@@ -474,32 +474,31 @@ def _blue_shortcut_variant(
 ) -> Image.Image | None:
     """Build a clean numeric view for a blue potion quantity.
 
-    The blue icon can intrude into the left side of the quantity strip.  Include
-    the full cell, start just below its keyboard label, and paint saturated
-    artwork white before enlarging.  This fallback is only used for a blue
-    cell, so the proven HP/ordinary-slot path stays unchanged.
+    The blue icon can intrude into the right side of the quantity strip.  The
+    blue channel keeps the white outlined digits visible against both the cell
+    background and the potion artwork.  Include a little extra width on both
+    sides because the neighboring cell's trailing digit is sometimes merged
+    into the OCR run; the caller takes the final separated number.  This
+    fallback is only used for a blue cell, so the proven HP/ordinary-slot path
+    stays unchanged.
     """
     parent_w, parent_h = image.size
     left = max(0, round((box[0] - SHORTCUT_BOX[0]) * scale_x))
-    top = max(0, round((box[1] - SHORTCUT_BOX[1] + 14) * scale_y))
-    right = min(parent_w, round((box[2] - SHORTCUT_BOX[0] + 8) * scale_x))
+    top = max(0, round((box[1] - SHORTCUT_BOX[1] + 10) * scale_y))
+    right = min(parent_w, round((box[2] - SHORTCUT_BOX[0] + 12) * scale_x))
     bottom = min(parent_h, round((box[3] - SHORTCUT_BOX[1] + 2) * scale_y))
     if right <= left or bottom <= top:
         return None
 
     source = image.crop((left, top, right, bottom)).convert("RGB")
-    pixels = source.load()
-    for y in range(source.height):
-        for x in range(source.width):
-            red, green, blue = pixels[x, y]
-            # White/gray quantity glyphs have low channel spread.  Remove
-            # saturated icon/effect pixels, but leave the dark blue panel
-            # background alone so it does not become artificial foreground.
-            if max(red, green, blue) - min(red, green, blue) > 45:
-                pixels[x, y] = (255, 255, 255)
+    # The MP icon and its blue highlight are exactly the pixels that confuse
+    # the grayscale model.  In the blue channel the white number outline has
+    # strong contrast while the colored artwork remains much closer to the
+    # dark panel value.
+    source = source.getchannel("B")
     resampling = getattr(Image, "Resampling", Image)
     return source.resize(
-        (max(1, source.width * 4), max(1, source.height * 4)),
+        (max(1, source.width * 5), max(1, source.height * 5)),
         resampling.LANCZOS,
     )
 
