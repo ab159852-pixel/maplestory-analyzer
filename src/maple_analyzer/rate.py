@@ -20,10 +20,10 @@ from dataclasses import dataclass
 class SessionSummary:
     """A finalized, immutable record of one completed session.
 
-    Every field is a JSON/SQLite-primitive (float, int, or None) and there
-    are no references to Session, StatSnapshot, or anything OCR/UI-related --
-    this is deliberately the shape a future persistence layer would store and
-    a future UI would read, decoupled from how it's produced or displayed.
+    Every field is a JSON/SQLite-friendly value and there are no references to
+    Session, StatSnapshot, or anything OCR/UI-related -- this is deliberately
+    the shape persistence stores and the UI reads, decoupled from how it is
+    produced or displayed.
     See ~/.claude/notes/maplestory-analyzer/ui-plan-2026-08-17.md for the
     plan to add that persistence layer and a session-history browser on top
     of this struct, without touching the capture/OCR/parser engine.
@@ -54,6 +54,31 @@ class SessionSummary:
     # User-assigned label, e.g. "grinding spot A". None until renamed via the
     # History tab -- UI-layer concern only, the engine never sets this.
     name: str | None = None
+    # Low-frequency game context captured by the overlay.  These are optional
+    # so old history JSON/CSV rows remain readable and future upload schemas
+    # can add more context without changing the EXP engine.
+    job_name: str | None = None
+    map_name: str | None = None
+    # Economy/recovery fields are optional so older history files remain
+    # readable and old callers constructing SessionSummary do not change.
+    mesos: int = 0
+    potion_uses: int = 0
+    potion_cost: int = 0
+    hp_potion_uses: int = 0
+    hp_potion_cost: int = 0
+    mp_potion_uses: int = 0
+    mp_potion_cost: int = 0
+    shared_potion_uses: int = 0
+    shared_potion_cost: int = 0
+    hp_recovery_natural: int = 0
+    hp_recovery_potion: int = 0
+    mp_recovery_natural: int = 0
+    mp_recovery_potion: int = 0
+    # Estimated mesos saved by non-potion recovery.  These are floats because
+    # the fixed reference prices are 1.2 mesos/HP and 2.1 mesos/MP.
+    hp_recovery_savings: float = 0.0
+    mp_recovery_savings: float = 0.0
+    potion_breakdown: dict[str, int] | None = None
 
     @property
     def exp_diff(self) -> int | None:
@@ -69,6 +94,19 @@ class SessionSummary:
         if diff is None or not self.total_exp:
             return None
         return diff / self.total_exp * 100
+
+    @property
+    def exp_per_hour(self) -> float | None:
+        """EXP gained normalized to one hour for comparing sessions.
+
+        A finalized session can be very short (for example, a user may hit
+        Restart while testing the HUD), so zero-length rows deliberately
+        return ``None`` instead of producing an infinite or misleading rate.
+        """
+        diff = self.exp_diff
+        if diff is None or self.duration_s <= 0:
+            return None
+        return max(0, diff) * 3600 / self.duration_s
 
     @property
     def duration_s(self) -> float:
@@ -138,7 +176,11 @@ class _LossTracker:
 
     def __init__(self) -> None:
         self.loss = 0
+        self._loss_floor = 0
         self._last: int | None = None       # last accepted value
+        self._segment_start: int | None = None
+        self._gross_loss = 0
+        self._recovery_evidence = 0
         self._max: int | None = None        # established max for this stat
         self._max_candidate: int | None = None
         self._max_candidate_count = 0
@@ -159,7 +201,11 @@ class _LossTracker:
         """New session: zero the total, keep the established max (it survives
         session boundaries), baseline off the last known value."""
         self.loss = 0
+        self._loss_floor = 0
         self._last = last
+        self._segment_start = last
+        self._gross_loss = 0
+        self._recovery_evidence = 0
         self._candidate = None
 
     def rebaseline(self, cur: int | None) -> None:
@@ -168,8 +214,25 @@ class _LossTracker:
         invisible to the session, so the first post-resume reading must not
         be diffed against the pre-pause value."""
         if cur is not None:
+            self._loss_floor = self.loss
             self._last = cur
+            self._segment_start = cur
+            self._gross_loss = 0
+            self._recovery_evidence = 0
         self._candidate = None
+
+    def add_recovery_evidence(self, amount: int) -> None:
+        """Add an upward HP/MP delta observed by the economy tracker.
+
+        The economy worker and the status worker have different OCR guards.
+        If the status tracker holds a large damage frame as suspicious but the
+        next potion heal is valid, this evidence lets the loss total recover
+        the hidden damage instead of reporting only the endpoint difference.
+        """
+        if amount <= 0 or self._segment_start is None or self._last is None:
+            return
+        self._recovery_evidence += amount
+        self._recompute_loss()
 
     def record(self, cur: int | None, maximum: int | None = None, level: int | None = None) -> None:
         if cur is None:
@@ -184,6 +247,7 @@ class _LossTracker:
                 return  # cur can never exceed max; this reading is garbage
         if self._last is None:
             self._last = cur
+            self._segment_start = cur
             return
         tolerance = (self._max or self._last) * self.OUTLIER_FRACTION
         if abs(cur - self._last) <= tolerance:
@@ -195,9 +259,20 @@ class _LossTracker:
 
     def _commit(self, cur: int) -> None:
         if cur < self._last:
-            self.loss += self._last - cur
+            self._gross_loss += self._last - cur
         self._last = cur
         self._candidate = None
+        self._recompute_loss()
+
+    def _recompute_loss(self) -> None:
+        if self._segment_start is None or self._last is None:
+            self.loss = self._loss_floor
+            return
+        endpoint_estimate = max(
+            0,
+            self._segment_start - self._last + self._recovery_evidence,
+        )
+        self.loss = self._loss_floor + max(self._gross_loss, endpoint_estimate)
 
     # A level-up nudges max HP/MP; nothing in the game multiplies it. A
     # proposed max outside this factor of the established one is garbage and
@@ -252,9 +327,9 @@ class Session:
 
     Calibration (require_calibration=True, the default): max HP, max MP, and
     the starting EXP are not trusted from a single reading. Each is
-    established independently, once 3 consecutive ticks corroborate it (2 if
-    the ticks visibly moved -- see _calib_liveness), and nothing is recorded
-    into the session until all three are confirmed. is_calibrating reports
+    established independently after two valid 0.3s frames corroborate it, and
+    nothing is recorded into the session until all three are confirmed.
+    is_calibrating reports
     this state; while true, elapsed() reads 0 and the HUD should show
     "Calibrating...".
 
@@ -268,15 +343,12 @@ class Session:
     panel the OCR garbage is *static* -- the identical wrong text every tick
     -- so N-identical-reads certifies it exactly as happily as it certifies
     the truth. Two earlier guard designs in _LossTracker failed this exact
-    way (see its docstring). _calib_liveness raises the bar somewhat: a tick
-    where nothing in the whole snapshot moved counts for less than one where
-    something did, so a frozen stream needs the full 3 ticks (never fewer --
-    see test_repetition_alone_never_confirms_faster_than_the_minimum) while
-    ordinary live play confirms in 2. It is a tiebreaker, not a requirement --
-    a genuinely idle character moves nothing either, and confirmation must
-    still complete for them.
+    way (see its docstring). _calib_liveness still gives a changing live frame
+    extra weight, but it is no longer needed to make an idle character wait
+    for a third sample. The structural parser and capture occlusion checks
+    remain the guards against malformed or covered frames.
 
-    This is NOT a claim that 3 static ticks of well-formed-but-wrong data can
+    This is NOT a claim that two static ticks of well-formed-but-wrong data can
     never calibrate -- nothing at this layer has ground truth to check a
     number against in isolation, that's what parser.py's structural filters
     (a missing '[' etc.) and capture.py's PANEL_OBSCURED occlusion probe are
@@ -295,16 +367,24 @@ class Session:
     again.
     """
 
-    # How many corroborating ticks establish a value during calibration. A
-    # tick where the whole snapshot moved (see _calib_liveness) counts double,
-    # so 2 live ticks (2+2=4) or 3 static ones (1+1+1=3) both clear this.
-    CALIB_TARGET = 3
+    # Two valid 0.3s frames are enough for the short startup calibration. The
+    # parser's structural checks and capture occlusion guard already reject
+    # malformed/covered frames; making the UI wait three frames on top of
+    # model loading made Start feel unresponsive. A changing live frame still
+    # receives the liveness weight, while an idle character confirms after
+    # the second identical valid frame.
+    CALIB_TARGET = 2
 
     def __init__(self, require_calibration: bool = True) -> None:
         self._require_calibration = require_calibration
         self._calibrated = not require_calibration
 
         self._start_time: float | None = None
+        # Wall-clock timestamps are persisted in history and remain the public
+        # session timebase.  Keep a monotonic companion for the very short
+        # live-rate window where Windows can return the same wall-clock tick for
+        # two back-to-back OCR frames.
+        self._start_perf: float | None = None
         self._start_exp: int | None = None
         self._hp = _LossTracker()
         self._mp = _LossTracker()
@@ -348,8 +428,10 @@ class Session:
         nothing yet to carry forward and the clock stays off until it does."""
         if self._require_calibration and not self._calibrated:
             self._start_time = None
+            self._start_perf = None
         else:
             self._start_time = now if now is not None else time.time()
+            self._start_perf = time.perf_counter()
         self._start_exp = self._exp_cur
         self._hp.reset(self._hp_cur)
         self._mp.reset(self._mp_cur)
@@ -361,6 +443,46 @@ class Session:
         self._pause_started_at = None
         self._paused_total = 0.0
         self._resume_pending = False
+
+    def begin_fresh(self) -> None:
+        """Start the next session from its first post-start live sample.
+
+        ``start()`` intentionally carries the last accepted values forward for
+        callers that already have a trustworthy current frame.  The overlay's
+        Start button can be pressed after a previous run has stopped, though,
+        and carrying that old EXP value would make the new interval's
+        projection depend on the previous session.  Clear the per-session
+        baselines while retaining calibrated HP/MP maxima; ``record()`` will
+        establish the clock and all baselines from the first fresh frame.
+        """
+        self._start_time = None
+        self._start_perf = None
+        self._start_exp = None
+        self._hp_cur = None
+        self._mp_cur = None
+        self._exp_cur = None
+        self._total_exp = None
+        self._banked = 0
+        self._segment_start = None
+        self._last_exp = None
+        self._last_level = None
+        self._last_implied_total = None
+        self._hp.reset(None)
+        self._mp.reset(None)
+        self._paused = False
+        self._pause_started_at = None
+        self._paused_total = 0.0
+        self._resume_pending = False
+        if not self._calibrated:
+            # A restart during startup should not inherit partial candidates.
+            self._hp_calib_max = None
+            self._hp_calib_count = 0
+            self._mp_calib_max = None
+            self._mp_calib_count = 0
+            self._exp_calib_baseline = None
+            self._exp_calib_total = None
+            self._exp_calib_count = 0
+            self._calib_last_snapshot = None
 
     # ---- pause/resume -------------------------------------------------
 
@@ -416,10 +538,11 @@ class Session:
     # ---- calibration ----------------------------------------------------
 
     def _calib_liveness(self, hp_cur, mp_cur, exp_cur, level) -> bool:
-        """True if anything in the snapshot differs from the previous clean
-        tick's -- the tiebreaker that lets ordinary live play calibrate in 2
-        ticks while static OCR garbage (identical every field, every tick,
-        see the class docstring) needs the full 3."""
+        """Return whether the current valid frame differs from the prior one.
+
+        A changing live frame receives a small liveness bonus, while static
+        valid data still reaches the two-frame calibration target.
+        """
         current = (hp_cur, mp_cur, exp_cur, level)
         previous = self._calib_last_snapshot
         self._calib_last_snapshot = current
@@ -521,6 +644,7 @@ class Session:
             self._segment_start = self._exp_calib_baseline
             self._last_exp = self._exp_calib_baseline
             self._start_time = time.time()
+            self._start_perf = time.perf_counter()
             # Fall through -- this confirming tick's own readings are still
             # real data, not spent purely on calibration.
 
@@ -535,6 +659,13 @@ class Session:
         if mp_cur is not None:
             self._mp_cur = mp_cur
         self._record_exp(exp_cur, exp_pct, level)
+
+    def add_recovery_evidence(self, kind: str, amount: int) -> None:
+        """Feed recovery observed by the separate economy OCR worker."""
+        if kind == "hp":
+            self._hp.add_recovery_evidence(amount)
+        elif kind == "mp":
+            self._mp.add_recovery_evidence(amount)
 
     # A reading may deviate this far from the level total established by the
     # previous tick before it is treated as garbage. Deliberately loose: it is
@@ -646,7 +777,19 @@ class Session:
         pause()/resume()."""
         if self._start_time is None:
             return 0.0
-        now = now if now is not None else time.time()
+        if now is None:
+            now = time.time()
+            wall_elapsed = now - self._start_time
+            # Some Windows clocks have millisecond-scale granularity.  A pair
+            # of immediate OCR frames can therefore have positive EXP gain but
+            # a reported wall duration of exactly zero.  Use the monotonic
+            # companion only for that degenerate live case; explicit `now`
+            # values used by history/pause tests keep their deterministic wall
+            # clock semantics.
+            if wall_elapsed <= 0 and self._start_perf is not None and not self._paused:
+                return max(0.0, time.perf_counter() - self._start_perf)
+        else:
+            wall_elapsed = now - self._start_time
         end = self._pause_started_at if (self._paused and self._pause_started_at is not None) else now
         return max(0.0, (end - self._start_time) - self._paused_total)
 
@@ -676,6 +819,18 @@ class Session:
     def total_exp(self) -> float | None:
         return self._total_exp
 
+    @property
+    def exp_per_hour(self) -> float | None:
+        """Current session EXP rate, normalized to one hour."""
+        diff = self.exp_diff
+        elapsed = self.elapsed()
+        # A valid session with no EXP gain is still a real zero rate. Returning
+        # None here made an idle character look indistinguishable from a
+        # broken capture/OCR pipeline in the HUD (which rendered both as "--").
+        if diff is None or elapsed <= 0:
+            return None
+        return diff * 3600 / elapsed
+
     def projected_exp(self, window_s: float, now: float | None = None) -> int | None:
         """EXP this session would total if the current rate held for the
         whole `window_s` -- rate is exp_diff / elapsed(), which is already
@@ -684,7 +839,7 @@ class Session:
         gain guard the level-up ETA uses -- a 1-2s sample swings wildly)."""
         diff = self.exp_diff
         elapsed = self.elapsed(now)
-        if diff is None or diff <= 0 or elapsed <= 3:
+        if diff is None or elapsed <= 3:
             return None
         return int(diff / elapsed * window_s)
 

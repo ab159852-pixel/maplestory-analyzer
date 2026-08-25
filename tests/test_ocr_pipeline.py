@@ -12,7 +12,7 @@ EXP162950[38.05%]) and confirming it matches this pipeline's output.
 import pytest
 
 from maple_analyzer.capture import StaticImageCapture
-from maple_analyzer.ocr import StatPanelOcr
+from maple_analyzer.ocr import OcrLine, StatPanelOcr
 from maple_analyzer.parser import parse_fields
 
 from conftest import SAMPLE_IMAGE
@@ -54,3 +54,21 @@ def test_field_crops_are_nonempty(ocr_engine):
     assert set(fields.keys()) == {"LV", "HP", "MP", "EXP"}
     for name, img in fields.items():
         assert img.width > 0 and img.height > 0, f"{name} crop is empty"
+
+
+def test_shortcut_detection_splits_adjacent_quantity_runs_without_loading_ocr():
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr.read_lines = lambda _image: [
+        OcrLine("Shift", y=21, x=74.75, left=50, right=100),
+        OcrLine("1180.", y=54, x=73, left=44, right=102),
+        OcrLine("2037465", y=54, x=167, left=110, right=224),
+        OcrLine("3:03", y=117, x=264, left=243, right=287),
+    ]
+
+    from PIL import Image
+    counts = ocr.read_shortcut_counts(Image.new("RGB", (297, 166)))
+
+    assert counts["1"] == 1180
+    assert counts["2"] == 2037
+    assert counts["3"] == 465
+    assert counts["8"] == 303

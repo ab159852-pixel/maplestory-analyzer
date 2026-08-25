@@ -1,0 +1,61 @@
+name: Build Windows release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements.win.lock.txt
+            requirements-dev.txt
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements.win.lock.txt -r requirements-dev.txt
+
+      - name: Verify release version
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = "src"
+          $expected = "${env:GITHUB_REF_NAME}".TrimStart('v')
+          $actual = python -c "from maple_analyzer.version import APP_VERSION; print(APP_VERSION)"
+          if ($actual.Trim() -ne $expected) {
+            throw "version.py contains $($actual.Trim()), but the tag is $expected"
+          }
+
+      - name: Build one-folder executable
+        run: python -m PyInstaller --noconfirm scripts/maple_analyzer.spec
+
+      - name: Package and checksum release
+        shell: pwsh
+        run: |
+          $asset = "MapleStoryAnalyzer-${env:GITHUB_REF_NAME}-win64.zip"
+          Compress-Archive -Path "dist/MapleStoryAnalyzer" -DestinationPath $asset -Force
+          $hash = (Get-FileHash -Path $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash *$asset" | Set-Content -Path checksums.txt -Encoding ascii
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            MapleStoryAnalyzer-${{ github.ref_name }}-win64.zip
+            checksums.txt

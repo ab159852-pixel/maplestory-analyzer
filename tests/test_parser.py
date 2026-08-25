@@ -77,6 +77,19 @@ def test_hp_mp_case_insensitive_label():
     assert (snap.mp_cur, snap.mp_max) == (5, 30)
 
 
+def test_isolated_fields_recover_when_ascii_label_is_dropped():
+    snap = parse_fields({
+        "HP": "[10/20]",
+        "MP": "5/30",
+        "EXP": "123456[12.34%]",
+        "LV": "44",
+    })
+    assert (snap.hp_cur, snap.hp_max) == (10, 20)
+    assert (snap.mp_cur, snap.mp_max) == (5, 30)
+    assert (snap.exp_cur, snap.exp_pct) == (123456, 12.34)
+    assert snap.level == 44
+
+
 def test_exp_pct_separator_read_as_colon():
     """Live capture (2026-08-17) showed the decimal point OCR'd as a colon in
     37 of 235 ticks -- each one silently lost exp_pct, and with it the EXP%
@@ -84,3 +97,9 @@ def test_exp_pct_separator_read_as_colon():
     snap = parse_fields({"EXP": "EXP 321675[75:11%] "})
     assert snap.exp_cur == 321675
     assert snap.exp_pct == 75.11
+
+
+def test_exp_thousands_separator_is_accepted():
+    snap = parse_fields({"EXP": "EXP 1,902,660[9.73%]"})
+    assert snap.exp_cur == 1902660
+    assert snap.exp_pct == 9.73

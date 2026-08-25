@@ -21,3 +21,14 @@ shapely==2.1.2
 six==1.17.0
 sympy==1.14.0
 tqdm==4.70.0
+typing_extensions==4.16.0
+winrt-Windows.AI.MachineLearning==3.2.1
+winrt-Windows.Foundation==3.2.1
+winrt-Windows.Graphics==3.2.1
+winrt-Windows.Graphics.Capture==3.2.1
+winrt-Windows.Graphics.Capture.Interop==3.2.1
+winrt-Windows.Graphics.DirectX==3.2.1
+winrt-Windows.Graphics.DirectX.Direct3D11==3.2.1
+winrt-Windows.Graphics.DirectX.Direct3D11.Interop==3.2.1
+winrt-Windows.Graphics.Imaging==3.2.1
+winrt-runtime==3.2.1

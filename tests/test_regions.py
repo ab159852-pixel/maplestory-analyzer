@@ -1,5 +1,12 @@
 """scale_box scaling math -- pure, no images/OCR."""
-from maple_analyzer.regions import FIELD_BOXES, REFERENCE_CLIENT_SIZE, STAT_PANEL_BOX, scale_box
+from maple_analyzer.regions import (
+    FIELD_BOXES,
+    REFERENCE_CLIENT_SIZE,
+    STAT_PANEL_BOX,
+    region_transform,
+    scale_box,
+    scale_top_left_box,
+)
 
 
 def test_identity_scale_at_reference_size():
@@ -29,3 +36,27 @@ def test_scale_at_known_working_resolutions():
         for box in FIELD_BOXES.values():
             b = scale_box(box, client_size)
             assert b.left < b.right and b.top < b.bottom
+
+
+def test_wide_client_uses_uniform_scale_and_horizontal_letterbox():
+    transform = region_transform((1920, 1077))
+    assert transform.offset_x > 0
+    assert transform.offset_y == 0
+    assert transform.scale == 1077 / REFERENCE_CLIENT_SIZE[1]
+
+    panel = scale_box(STAT_PANEL_BOX, (1920, 1077))
+    assert panel.bottom == 1077
+    assert panel.left > 0
+
+
+def test_top_left_box_does_not_apply_viewport_letterbox():
+    box = (44, 42, 119, 63)
+    client_size = (1920, 1077)
+    transform = region_transform(client_size)
+
+    centered = scale_box(box, client_size)
+    anchored = scale_top_left_box(box, client_size)
+
+    assert centered.left > anchored.left
+    assert anchored.left == round(box[0] * transform.scale)
+    assert anchored.top == round(box[1] * transform.scale)

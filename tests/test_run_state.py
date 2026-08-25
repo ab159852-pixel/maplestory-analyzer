@@ -1,4 +1,4 @@
-"""OverlayApp's run-state machine: running/paused/stopped, auto-stop,
+"""OverlayApp's run-state machine: running/paused/stopped, interval rollover,
 restart-with-save, deleting a History entry, and the timer/auto-finalize
 staying alive while OCR capture is failing.
 
@@ -195,25 +195,25 @@ def test_pause_button_cycles_running_paused_running():
     assert app._pause_button.cget("text") == app._t("pause_button")
 
 
-# --- auto-stop (default on) -----------------------------------------------
+# --- ten-minute interval rollover -----------------------------------------
 
 
-def test_auto_stop_commits_and_stops_by_default():
+def test_interval_commits_and_continues_by_default():
     app = _StubApp()
     app._on_pause_button_clicked()
     _calibrate(app, gains=(100,))
     app._settings.window_min = 1
     app._session._start_time -= 61  # force the interval to have elapsed
     app._do_tick()
-    assert app._run_state == "stopped"
+    assert app._run_state == "running"
     assert len(app._session_history) == 1
-    assert app._restart_button.grid_info() == {}  # hidden while stopped
-    elapsed_at_stop = app._session.elapsed()
+    assert app._session.start_exp is not None
+    assert app._session.elapsed() < 2.0  # a fresh interval began immediately
     app._do_tick()
-    assert app._session.elapsed() == elapsed_at_stop  # frozen, not overrunning
+    assert len(app._session_history) == 1  # no duplicate commit on next tick
 
 
-def test_auto_stop_disabled_restarts_instead():
+def test_interval_rollover_can_be_explicitly_kept_continuous():
     app = _StubApp()
     app._settings.auto_stop = False
     app._on_pause_button_clicked()
@@ -221,7 +221,7 @@ def test_auto_stop_disabled_restarts_instead():
     app._settings.window_min = 1
     app._session._start_time -= 61
     app._do_tick()
-    assert app._run_state == "running"  # old behaviour: immediately restarts
+    assert app._run_state == "running"
     assert len(app._session_history) == 1
     assert app._session.start_exp is not None  # carried forward, not calibrating again
 
@@ -274,12 +274,13 @@ def test_auto_finalize_still_fires_while_capture_is_blocked():
     app._session._start_time -= 61
     app._source.blocked = True
     app._do_tick()
-    assert app._run_state == "stopped"
+    assert app._run_state == "running"
     assert len(app._session_history) == 1
 
 
 def test_stopped_session_does_not_auto_finalize_again():
     app = _StubApp()
+    app._settings.auto_stop = True
     app._on_pause_button_clicked()
     _calibrate(app, gains=(100,))
     app._settings.window_min = 1

@@ -105,13 +105,11 @@ def test_live_ticks_confirm_in_two():
     assert not s.is_calibrating  # EXP moving drives liveness for HP/MP's calibration too
 
 
-def test_static_ticks_need_a_third():
+def test_static_ticks_confirm_after_the_short_two_frame_calibration():
     s = Session()
     _tick(s, hp=800, hp_max=824, mp=2800, mp_max=2816, exp=100, exp_pct=0.02, level=44)
     _tick(s, hp=800, hp_max=824, mp=2800, mp_max=2816, exp=100, exp_pct=0.02, level=44)
-    assert s.is_calibrating  # nothing moved -- 2 static ticks isn't enough
-    _tick(s, hp=800, hp_max=824, mp=2800, mp_max=2816, exp=100, exp_pct=0.02, level=44)
-    assert not s.is_calibrating
+    assert not s.is_calibrating  # two valid 0.3s frames are enough now
 
 
 # --- while calibrating, nothing is recorded -------------------------------

@@ -93,4 +93,6 @@ def test_obscured_message_is_localised():
     assert "被" in localized  # zh string, not raw English
 
     stub._settings = Settings(language="en")
-    assert stub._localize_error(PANEL_OBSCURED) == "Stat panel is covered"
+    assert stub._localize_error(PANEL_OBSCURED) == (
+        "Stat panel is covered; live capture is unavailable"
+    )

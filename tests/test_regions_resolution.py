@@ -77,24 +77,13 @@ def test_exp_percentage_reads_correctly_at_1920(snapshot_1920):
     assert snap.exp_pct == TRUTH_1920["exp_pct"], text
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="OCR drops the '/' in 'HP[824/824]' at 1920, giving 'HP[824824]', "
-           "which _PAIR_RE rightly refuses to split -- a bare digit run has no "
-           "honest boundary. Open question: systematic at this resolution, or a "
-           "one-frame fluke? Needs more live frames before deciding on a fix. "
-           "See the plan's Phase 2.",
-)
 def test_hp_reads_correctly_at_1920(snapshot_1920):
     snap, _text = snapshot_1920
     assert (snap.hp_cur, snap.hp_max) == TRUTH_1920["hp"]
 
 
-def test_hp_failure_is_a_missing_separator_not_a_bad_crop(snapshot_1920):
-    """Pins *why* HP fails, so the xfail above can't be quietly satisfied by
-    some unrelated change. The digits are read correctly and in the right
-    order; only the separator is lost, which is a recognition problem, not a
-    cropping one."""
+def test_hp_digits_are_stable_at_1920(snapshot_1920):
+    """The digits remain correct even when OCR changes the separator shape."""
     _snap, text = snapshot_1920
     hp = text["HP"].replace(" ", "")
     assert "824" in hp

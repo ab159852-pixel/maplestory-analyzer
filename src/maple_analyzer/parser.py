@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+import unicodedata
 
 _PAIR_RE = {
     "HP": re.compile(r"HP\D{0,3}(\d+)\D+(\d+)", re.IGNORECASE),
@@ -40,8 +41,17 @@ _EXP_CUR_RE = re.compile(r"EXP\D{0,3}(\d+)\s*[\[({]", re.IGNORECASE)
 # with it the EXP% display and the level-up ETA. All forms captured here;
 # _normalize_pct interprets them. A bare 1-2 digit run is deliberately NOT
 # matched, ambiguous with stray adjacent OCR noise.
-_EXP_PCT_RE = re.compile(r"(\d{1,2}[.\s:]\d{1,2}|\d{3,4})\s*%")
-_LV_RE = re.compile(r"LV\.?\D{0,3}(\d+)", re.IGNORECASE)
+# Require the percentage run to start at a digit boundary.  Without the
+# look-behind, OCR text such as ``83.319%`` can be matched from the embedded
+# ``3.19`` and silently become 3.19%; the game displays two decimal places, so
+# tolerate one trailing false-positive digit and keep the first two decimals.
+_EXP_PCT_RE = re.compile(
+    r"(?<!\d)(\d{1,2}[.\s:]\d{2})(?:\d)?\s*%|(?<!\d)(\d{3,4})\s*%"
+)
+# The wider LV crop intentionally includes a little of the adjacent job text
+# at high resolutions.  Permit OCR garbage between the label and the first
+# one-to-three-digit level while still refusing an unbounded arbitrary number.
+_LV_RE = re.compile(r"LV\.?\D{0,20}(\d{1,3})", re.IGNORECASE)
 
 
 @dataclass
@@ -70,32 +80,57 @@ def _normalize_pct(raw: str) -> float:
 def _find_pair(label: str, text: str) -> tuple[int | None, int | None]:
     m = _PAIR_RE[label].search(text)
     if not m:
-        return None, None
+        # The field is already isolated by capture.py, so a dropped HP/MP
+        # label is recoverable without searching neighbouring OCR boxes.  Keep
+        # the fallback separator-based and bounded; never split a bare digit
+        # run because that is how a missing slash creates phantom losses.
+        m = re.search(r"(?<!\d)(\d{1,7})\D+(\d{1,7})(?!\d)", text)
+        if not m:
+            return None, None
     return int(m.group(1)), int(m.group(2))
 
 
 def _find_exp(text: str) -> tuple[int | None, float | None]:
+    # RapidOCR sometimes preserves the thousands separator from the HUD
+    # (``EXP 1,902,660[9.73%]``).  Remove separators only when they sit between
+    # digits; spaces remain meaningful for the OCR form ``9 73%``.
+    text = re.sub(r"(?<=\d)[,，](?=\d)", "", text)
     m = _EXP_CUR_RE.search(text)
+    if not m:
+        # EXP is also captured in its own box.  If only the ASCII label was
+        # lost, the opening bracket still provides a safe structural anchor;
+        # a naked number is intentionally not accepted.
+        m = re.search(r"(?<!\d)(\d{3,9})\s*[\[({]", text)
     if not m:
         return None, None
     cur = int(m.group(1))
     pm = _EXP_PCT_RE.search(text[m.end():])
-    pct = _normalize_pct(pm.group(1)) if pm else None
+    pct = _normalize_pct(pm.group(1) or pm.group(2)) if pm else None
     return cur, pct
 
 
 def _find_level(text: str) -> int | None:
     m = _LV_RE.search(text)
-    return int(m.group(1)) if m else None
+    if m:
+        return int(m.group(1))
+    # The LV crop can lose the two ASCII glyphs while leaving the level
+    # number.  Accept that only when it is the sole numeric token in the crop;
+    # the wider LV/job crop otherwise contains unrelated numbers.
+    numbers = re.findall(r"(?<!\d)\d{1,3}(?!\d)", text)
+    return int(numbers[0]) if len(numbers) == 1 else None
 
 
 def parse_fields(field_text: dict[str, str]) -> StatSnapshot:
     """field_text: {'LV': ..., 'HP': ..., 'MP': ..., 'EXP': ...} -- the raw
     recognized text for each of regions.py's FIELD_BOXES."""
-    hp_cur, hp_max = _find_pair("HP", field_text.get("HP", ""))
-    mp_cur, mp_max = _find_pair("MP", field_text.get("MP", ""))
-    exp_cur, exp_pct = _find_exp(field_text.get("EXP", ""))
-    level = _find_level(field_text.get("LV", ""))
+    normalized = {
+        name: unicodedata.normalize("NFKC", str(value or ""))
+        for name, value in field_text.items()
+    }
+    hp_cur, hp_max = _find_pair("HP", normalized.get("HP", ""))
+    mp_cur, mp_max = _find_pair("MP", normalized.get("MP", ""))
+    exp_cur, exp_pct = _find_exp(normalized.get("EXP", ""))
+    level = _find_level(normalized.get("LV", ""))
     return StatSnapshot(
         level=level,
         hp_cur=hp_cur, hp_max=hp_max,
