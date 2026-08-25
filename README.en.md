@@ -1,4 +1,4 @@
-# MapleStoryAnalyzer
+# Maple Insight
 
 *[繁體中文版 README](README.md)*
 
@@ -127,7 +127,7 @@ and keep the folder intact — the .exe needs the files alongside it.
 2. Double-click `MapleStoryAnalyzer.exe`. Windows may show a SmartScreen
    warning on first run since it isn't code-signed — click **More info →
    Run anyway**.
-3. A small window titled "MapleStoryAnalyzer" opens, always on top, on the
+3. A small window titled "Maple Insight" opens, always on top, on the
    **Live** tab by default. Once the game window is found, LV/HP/MP/EXP should
    start filling in within a second or two.
 4. Click into the game and play normally — the HUD keeps reading in the
@@ -169,7 +169,7 @@ identically whether started via the .exe or this command.
 
 ## Publish a release (maintainers)
 
-This source currently contains `APP_VERSION = 1.0.5`. For each release, bump
+This source currently contains `APP_VERSION = 1.0.6`. For each release, bump
 `APP_VERSION` in `src/maple_analyzer/version.py`, commit the change, and push a
 matching tag, for example:
 

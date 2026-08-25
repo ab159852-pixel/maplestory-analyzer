@@ -121,6 +121,9 @@ def load_settings(data_dir: str | Path | None = None) -> Settings:
     settings.sample_interval_ms = _bounded_int(
         values.get("sample_interval_ms"), settings.sample_interval_ms, 200, 1000
     )
+    settings.pickup_interval_ms = _bounded_int(
+        values.get("pickup_interval_ms"), settings.pickup_interval_ms, 100, 1000
+    )
     legacy_recovery = _bounded_int(values.get("potion_recovery_default"), 0, 0, 1_000_000)
     settings.potion_recovery_hp_default = _bounded_int(
         values.get("potion_recovery_hp_default"), legacy_recovery, 0, 1_000_000

@@ -80,6 +80,10 @@ class Settings:
     # setting so a slower machine can trade responsiveness for CPU later,
     # without another code change or release rebuild.
     sample_interval_ms: int = 300
+    # Pickup/mesos notifications are shorter-lived than the status bar. Keep
+    # their cadence independent so users can choose 0.1–1.0s without making
+    # HP/MP/EXP OCR run at the same expensive rate.
+    pickup_interval_ms: int = 200
     track_pickup_messages: bool = True
     track_potions: bool = True
     # Per-resource fallback recovery used when a potion slot's quantity OCR is

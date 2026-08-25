@@ -78,7 +78,7 @@ from .regions import (
 from .settings import PotionSlotConfig, Settings
 from .storage import export_history_csv, load_history, load_settings, save_history, save_settings
 from .updates import UpdateError, UpdateInfo, check_for_update, download_update, schedule_update
-from .version import APP_VERSION
+from .version import APP_DISPLAY_NAME, APP_VERSION
 
 # The console's codepage (e.g. cp950 Traditional Chinese) can't represent
 # every character OCR might misread out of the game's UI -- printing one
@@ -124,10 +124,10 @@ if sys.platform == "win32":
         pass
 
 TARGET_MS = 300  # target full status/OCR cycle -- 3.33Hz
-# Pickup toasts are brief lower-right notifications.  A 0.75s scan could miss
-# an entire toast, so the economy path uses a faster independent cadence.
-AUX_SCAN_MS = 250
-PICKUP_DETECTION_MS = 350
+# Pickup toasts are brief lower-right notifications. Keep the fallback path
+# fast too; the threaded monitor uses Settings.pickup_interval_ms directly.
+AUX_SCAN_MS = 200
+PICKUP_DETECTION_MS = 200
 POTION_PROJECTION_MIN_SECONDS = 60.0  # avoid a first-drink spike in a short sample
 SCALE_STEP_PCT = 10
 SCALE_MIN_PCT = 50
@@ -140,25 +140,32 @@ STOPPED_BUTTON_WIDTH = 96  # Start alone, centered -- smaller than the two-butto
 # Color tokens: an obsidian/sapphire base with restrained teal, violet and
 # gold accents.  The extra border/raised tokens keep cards visually layered
 # instead of making the whole window read as one flat dark rectangle.
-BG = "#0a0f18"
-SURFACE = "#141b28"
-SURFACE_2 = "#1a2434"
-SURFACE_RAISED = "#202c40"
-SURFACE_ELEVATED = "#25344a"
-BORDER = "#2c3d56"
-BORDER_SOFT = "#1e2b3e"
-INK = "#edf3fb"
-INK_DIM = "#a4b1c3"
-INK_FAINT = "#687891"
-ACCENT = "#65e6d3"
-ACCENT_INK = "#052b2a"
-VIOLET = "#8c82ff"
-VIOLET_HOVER = "#a49dff"
-HP_COLOR = "#ff6b6b"
-MP_COLOR = "#5b9dff"
-EXP_COLOR = "#ffc247"
-OK_COLOR = "#3ddc84"
-TRACK_BG = "#12291f"
+# Night-pink glass palette.  CustomTkinter does not provide per-widget alpha
+# compositing, so the jelly/glow effect is built from close translucent-like
+# surfaces, bright hairline borders, and high-contrast hover/selected layers.
+BG = "#0f0915"
+SURFACE = "#1e1326"
+SURFACE_2 = "#281832"
+SURFACE_RAISED = "#33203e"
+SURFACE_ELEVATED = "#42284d"
+BORDER = "#784866"
+BORDER_SOFT = "#432842"
+INK = "#fff1fa"
+INK_DIM = "#e0b6d1"
+INK_FAINT = "#a47b99"
+ACCENT = "#ff8dcc"
+ACCENT_INK = "#351126"
+VIOLET = "#ff79c8"
+VIOLET_HOVER = "#ffb0e1"
+TAB_SURFACE = "#160d1e"
+TAB_UNSELECTED = "#321a38"
+TAB_HOVER = "#633052"
+GLOW_BORDER = "#c764a5"
+HP_COLOR = "#ff789d"
+MP_COLOR = "#8cb4ff"
+EXP_COLOR = "#ffd27a"
+OK_COLOR = "#78efc2"
+TRACK_BG = "#3c1e31"
 
 # Chrome text (tabs, headers, buttons, switches, kv labels -- anything that
 # can carry translated content) picks its font family from the active
@@ -370,7 +377,7 @@ class OverlayApp:
         ctk.set_window_scaling(self._settings.scale_pct / 100)
 
         self.root = ctk.CTk()
-        self.root.title("MapleStoryAnalyzer")
+        self.root.title(APP_DISPLAY_NAME)
         self.root.attributes("-topmost", self._settings.topmost)
         self.root.attributes("-alpha", 1.0)
         self.root.configure(fg_color=BG)
@@ -401,7 +408,7 @@ class OverlayApp:
         title_box = ctk.CTkFrame(brand, fg_color="transparent")
         title_box.pack(side="left", fill="both", expand=True, padx=(12, 0))
         ctk.CTkLabel(
-            title_box, text="MAPLESTORY ANALYZER", anchor="w",
+            title_box, text="MAPLE INSIGHT", anchor="w",
             text_color=INK, font=("Segoe UI", 13, "bold"),
         ).pack(anchor="w", pady=(14, 0))
         ctk.CTkLabel(
@@ -423,6 +430,22 @@ class OverlayApp:
             segmented_button_unselected_color=SURFACE,
             segmented_button_unselected_hover_color=SURFACE_ELEVATED,
         )
+        # Give the three primary destinations a deliberate control-center
+        # treatment instead of the stock compact segmented-button look.
+        self._tabview._segmented_button.configure(
+            height=38,
+            corner_radius=14,
+            fg_color=TAB_SURFACE,
+            selected_color=VIOLET,
+            selected_hover_color=VIOLET_HOVER,
+            unselected_color=TAB_UNSELECTED,
+            unselected_hover_color=TAB_HOVER,
+            border_width=1,
+            border_color=GLOW_BORDER,
+            text_color=INK,
+            font=self._font(11, bold=True),
+        )
+        self._tabview._segmented_button.grid_configure(padx=6, pady=(0, 8))
         self._tabview.pack(fill="both", expand=True)
         # CTkTabview's tab name doubles as its segmented-button label and its
         # internal dict key -- there's no separate "id" to address a tab by,
@@ -500,6 +523,12 @@ class OverlayApp:
             "settings_sampling_value", seconds=self._settings.sample_interval_ms / 1000
         )
 
+    def _pickup_sampling_header_text(self) -> str:
+        return self._t(
+            "settings_pickup_sampling_value",
+            seconds=self._settings.pickup_interval_ms / 1000,
+        )
+
     def _opacity_header_text(self) -> str:
         return self._t("settings_floating_opacity") + f" — {self._settings.floating_opacity_pct}%"
 
@@ -531,9 +560,13 @@ class OverlayApp:
 
         self._status_pill.configure(font=self._font(9, bold=True))
         self._timer_label.configure(font=self._font(10, bold=True))
+        self._tabview._segmented_button.configure(font=self._font(11, bold=True))
         self._scale_header_label.configure(text=self._scale_header_text(), font=self._font(11, bold=True))
         self._interval_header_label.configure(text=self._interval_header_text(), font=self._font(11, bold=True))
         self._sampling_header_label.configure(text=self._sampling_header_text(), font=self._font(10, bold=True))
+        self._pickup_sampling_header_label.configure(
+            text=self._pickup_sampling_header_text(), font=self._font(10, bold=True)
+        )
         self._floating_header_label.configure(text=self._opacity_header_text(), font=self._font(10, bold=True))
         self._hud_mode_button.configure(
             text=self._t("hud_button_exit" if self._floating_mode else "hud_button_enter")
@@ -729,6 +762,7 @@ class OverlayApp:
                 self._source,
                 self._ocr,
                 sample_interval_ms=self._settings.sample_interval_ms,
+                pickup_interval_ms=self._settings.pickup_interval_ms,
             )
             self._monitor.configure_auxiliary(
                 track_pickup=self._settings.track_pickup_messages,
@@ -1763,6 +1797,19 @@ class OverlayApp:
             "settings_economy", size=10, bold=True,
         ).pack(fill="x", padx=12, pady=(5, 0))
 
+        self._pickup_sampling_header_label = ctk.CTkLabel(
+            economy_card, text=self._pickup_sampling_header_text(),
+            anchor="w", text_color=INK_DIM, font=self._font(10, bold=True),
+        )
+        self._pickup_sampling_header_label.pack(fill="x", padx=12, pady=(4, 0))
+        self._pickup_sampling_slider = ctk.CTkSlider(
+            economy_card, from_=0.1, to=1.0, number_of_steps=9,
+            command=self._on_pickup_sampling_changed,
+            progress_color=ACCENT, button_color=ACCENT, button_hover_color="#8bfff0",
+        )
+        self._pickup_sampling_slider.set(self._settings.pickup_interval_ms / 1000)
+        self._pickup_sampling_slider.pack(fill="x", padx=12, pady=(0, 5))
+
         self._track_pickup_var = tk.BooleanVar(value=self._settings.track_pickup_messages)
         self._i18n(ctk.CTkSwitch(
             economy_card, variable=self._track_pickup_var, text_color=INK,
@@ -2019,6 +2066,19 @@ class OverlayApp:
             monitor.set_sample_interval(self._settings.sample_interval_ms)
         _maybe_persist_settings(self)
 
+    def _on_pickup_sampling_changed(self, value: float) -> None:
+        self._settings.pickup_interval_ms = max(
+            100, min(1000, round(float(value) * 10) * 100)
+        )
+        label = getattr(self, "_pickup_sampling_header_label", None)
+        if label is not None:
+            label.configure(text=self._pickup_sampling_header_text())
+        monitor = getattr(self, "_monitor", None)
+        setter = getattr(monitor, "set_pickup_interval", None)
+        if callable(setter):
+            setter(self._settings.pickup_interval_ms)
+        _maybe_persist_settings(self)
+
     def _on_track_pickup_changed(self) -> None:
         self._settings.track_pickup_messages = self._track_pickup_var.get()
         self._configure_monitor()
@@ -2273,7 +2333,8 @@ class OverlayApp:
             if economy is not None and (
                 self._run_state == "running" or include_auxiliary_when_paused
             ):
-                economy.record_pickup_lines(reading.lines, event_now)
+                if getattr(reading, "pickup_scanned", True):
+                    economy.record_pickup_lines(reading.lines, event_now)
                 self._record_auxiliary_counts(dict(reading.counts), event_now)
 
         while True:
@@ -2425,7 +2486,8 @@ class OverlayApp:
         # The status bar remains a 0.3s loop, but economy OCR used to run 12
         # pickup rows plus 8 shortcut slots on every status tick.  That could
         # consume the whole Tk frame budget and make the window look hung.
-        self._next_aux_scan = now + AUX_SCAN_MS / 1000
+        fallback_interval = min(AUX_SCAN_MS, self._settings.pickup_interval_ms)
+        self._next_aux_scan = now + fallback_interval / 1000
         try:
             regions = grab_auxiliary()
         except RuntimeError as exc:

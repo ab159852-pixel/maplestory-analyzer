@@ -55,6 +55,7 @@ def test_settings_round_trip(tmp_path):
         language="en",
         auto_stop=False,
         save_on_restart=False,
+        pickup_interval_ms=100,
         auto_context=True,
         job_name_override="",
         map_name_override="",

@@ -196,6 +196,10 @@ _STRINGS: dict[str, dict[Lang, str]] = {
     },
     "settings_sampling": {"en": "SAMPLING", "zh": "取樣頻率"},
     "settings_sampling_value": {"en": "Status scan — {seconds:.1f}s", "zh": "狀態列取樣 — {seconds:.1f} 秒"},
+    "settings_pickup_sampling_value": {
+        "en": "Mesos scan — {seconds:.1f}s",
+        "zh": "楓幣擷取 — {seconds:.1f} 秒",
+    },
     "settings_economy": {"en": "ECONOMY TRACKING", "zh": "經濟統計"},
     "settings_track_pickup": {"en": "Track mesos from pickup messages", "zh": "從撿取訊息統計楓幣"},
     "settings_track_potions": {"en": "Track potion usage and recovery", "zh": "統計藥水消耗與回復"},

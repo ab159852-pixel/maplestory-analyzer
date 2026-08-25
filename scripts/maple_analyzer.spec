@@ -23,8 +23,8 @@ repo_root = Path(SPECPATH).resolve().parent
 # same as the source run at 100%, 125%, and 150% display scaling.
 DPI_MANIFEST = r'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="1.0.5.0" processorArchitecture="*" name="MapleStoryAnalyzer" type="win32"/>
-  <description>MapleStoryAnalyzer live efficiency HUD</description>
+  <assemblyIdentity version="1.0.6.0" processorArchitecture="*" name="MapleStoryAnalyzer" type="win32"/>
+  <description>Maple Insight live efficiency HUD</description>
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
       <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
@@ -131,6 +131,7 @@ exe = EXE(
     upx=False,
     console=False,
     disable_windowed_traceback=False,
+    icon=str(repo_root / "assets" / "maple_insight.ico"),
     manifest=DPI_MANIFEST,
 )
 

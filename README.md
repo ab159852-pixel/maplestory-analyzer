@@ -1,4 +1,4 @@
-# MapleStoryAnalyzer
+# Maple Insight
 
 *[English README](README.en.md)*
 
@@ -96,7 +96,7 @@
    Graphics Capture 啟用後，追蹤期間也不必把遊戲切到最前面。
 2. 雙擊 `MapleStoryAnalyzer.exe`。由於這個執行檔沒有數位簽章，Windows 可能會
    跳出 SmartScreen 警告，請點 **更多資訊 → 仍要執行**。
-3. 會開啟一個標題為「MapleStoryAnalyzer」的小視窗，永遠置頂，預設停在 **即時**
+3. 會開啟一個標題為「Maple Insight」的小視窗，永遠置頂，預設停在 **即時**
    分頁。找到遊戲視窗後，LV/HP/MP/EXP 就會在一兩秒內開始顯示數值。
 4. 點回遊戲正常遊玩即可，HUD 會在背景持續讀取。隨時可以切到 **紀錄** 分頁查
    看過去的紀錄，或先到 **設定** → **經濟統計** 設定快捷欄位的藥水名稱、單價與
@@ -131,7 +131,7 @@ py -3.10 -m venv .venv
 
 ## 發佈新版（維護者）
 
-目前這份程式的 `APP_VERSION` 是 `1.0.5`。每次先把
+目前這份程式的 `APP_VERSION` 是 `1.0.6`。每次先把
 `src/maple_analyzer/version.py` 改成下一個版本，再提交並推送同名 tag，例如：
 
 ```powershell

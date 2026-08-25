@@ -28,6 +28,7 @@ from .settings import PotionSlotConfig
 
 
 AUX_SCAN_MIN_MS = 200
+PICKUP_SCAN_MIN_MS = 100
 PICKUP_DETECTION_INTERVAL_S = 0.35
 
 
@@ -56,6 +57,10 @@ class AuxiliaryReading:
     counts: dict[str, int] = field(default_factory=dict)
     error: str | None = None
     timestamp: float | None = None
+    # Kept true by default for compatibility with custom monitor producers;
+    # the split-cadence worker sets it false on potion-only scans so an empty
+    # line list does not erase the visible mesos feed between pickup scans.
+    pickup_scanned: bool = True
 
 
 @dataclass(frozen=True)
@@ -309,6 +314,7 @@ class BackgroundMonitor:
         *,
         sample_interval_ms: int = 300,
         aux_scan_ms: int = 250,
+        pickup_interval_ms: int = 200,
         context_scan_ms: int = 3000,
     ) -> None:
         self.source = source
@@ -323,6 +329,7 @@ class BackgroundMonitor:
         self._lock = threading.Lock()
         self._sample_interval_ms = max(200, min(1000, sample_interval_ms))
         self._aux_scan_ms = max(AUX_SCAN_MIN_MS, aux_scan_ms)
+        self._pickup_interval_ms = max(PICKUP_SCAN_MIN_MS, min(1000, pickup_interval_ms))
         self._context_scan_ms = max(1500, context_scan_ms)
         self._track_pickup = True
         self._track_potions = True
@@ -352,6 +359,10 @@ class BackgroundMonitor:
     def set_sample_interval(self, value_ms: int) -> None:
         with self._lock:
             self._sample_interval_ms = max(200, min(1000, int(value_ms)))
+
+    def set_pickup_interval(self, value_ms: int) -> None:
+        with self._lock:
+            self._pickup_interval_ms = max(PICKUP_SCAN_MIN_MS, min(1000, int(value_ms)))
 
     def set_aux_enabled(self, enabled: bool) -> None:
         if enabled:
@@ -427,31 +438,44 @@ class BackgroundMonitor:
             self._stop.wait(remaining)
 
     def _auxiliary_loop(self) -> None:
-        next_scan = 0.0
+        next_pickup_scan = 0.0
+        next_potion_scan = 0.0
         while not self._stop.is_set():
             if not self._aux_enabled.wait(0.1):
                 continue
             now = time.monotonic()
             requested = self._aux_request.is_set()
-            if now < next_scan and not requested:
-                self._stop.wait(min(0.1, next_scan - now))
+            with self._lock:
+                track_pickup = self._track_pickup
+                track_potions = self._track_potions
+                pickup_interval = self._pickup_interval_ms / 1000
+                potion_interval = self._aux_scan_ms / 1000
+            next_due = min(
+                next_pickup_scan if track_pickup else float("inf"),
+                next_potion_scan if track_potions else float("inf"),
+            )
+            if not requested and now < next_due:
+                self._stop.wait(min(0.1, next_due - now))
                 continue
             self._aux_request.clear()
-            next_scan = now + self._aux_scan_ms / 1000
+            pickup_due = track_pickup and (requested or now >= next_pickup_scan)
+            potion_due = track_potions and (requested or now >= next_potion_scan)
+            if pickup_due:
+                next_pickup_scan = now + pickup_interval
+            if potion_due:
+                next_potion_scan = now + potion_interval
             try:
                 with self._lock:
-                    track_pickup = self._track_pickup
-                    track_potions = self._track_potions
                     configured_slots = self._configured_potion_slots
                     slots = self._potion_slots
                 if not (track_pickup or track_potions):
                     continue
                 regions = self.source.grab_auxiliary()
                 lines: list[tuple[str, float]] = []
-                if track_pickup:
+                if pickup_due:
                     lines = self._read_pickup_lines(regions, now)
                 counts: dict[str, int] = {}
-                if track_potions:
+                if potion_due:
                     read_shortcut_counts = getattr(self.ocr, "read_shortcut_counts", None)
                     if callable(read_shortcut_counts) and regions.get("shortcut") is not None:
                         configured_ids = {slot.slot for slot in configured_slots}
@@ -484,7 +508,11 @@ class BackgroundMonitor:
                                 counts[slot.slot] = count
                 _put_latest(
                     self.auxiliary_queue,
-                    AuxiliaryReading(tuple(lines), counts, timestamp=time.monotonic()),
+                    AuxiliaryReading(
+                        tuple(lines), counts,
+                        timestamp=time.monotonic(),
+                        pickup_scanned=bool(pickup_due),
+                    ),
                 )
             except RuntimeError as exc:
                 _put_latest(
