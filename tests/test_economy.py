@@ -138,7 +138,7 @@ def test_recovery_without_slot_drop_never_creates_potion_cost_and_estimates_savi
 def test_quantity_increase_only_resets_baseline_and_a_later_drop_counts():
     tracker = EconomyTracker([
         PotionSlotConfig(slot="F1", name="Red Potion", kind="hp", cost=25, recovery=50),
-    ])
+    ], allow_in_session_restock=True)
 
     tracker.record_quick_slot_counts({"F1": 10}, now=0)
     # A restock is accepted only after three identical frames so a joined
@@ -168,9 +168,11 @@ def test_recovery_after_confirmed_drop_is_potion_even_when_amount_is_capped():
     snapshot = tracker.snapshot
     assert snapshot.potion_uses == 1
     assert snapshot.potion_cost == 25
-    assert snapshot.hp_recovery_potion == 30
-    assert snapshot.hp_recovery_natural == 0
-    assert snapshot.hp_recovery_savings == 0
+    # A partial heal is no longer attributed to a potion: without an exact
+    # configured amount it is indistinguishable from a skill/natural tick.
+    assert snapshot.hp_recovery_potion == 0
+    assert snapshot.hp_recovery_natural == 30
+    assert snapshot.hp_recovery_savings == 36.0
 
 
 def test_one_frame_lower_ocr_is_not_a_potion_use():
@@ -269,14 +271,17 @@ def test_one_frame_neighbour_cell_merge_never_publishes_as_restock():
 
 
 def test_restock_requires_three_identical_frames():
-    tracker = EconomyTracker([PotionSlotConfig(slot="7", kind="mp", cost=604)])
+    tracker = EconomyTracker(
+        [PotionSlotConfig(slot="7", kind="mp", cost=604)],
+        allow_in_session_restock=True,
+    )
     tracker.prime_quick_slot_counts({"7": 89})
 
-    tracker.record_quick_slot_counts({"7": 120}, now=1)
-    tracker.record_quick_slot_counts({"7": 120}, now=1.5)
+    tracker.record_quick_slot_counts({"7": 94}, now=1)
+    tracker.record_quick_slot_counts({"7": 94}, now=1.5)
     assert tracker.snapshot.shortcut_current == {"7": 89}
-    tracker.record_quick_slot_counts({"7": 120}, now=2)
-    assert tracker.snapshot.shortcut_current == {"7": 120}
+    tracker.record_quick_slot_counts({"7": 94}, now=2)
+    assert tracker.snapshot.shortcut_current == {"7": 94}
     assert tracker.snapshot.mp_potion_uses == 0
 
 
@@ -285,7 +290,7 @@ def test_final_reconciliation_commits_missed_quantity_drop_once():
         PotionSlotConfig(slot="2", name="White Potion", kind="hp", cost=320),
         PotionSlotConfig(slot="3", name="Blue Potion", kind="mp", cost=604),
     ])
-    tracker.prime_quick_slot_counts({"2": 1578, "3": 229})
+    tracker.prime_quick_slot_counts({"2": 1578, "3": 229}, now=0)
     # OCR only confirmed part of the real HP stack decrease during the live
     # session; the final visible inventory is authoritative at the boundary.
     tracker.record_quick_slot_counts({"2": 1577, "3": 228}, now=1)
@@ -293,9 +298,55 @@ def test_final_reconciliation_commits_missed_quantity_drop_once():
     assert tracker.snapshot.hp_potion_uses == 1
     assert tracker.snapshot.mp_potion_uses == 1
 
-    uses = tracker.reconcile_quick_slot_counts({"2": 1545, "3": 229}, now=2)
+    uses = tracker.reconcile_quick_slot_counts({"2": 1545, "3": 229}, now=20)
 
     assert uses == 32
     assert tracker.snapshot.hp_potion_uses == 33
     assert tracker.snapshot.mp_potion_uses == 1
     assert tracker.snapshot.hp_potion_cost == 10_560
+
+
+def test_fast_bulk_shortcut_drop_is_rejected_by_realistic_drink_rate():
+    tracker = EconomyTracker([
+        PotionSlotConfig(slot="7", name="Blue Potion", kind="mp", cost=604),
+    ])
+    tracker.prime_quick_slot_counts({"7": 1200}, now=0)
+
+    # 80 drinks in half a second cannot happen in the game and is an OCR
+    # suffix/crop error, not a real inventory event.
+    tracker.record_quick_slot_counts({"7": 1120}, now=0.5)
+    tracker.record_quick_slot_counts({"7": 1120}, now=0.75)
+
+    assert tracker.snapshot.shortcut_current == {"7": 1200}
+    assert tracker.snapshot.mp_potion_uses == 0
+    assert tracker.snapshot.mp_potion_cost == 0
+
+
+def test_live_session_ignores_shortcut_restock_without_refill_action():
+    tracker = EconomyTracker([
+        PotionSlotConfig(slot="7", name="Blue Potion", kind="mp", cost=604),
+    ])
+    tracker.prime_quick_slot_counts({"7": 86}, now=0)
+
+    tracker.record_quick_slot_counts({"7": 91}, now=1)
+    tracker.record_quick_slot_counts({"7": 91}, now=1.5)
+    tracker.record_quick_slot_counts({"7": 91}, now=2)
+
+    assert tracker.snapshot.shortcut_current == {"7": 86}
+    assert tracker.snapshot.mp_potion_uses == 0
+
+
+def test_unconfigured_recovery_is_not_attributed_to_a_pending_potion():
+    tracker = EconomyTracker([
+        PotionSlotConfig(slot="F1", name="Red Potion", kind="hp", cost=25),
+    ])
+    tracker.prime_quick_slot_counts({"F1": 10}, now=0)
+    tracker.record_quick_slot_counts({"F1": 9}, now=1)
+    tracker.record_quick_slot_counts({"F1": 9}, now=1.75)
+    tracker.record_stats(100, 200, now=2)
+    tracker.record_stats(160, 200, now=2.2)
+
+    snapshot = tracker.snapshot
+    assert snapshot.hp_potion_uses == 1
+    assert snapshot.hp_recovery_potion == 0
+    assert snapshot.hp_recovery_natural == 60

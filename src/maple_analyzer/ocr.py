@@ -215,6 +215,7 @@ class StatPanelOcr:
         self,
         image: Image.Image,
         required_slots: Iterable[str] | None = None,
+        blue_slots: Iterable[str] | None = None,
     ) -> dict[str, int]:
         """Read all visible shortcut quantities from the parent bar.
 
@@ -225,13 +226,14 @@ class StatPanelOcr:
         assign the pieces back to slots without guessing from a single cell.
         """
         required = set(required_slots or ())
+        blue = set(blue_slots or ())
         # Configured potion slots have a known cell location.  Recognition on
         # the small lower quantity strip is both much faster than detection on
         # the whole bar and avoids adjacent cells being merged into one OCR
         # run.  The wider detection path remains below as a recovery/fallback
         # for custom callers that ask for slots which the fast crop misses.
         if required:
-            fast_counts = self._read_shortcut_slot_counts(image, required)
+            fast_counts = self._read_shortcut_slot_counts(image, required, blue)
             if required.issubset(fast_counts):
                 return fast_counts
         else:
@@ -269,6 +271,7 @@ class StatPanelOcr:
         self,
         image: Image.Image,
         required_slots: Iterable[str],
+        blue_slots: Iterable[str] = (),
     ) -> dict[str, int]:
         """Read configured cells without running full-bar text detection.
 
@@ -282,6 +285,7 @@ class StatPanelOcr:
         ref_h = SHORTCUT_BOX[3] - SHORTCUT_BOX[1]
         scale_x = parent_w / ref_w
         scale_y = parent_h / ref_h
+        blue_slot_ids = {str(slot_id) for slot_id in blue_slots}
         counts: dict[str, int] = {}
         for slot_id in required_slots:
             box = SHORTCUT_SLOT_BOXES.get(str(slot_id))
@@ -322,7 +326,7 @@ class StatPanelOcr:
             # or joins it with the neighboring cell (91 -> 915).  A targeted
             # colour-neutralized pass is more trustworthy for that cell than
             # either ambiguous result.  White HP counts keep the cheap path.
-            if _looks_like_blue_shortcut_cell(crop):
+            if str(slot_id) in blue_slot_ids or _looks_like_blue_shortcut_cell(crop):
                 blue_count = _read_blue_shortcut_count(
                     self,
                     image,
@@ -515,48 +519,41 @@ def _read_blue_shortcut_count(
 ) -> int | None:
     """Read an MP quantity while separating it from its neighbor cell.
 
-    A narrow cell view is preferred when it yields at least two digits.  If
-    the first digit is hidden by the blue bottle, use a wider view and accept
-    only the final OCR-separated numeric group (``01 91`` -> ``91``).  A lone
-    merged group such as ``969`` is deliberately rejected instead of being
-    published as a plausible but wrong inventory count.
+    Read the complete isolated cell and several progressively tighter left
+    edges.  A suffix such as ``6`` is never preferred over a complete ``86``
+    candidate from the same cell.  The views do not extend into the next cell,
+    so this recovery path cannot manufacture a value by joining neighbours.
     """
-    narrow = _blue_shortcut_variant(
-        image, box, scale_x, scale_y, left_pad=5, right_pad=0
-    )
-    narrow_text = ocr._read_once(narrow)[0] if narrow is not None else ""
-    narrow_matches = re.findall(r"\d[\d,]*", narrow_text)
-    if narrow_matches and len(narrow_matches[-1].replace(",", "")) >= 2:
-        try:
-            return int(narrow_matches[-1].replace(",", ""))
-        except ValueError:
-            pass
+    candidates: list[int] = []
 
-    wide = _blue_shortcut_variant(
-        image, box, scale_x, scale_y, left_pad=0, right_pad=12
-    )
-    wide_text = ocr._read_once(wide)[0] if wide is not None else ""
-    wide_matches = re.findall(r"\d[\d,]*", wide_text)
-    if len(wide_matches) >= 2:
-        try:
-            return int(wide_matches[-1].replace(",", ""))
-        except ValueError:
-            pass
+    # The old implementation started with a five-pixel left inset.  At the
+    # user's current scale that can remove the leading ``8`` from ``86`` and
+    # leave a perfectly plausible-looking ``6``.  Read the complete cell first
+    # and then use progressively tighter views only as corroboration.  These
+    # views never extend into the neighbouring cell, so preferring the longest
+    # numeric candidate cannot turn the adjacent quantity into this slot.
+    for left_pad in (0, 2, 4, 5):
+        view = _blue_shortcut_variant(
+            image, box, scale_x, scale_y, left_pad=left_pad, right_pad=0
+        )
+        if view is None:
+            continue
+        text, _records = ocr._read_once(view)
+        for match in re.findall(r"\d[\d,]*", text):
+            try:
+                value = int(match.replace(",", ""))
+            except ValueError:
+                continue
+            if 0 <= value <= 999_999:
+                candidates.append(value)
 
-    # One more narrow edge is useful when the first digit sits exactly on the
-    # five-pixel inset boundary.  It is reached only when the two preferred
-    # views were inconclusive, so it cannot override a separated wide read.
-    edge = _blue_shortcut_variant(
-        image, box, scale_x, scale_y, left_pad=6, right_pad=0
-    )
-    edge_text = ocr._read_once(edge)[0] if edge is not None else ""
-    edge_matches = re.findall(r"\d[\d,]*", edge_text)
-    if edge_matches and len(edge_matches[-1].replace(",", "")) >= 2:
-        try:
-            return int(edge_matches[-1].replace(",", ""))
-        except ValueError:
-            pass
-    return None
+    if not candidates:
+        return None
+
+    # A suffix read (6) is less informative than a complete read (86).  The
+    # quantity is right-aligned inside this isolated cell, so the greatest
+    # digit width is the safest tie-breaker for this colour-specific path.
+    return max(candidates, key=lambda value: (len(str(value)), value))
 
 
 def _as_iterable(value: Any) -> Iterable[Any]:

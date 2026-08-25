@@ -479,12 +479,26 @@ class BackgroundMonitor:
                     read_shortcut_counts = getattr(self.ocr, "read_shortcut_counts", None)
                     if callable(read_shortcut_counts) and regions.get("shortcut") is not None:
                         configured_ids = {slot.slot for slot in configured_slots}
+                        blue_ids = {
+                            slot.slot
+                            for slot in configured_slots
+                            if slot.kind in ("mp", "both")
+                        }
                         try:
-                            detected_counts = read_shortcut_counts(regions["shortcut"], configured_ids)
+                            detected_counts = read_shortcut_counts(
+                                regions["shortcut"], configured_ids, blue_ids
+                            )
                         except TypeError:
                             # Compatibility with custom OCR adapters that still
-                            # expose the original one-argument method.
-                            detected_counts = read_shortcut_counts(regions["shortcut"])
+                            # expose the original one/two-argument method.
+                            try:
+                                detected_counts = read_shortcut_counts(
+                                    regions["shortcut"], configured_ids
+                                )
+                            except TypeError:
+                                # Compatibility with custom OCR adapters that
+                                # still expose the original one-argument method.
+                                detected_counts = read_shortcut_counts(regions["shortcut"])
                         enabled_slots = {slot.slot for slot in slots if slot.enabled}
                         counts = {
                             slot_id: count

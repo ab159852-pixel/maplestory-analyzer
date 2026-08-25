@@ -12,6 +12,7 @@ EXP162950[38.05%]) and confirming it matches this pipeline's output.
 import pytest
 
 from maple_analyzer.capture import StaticImageCapture
+from maple_analyzer import ocr as ocr_module
 from maple_analyzer.ocr import OcrLine, StatPanelOcr
 from maple_analyzer.parser import parse_fields
 
@@ -72,3 +73,25 @@ def test_shortcut_detection_splits_adjacent_quantity_runs_without_loading_ocr():
     assert counts["2"] == 2037
     assert counts["3"] == 465
     assert counts["8"] == 303
+
+
+def test_blue_shortcut_prefers_complete_quantity_over_suffix_read():
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    readings = iter([
+        ("6", []),
+        ("86", []),
+        ("6", []),
+        ("86", []),
+    ])
+    ocr._read_once = lambda _image: next(readings)
+
+    from PIL import Image
+    count = ocr_module._read_blue_shortcut_count(
+        ocr,
+        Image.new("RGB", (200, 200)),
+        (997, 700, 1034, 735),
+        1.0,
+        1.0,
+    )
+
+    assert count == 86

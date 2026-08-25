@@ -2020,7 +2020,7 @@ class OverlayApp:
                     stable[slot_id] = count
             if not stable:
                 return
-            economy.prime_quick_slot_counts(stable)
+            economy.prime_quick_slot_counts(stable, now=now)
             self._potion_baseline_pending = False
             self._last_logged_shortcut_counts = dict(stable)
             visible = ", ".join(f"{slot}={count}" for slot, count in sorted(stable.items()))
@@ -2583,10 +2583,22 @@ class OverlayApp:
             if callable(read_shortcut_counts) and regions.get("shortcut") is not None:
                 try:
                     configured_ids = {slot.slot for slot in configured if slot.enabled}
+                    blue_ids = {
+                        slot.slot
+                        for slot in configured
+                        if slot.enabled and slot.kind in ("mp", "both")
+                    }
                     try:
-                        detected_counts = read_shortcut_counts(regions["shortcut"], configured_ids)
+                        detected_counts = read_shortcut_counts(
+                            regions["shortcut"], configured_ids, blue_ids
+                        )
                     except TypeError:
-                        detected_counts = read_shortcut_counts(regions["shortcut"])
+                        try:
+                            detected_counts = read_shortcut_counts(
+                                regions["shortcut"], configured_ids
+                            )
+                        except TypeError:
+                            detected_counts = read_shortcut_counts(regions["shortcut"])
                     enabled_slots = {slot.slot for slot in slots if slot.enabled}
                     counts = {
                         slot_id: count
