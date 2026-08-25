@@ -297,7 +297,12 @@ class StatPanelOcr:
             # includes the previous cell's trailing ``1`` and turns it into
             # 1115.  Five reference pixels keeps the whole current quantity
             # while excluding that neighboring glyph.
-            left_pad = 5 if column else 0
+            # The second cell in each row has a one-pixel render seam that
+            # makes the standard inset turn a 3 into a 9 (for example
+            # 1239 -> 1299).  A smaller inset and one-pixel lower baseline
+            # keeps the complete outlined digit while excluding the previous
+            # cell.  Slot 6 is the usual HP-water position.
+            left_pad = 2 if column == 1 else (5 if column else 0)
             right_pad = 8 if column < 3 else 0
             crop = image.crop((
                 max(0, round((box[0] - SHORTCUT_BOX[0] + left_pad) * scale_x)),
@@ -307,7 +312,7 @@ class StatPanelOcr:
                 # example 1343 becomes 11349).  The +10 crop keeps the full
                 # quantity while excluding the label; read_slot_count also
                 # tolerates the small outlined-border zero at the left edge.
-                max(0, round((box[1] - SHORTCUT_BOX[1] + 10) * scale_y)),
+                max(0, round((box[1] - SHORTCUT_BOX[1] + (9 if column == 1 else 10)) * scale_y)),
                 min(parent_w, round((box[2] - SHORTCUT_BOX[0] + right_pad) * scale_x)),
                 min(parent_h, round((box[3] - SHORTCUT_BOX[1] + 2) * scale_y)),
             ))
