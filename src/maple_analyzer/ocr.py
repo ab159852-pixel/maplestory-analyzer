@@ -318,20 +318,15 @@ class StatPanelOcr:
             # colour-neutralized pass is more trustworthy for that cell than
             # either ambiguous result.  White HP counts keep the cheap path.
             if _looks_like_blue_shortcut_cell(crop):
-                colored = _blue_shortcut_variant(image, box, scale_x, scale_y)
-                if colored is not None:
-                    blue_text, _records = self._read_once(colored)
-                    # Keep OCR-separated groups separate: ``6 91`` means the
-                    # keyboard label plus the quantity 91, not the number 691.
-                    matches = re.findall(r"\d[\d,]*", blue_text)
-                    blue_count = None
-                    if matches:
-                        try:
-                            blue_count = int(matches[-1].replace(",", ""))
-                        except ValueError:
-                            blue_count = None
-                    if blue_count is not None:
-                        count = blue_count
+                blue_count = _read_blue_shortcut_count(
+                    self,
+                    image,
+                    box,
+                    scale_x,
+                    scale_y,
+                )
+                if blue_count is not None:
+                    count = blue_count
             if count is not None:
                 counts[str(slot_id)] = count
         return counts
@@ -471,6 +466,9 @@ def _blue_shortcut_variant(
     box: tuple[int, int, int, int],
     scale_x: float,
     scale_y: float,
+    *,
+    left_pad: int,
+    right_pad: int,
 ) -> Image.Image | None:
     """Build a clean numeric view for a blue potion quantity.
 
@@ -483,9 +481,9 @@ def _blue_shortcut_variant(
     stays unchanged.
     """
     parent_w, parent_h = image.size
-    left = max(0, round((box[0] - SHORTCUT_BOX[0]) * scale_x))
+    left = max(0, round((box[0] - SHORTCUT_BOX[0] + left_pad) * scale_x))
     top = max(0, round((box[1] - SHORTCUT_BOX[1] + 10) * scale_y))
-    right = min(parent_w, round((box[2] - SHORTCUT_BOX[0] + 12) * scale_x))
+    right = min(parent_w, round((box[2] - SHORTCUT_BOX[0] + right_pad) * scale_x))
     bottom = min(parent_h, round((box[3] - SHORTCUT_BOX[1] + 2) * scale_y))
     if right <= left or bottom <= top:
         return None
@@ -501,6 +499,59 @@ def _blue_shortcut_variant(
         (max(1, source.width * 5), max(1, source.height * 5)),
         resampling.LANCZOS,
     )
+
+
+def _read_blue_shortcut_count(
+    ocr: StatPanelOcr,
+    image: Image.Image,
+    box: tuple[int, int, int, int],
+    scale_x: float,
+    scale_y: float,
+) -> int | None:
+    """Read an MP quantity while separating it from its neighbor cell.
+
+    A narrow cell view is preferred when it yields at least two digits.  If
+    the first digit is hidden by the blue bottle, use a wider view and accept
+    only the final OCR-separated numeric group (``01 91`` -> ``91``).  A lone
+    merged group such as ``969`` is deliberately rejected instead of being
+    published as a plausible but wrong inventory count.
+    """
+    narrow = _blue_shortcut_variant(
+        image, box, scale_x, scale_y, left_pad=5, right_pad=0
+    )
+    narrow_text = ocr._read_once(narrow)[0] if narrow is not None else ""
+    narrow_matches = re.findall(r"\d[\d,]*", narrow_text)
+    if narrow_matches and len(narrow_matches[-1].replace(",", "")) >= 2:
+        try:
+            return int(narrow_matches[-1].replace(",", ""))
+        except ValueError:
+            pass
+
+    wide = _blue_shortcut_variant(
+        image, box, scale_x, scale_y, left_pad=0, right_pad=12
+    )
+    wide_text = ocr._read_once(wide)[0] if wide is not None else ""
+    wide_matches = re.findall(r"\d[\d,]*", wide_text)
+    if len(wide_matches) >= 2:
+        try:
+            return int(wide_matches[-1].replace(",", ""))
+        except ValueError:
+            pass
+
+    # One more narrow edge is useful when the first digit sits exactly on the
+    # five-pixel inset boundary.  It is reached only when the two preferred
+    # views were inconclusive, so it cannot override a separated wide read.
+    edge = _blue_shortcut_variant(
+        image, box, scale_x, scale_y, left_pad=6, right_pad=0
+    )
+    edge_text = ocr._read_once(edge)[0] if edge is not None else ""
+    edge_matches = re.findall(r"\d[\d,]*", edge_text)
+    if edge_matches and len(edge_matches[-1].replace(",", "")) >= 2:
+        try:
+            return int(edge_matches[-1].replace(",", ""))
+        except ValueError:
+            pass
+    return None
 
 
 def _as_iterable(value: Any) -> Iterable[Any]:
