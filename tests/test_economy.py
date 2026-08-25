@@ -141,7 +141,11 @@ def test_quantity_increase_only_resets_baseline_and_a_later_drop_counts():
     ])
 
     tracker.record_quick_slot_counts({"F1": 10}, now=0)
-    tracker.record_quick_slot_counts({"F1": 12}, now=1)  # dropped potion/restock
+    # A restock is accepted only after three identical frames so a joined
+    # neighbour cell cannot redefine the inventory baseline.
+    tracker.record_quick_slot_counts({"F1": 12}, now=1)
+    tracker.record_quick_slot_counts({"F1": 12}, now=1.5)
+    tracker.record_quick_slot_counts({"F1": 12}, now=1.75)  # restock
     assert tracker.snapshot.potion_uses == 0
     tracker.record_quick_slot_counts({"F1": 11}, now=2)
     assert tracker.snapshot.potion_uses == 0
@@ -249,6 +253,31 @@ def test_truncated_shortcut_ocr_never_jumps_inventory_to_a_suffix():
     tracker.record_quick_slot_counts({"7": 115}, now=2)
     assert tracker.snapshot.shortcut_current == {"7": 115}
     assert tracker.snapshot.mp_potion_uses == 1
+
+
+def test_one_frame_neighbour_cell_merge_never_publishes_as_restock():
+    tracker = EconomyTracker([PotionSlotConfig(slot="7", kind="mp", cost=604)])
+    tracker.prime_quick_slot_counts({"7": 89})
+
+    # The neighbouring cell can be joined to the MP count for one frame.
+    # That is not a restock and must not leak into the visible inventory.
+    tracker.record_quick_slot_counts({"7": 895}, now=1)
+    assert tracker.snapshot.shortcut_current == {"7": 89}
+    tracker.record_quick_slot_counts({"7": 89}, now=1.5)
+    assert tracker.snapshot.shortcut_current == {"7": 89}
+    assert tracker.snapshot.mp_potion_uses == 0
+
+
+def test_restock_requires_three_identical_frames():
+    tracker = EconomyTracker([PotionSlotConfig(slot="7", kind="mp", cost=604)])
+    tracker.prime_quick_slot_counts({"7": 89})
+
+    tracker.record_quick_slot_counts({"7": 120}, now=1)
+    tracker.record_quick_slot_counts({"7": 120}, now=1.5)
+    assert tracker.snapshot.shortcut_current == {"7": 89}
+    tracker.record_quick_slot_counts({"7": 120}, now=2)
+    assert tracker.snapshot.shortcut_current == {"7": 120}
+    assert tracker.snapshot.mp_potion_uses == 0
 
 
 def test_final_reconciliation_commits_missed_quantity_drop_once():

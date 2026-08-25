@@ -37,6 +37,10 @@ SLOT_CONFIRMATIONS_REQUIRED = 2
 # later identical/lower read can still confirm it.
 SLOT_CANDIDATE_MAX_GAP_SECONDS = 5.0
 MAX_SLOT_DROP_PER_SCAN = 99
+# An increase is not a potion event.  It can be a genuine restock, but it can
+# also be the OCR joining the neighbouring shortcut cell (89 -> 895).  Never
+# publish that jump from one frame; require three identical frames first.
+SLOT_INCREASE_CONFIRMATIONS_REQUIRED = 3
 # A final inventory reconciliation may cover a long interval, so it is not
 # limited by the per-scan held-key guard above.  Values larger than this are
 # more likely to be a missing OCR digit than a real single-session depletion.
@@ -398,21 +402,49 @@ class EconomyTracker:
                 self._shortcut_observed[slot_id] = current
                 self._slot_candidates.pop(slot_id, None)
                 continue
-            if current >= previous:
-                # A restock/pickup is a new baseline.  Returning to the old
-                # quantity also cancels a one-frame low OCR candidate.
+            if current == previous:
+                # A stable return to the trusted value cancels either kind of
+                # one-frame OCR candidate.
+                self._slot_counts[slot_id] = current
+                self._shortcut_observed[slot_id] = current
+                self._slot_candidates.pop(slot_id, None)
+                continue
+
+            if current > previous:
+                # A quantity increase can be a restock, but a single OCR
+                # frame must not make the visible inventory jump when the
+                # adjacent cell was accidentally included (for example
+                # 89 -> 895).  Keep it pending until the exact same value is
+                # seen three times.  A lower frame cancels this candidate.
+                candidate = self._slot_candidates.get(slot_id)
+                candidate_is_recent = (
+                    candidate is not None
+                    and timestamp - candidate[2] <= SLOT_CANDIDATE_MAX_GAP_SECONDS
+                )
+                if candidate_is_recent and candidate[0] == current:
+                    confirmations = candidate[1] + 1
+                else:
+                    confirmations = 1
+                self._slot_candidates[slot_id] = (current, confirmations, timestamp)
+                if confirmations < SLOT_INCREASE_CONFIRMATIONS_REQUIRED:
+                    continue
+                self._slot_candidates.pop(slot_id, None)
                 self._slot_counts[slot_id] = current
                 self._shortcut_observed[slot_id] = current
                 if (
-                    current > previous
-                    and self._slot_charged.get(slot_id, 0) == 0
+                    self._slot_charged.get(slot_id, 0) == 0
                     and _is_probable_leading_digit_recovery(previous, current)
                 ):
                     # The first baseline may have lost a leading digit.  Do
                     # not leave the UI showing a false initial quantity.
                     self._shortcut_baseline[slot_id] = current
-                self._slot_candidates.pop(slot_id, None)
                 continue
+
+            # A pending increase is not evidence for a decrease.  This
+            # matters when one bad frame is followed by the real quantity.
+            candidate = self._slot_candidates.get(slot_id)
+            if candidate is not None and candidate[0] > previous:
+                self._slot_candidates.pop(slot_id, None)
 
             if _is_probable_truncated_count(previous, current):
                 # Keep the trusted and displayed values stable; a suffix such

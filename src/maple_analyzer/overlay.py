@@ -329,6 +329,7 @@ class OverlayApp:
         # The first shortcut OCR result after Start/Resume is an inventory
         # baseline, never a potion-use event.
         self._potion_baseline_pending = True
+        self._potion_baseline_samples: list[dict[str, int]] = []
         self._last_logged_shortcut_counts: dict[str, int] | None = None
         self._next_aux_scan = 0.0
         # Full pickup-feed detection is much slower than recognition-only
@@ -1925,6 +1926,7 @@ class OverlayApp:
             if economy is not None:
                 economy.begin_quick_slot_baseline()
             self._potion_baseline_pending = True
+            self._potion_baseline_samples.clear()
             self._last_logged_shortcut_counts = None
         if monitor is not None:
             monitor.set_aux_enabled(enabled)
@@ -1940,10 +1942,28 @@ class OverlayApp:
         if self._potion_baseline_pending:
             if not counts:
                 return
-            economy.prime_quick_slot_counts(counts)
+            # The first read is calibration, not accounting.  Require each
+            # slot to repeat the same value in two consecutive auxiliary
+            # frames before making it the session baseline.  This prevents a
+            # single adjacent-cell OCR merge (e.g. 89 -> 895) from defining
+            # the starting inventory for the entire session.
+            self._potion_baseline_samples.append(dict(counts))
+            if len(self._potion_baseline_samples) > 3:
+                del self._potion_baseline_samples[:-3]
+            stable: dict[str, int] = {}
+            for slot_id, count in counts.items():
+                confirmations = sum(
+                    sample.get(slot_id) == count
+                    for sample in self._potion_baseline_samples
+                )
+                if confirmations >= 2:
+                    stable[slot_id] = count
+            if not stable:
+                return
+            economy.prime_quick_slot_counts(stable)
             self._potion_baseline_pending = False
-            self._last_logged_shortcut_counts = dict(counts)
-            visible = ", ".join(f"{slot}={count}" for slot, count in sorted(counts.items()))
+            self._last_logged_shortcut_counts = dict(stable)
+            visible = ", ".join(f"{slot}={count}" for slot, count in sorted(stable.items()))
             self._log(f"[{time.strftime('%H:%M:%S')}] potion baseline: {visible}")
             return
         if counts != self._last_logged_shortcut_counts:
