@@ -23,7 +23,7 @@ repo_root = Path(SPECPATH).resolve().parent
 # same as the source run at 100%, 125%, and 150% display scaling.
 DPI_MANIFEST = r'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="1.0.6.0" processorArchitecture="*" name="MapleStoryAnalyzer" type="win32"/>
+  <assemblyIdentity version="1.0.7.0" processorArchitecture="*" name="MapleStoryAnalyzer" type="win32"/>
   <description>Maple Insight live efficiency HUD</description>
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
@@ -36,6 +36,10 @@ DPI_MANIFEST = r'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 datas = []
 binaries = []
 hiddenimports = []
+
+# ``icon=`` embeds the executable's shell icon, while Tk needs the same ICO
+# available at runtime for the title bar/taskbar icon.
+datas.append((str(repo_root / "assets" / "maple_insight.ico"), "."))
 
 for pkg in ("customtkinter", "rapidocr_onnxruntime", "winrt", "mss"):
     pkg_datas, pkg_binaries, pkg_hiddenimports = collect_all(pkg)

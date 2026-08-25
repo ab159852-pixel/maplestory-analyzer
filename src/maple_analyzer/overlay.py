@@ -40,6 +40,7 @@ import contextlib
 import dataclasses
 import math
 import os
+from pathlib import Path
 import queue
 import sys
 import threading
@@ -378,6 +379,19 @@ class OverlayApp:
 
         self.root = ctk.CTk()
         self.root.title(APP_DISPLAY_NAME)
+        # PyInstaller's ``icon=`` sets the executable/file icon, but Tk uses
+        # a separate runtime window icon.  Set that explicitly as well so the
+        # title bar and taskbar do not keep showing the old default icon.
+        icon_candidates = (
+            Path(sys.executable).resolve().parent / "maple_insight.ico",
+            Path(getattr(sys, "_MEIPASS", "")) / "maple_insight.ico",
+            Path(__file__).resolve().parents[2] / "assets" / "maple_insight.ico",
+        )
+        for icon_path in icon_candidates:
+            if icon_path.is_file():
+                with contextlib.suppress(tk.TclError, OSError):
+                    self.root.iconbitmap(default=str(icon_path))
+                break
         self.root.attributes("-topmost", self._settings.topmost)
         self.root.attributes("-alpha", 1.0)
         self.root.configure(fg_color=BG)
