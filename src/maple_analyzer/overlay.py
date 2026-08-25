@@ -441,7 +441,6 @@ class OverlayApp:
             unselected_color=TAB_UNSELECTED,
             unselected_hover_color=TAB_HOVER,
             border_width=1,
-            border_color=GLOW_BORDER,
             text_color=INK,
             font=self._font(11, bold=True),
         )
