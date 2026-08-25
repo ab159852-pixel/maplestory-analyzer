@@ -75,6 +75,16 @@ def _is_probable_leading_digit_recovery(previous: int, current: int) -> bool:
     return len(current_text) > len(previous_text) and current_text.endswith(previous_text)
 
 
+def _is_probable_shortcut_truncation(previous: int, current: int) -> bool:
+    """Reject a missing-leading-digit read, including nonmatching suffixes."""
+    if _is_probable_truncated_count(previous, current):
+        return True
+    # OCR can turn a two-digit quantity such as 82 into a lone 2 while also
+    # changing the surviving glyph enough that the suffix test misses it.
+    # A genuine 10 -> 9 drink is the only one-digit transition worth keeping.
+    return previous >= 10 and current < 10 and previous - current > 1
+
+
 def parse_mesos_amount(text: str) -> int | None:
     """Extract a mesos amount from a pickup line.
 
@@ -315,6 +325,7 @@ class EconomyTracker:
             self._slot_counts.clear()
             self._slot_charged.clear()
             self._slot_last_accepted_at.clear()
+            self._slot_last_sample_at.clear()
             self._shortcut_baseline.clear()
             self._shortcut_observed.clear()
             self._slot_candidates.clear()
@@ -334,6 +345,7 @@ class EconomyTracker:
         self._slot_counts.clear()
         self._slot_charged = {}
         self._slot_last_accepted_at.clear()
+        self._slot_last_sample_at.clear()
         self._shortcut_baseline.clear()
         self._shortcut_observed.clear()
         self._slot_candidates.clear()
@@ -352,6 +364,7 @@ class EconomyTracker:
                 self._shortcut_observed[slot_id] = count
                 self._slot_charged[slot_id] = 0
                 self._slot_last_accepted_at[slot_id] = timestamp
+                self._slot_last_sample_at[slot_id] = timestamp
 
     def reset(self) -> None:
         self._mesos.reset()
@@ -375,6 +388,7 @@ class EconomyTracker:
         self._slot_counts: dict[str, int] = {}
         self._slot_charged = {}
         self._slot_last_accepted_at: dict[str, float] = {}
+        self._slot_last_sample_at: dict[str, float] = {}
         self._shortcut_baseline: dict[str, int] = {}
         self._shortcut_observed: dict[str, int] = {}
         self._slot_candidates: dict[str, tuple[int, int, float]] = {}
@@ -411,6 +425,8 @@ class EconomyTracker:
             return 0
         uses = 0
         for slot_id, current in valid_counts.items():
+            previous_sample_at = self._slot_last_sample_at.get(slot_id)
+            self._slot_last_sample_at[slot_id] = timestamp
             previous = self._slot_counts.get(slot_id)
             if previous is None:
                 self._slot_counts[slot_id] = current
@@ -469,7 +485,7 @@ class EconomyTracker:
             if candidate is not None and candidate[0] > previous:
                 self._slot_candidates.pop(slot_id, None)
 
-            if _is_probable_truncated_count(previous, current):
+            if _is_probable_shortcut_truncation(previous, current):
                 # Keep the trusted and displayed values stable; a suffix such
                 # as 6/16 is a crop error, not a real drop from 116.
                 self._slot_candidates.pop(slot_id, None)
@@ -498,7 +514,9 @@ class EconomyTracker:
             self._slot_candidates[slot_id] = (current, confirmations, timestamp)
             if confirmations >= SLOT_CONFIRMATIONS_REQUIRED:
                 confirmed_drop = previous - current
-                allowed_drop = self._allowed_drop_for_slot(slot_id, timestamp)
+                allowed_drop = self._allowed_drop_for_slot(
+                    slot_id, timestamp, reference_at=previous_sample_at
+                )
                 if allowed_drop <= 0:
                     # The candidate may be real but it arrived before the
                     # game's minimum drink interval.  Keep it pending until a
@@ -516,9 +534,15 @@ class EconomyTracker:
                 uses += self._commit_slot_drop(slot_id, confirmed_drop, timestamp)
         return uses
 
-    def _allowed_drop_for_slot(self, slot_id: str, timestamp: float) -> int:
-        """Return the maximum believable consumption since the last commit."""
-        last = self._slot_last_accepted_at.get(slot_id)
+    def _allowed_drop_for_slot(
+        self,
+        slot_id: str,
+        timestamp: float,
+        *,
+        reference_at: float | None = None,
+    ) -> int:
+        """Return the maximum believable consumption since the last sample."""
+        last = reference_at if reference_at is not None else self._slot_last_sample_at.get(slot_id)
         if last is None or timestamp < last:
             # Keep deterministic/unit-test callers that use synthetic times
             # before a real monotonic baseline backwards compatible.  Live
@@ -572,7 +596,7 @@ class EconomyTracker:
                     self._shortcut_observed[slot_id] = current
                 self._slot_candidates.pop(slot_id, None)
                 continue
-            if _is_probable_truncated_count(self._slot_counts.get(slot_id, baseline), current):
+            if _is_probable_shortcut_truncation(self._slot_counts.get(slot_id, baseline), current):
                 continue
             total_drop = baseline - current
             already_charged = self._slot_charged.get(slot_id, 0)
@@ -586,6 +610,7 @@ class EconomyTracker:
             self._shortcut_observed[slot_id] = current
             self._slot_candidates.pop(slot_id, None)
             self._slot_last_accepted_at[slot_id] = timestamp
+            self._slot_last_sample_at[slot_id] = timestamp
             uses += self._commit_slot_drop(slot_id, missing, timestamp)
         return uses
 
@@ -660,9 +685,17 @@ class EconomyTracker:
                 continue
             if slot.kind not in (kind, "both"):
                 continue
+            if _is_probable_shortcut_truncation(previous, current):
+                self._slot_candidates.pop(slot_id, None)
+                continue
+            drop = previous - current
+            allowed_drop = self._allowed_drop_for_slot(slot_id, now)
+            if allowed_drop <= 0 or drop > min(MAX_SLOT_DROP_PER_SCAN, allowed_drop):
+                self._slot_candidates.pop(slot_id, None)
+                continue
             expected = slot.recovery or self._default_recovery(kind)
             if expected > 0 and _recovery_matches(expected, amount):
-                exact.append((slot_id, previous - current, current))
+                exact.append((slot_id, drop, current))
         if not exact:
             return
         slot_id, drop, current = exact[0]
