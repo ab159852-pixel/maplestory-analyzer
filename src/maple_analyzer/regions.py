@@ -14,6 +14,11 @@ from dataclasses import dataclass
 
 REFERENCE_CLIENT_SIZE = (1351, 800)  # size of samples/maple_story_ui.jpg
 
+# A shortcut stack in MapleStory is displayed as a four-digit quantity at
+# most.  Keep this domain rule next to the shortcut geometry so every OCR and
+# accounting path can share the same hard boundary.
+MAX_SHORTCUT_QUANTITY = 9_999
+
 # Whole stat panel, in absolute pixels at REFERENCE_CLIENT_SIZE. Grabbed once per
 # tick with a single mss.grab() call; FIELD_BOXES below are sliced out of it
 # in-memory (no extra screen captures).
@@ -57,8 +62,12 @@ BAR_BOXES = {
 # outside STAT_PANEL_BOX so the existing HP/MP/EXP crops stay unchanged.
 # Coordinates are measured from the same 1351x800 client screenshot used by
 # the status panel.  The pickup feed is the right-side notification stack;
-# SHORTCUT_SLOT_BOXES covers the two-row shortcut grid visible above the
-# bottom action bar.  Users can leave unused slots blank in Settings.
+# SHORTCUT_BOX is the visible outer frame of the 4x2 shortcut grid, not the
+# larger area around it.  The previous implementation used a 165x92 box
+# around a frame that is only 147x77 at the reference size.  That extra
+# padding made the eight crops overlap the frame and, after scaling, drift
+# into their neighbours.  Keep the frame and the eight interior cells in one
+# calibrated coordinate system.
 PICKUP_FEED_BOX = (1080, 470, 1351, 665)
 # Pickup toasts are brief and can shift with client/font scale.  Keep the
 # narrow measured feed for cheap row OCR and a wider lower-right detector box.
@@ -91,16 +100,23 @@ PICKUP_LINE_BOXES = {
     )
     for index in range(12)
 }
-SHORTCUT_BOX = (915, 650, 1080, 742)
+# Measured from the real frame in samples/maple_story_ui.jpg.  Right/bottom
+# are exclusive PIL crop edges.
+SHORTCUT_BOX = (925, 659, 1072, 736)
+
+# Cell boxes use the midpoint of each real separator as their boundary.  The
+# crop therefore contains the whole cell (including the outlined last digit)
+# but never enters the next cell.  The separator itself is harmless chrome;
+# trimming it out was the previous cause of values such as 1570 becoming 57.
 SHORTCUT_SLOT_BOXES = {
-    "1": (925, 659, 960, 695),
-    "2": (960, 659, 997, 695),
-    "3": (997, 659, 1034, 695),
-    "4": (1034, 659, 1071, 695),
-    "5": (925, 700, 960, 735),
-    "6": (960, 700, 997, 735),
-    "7": (997, 700, 1034, 735),
-    "8": (1034, 700, 1071, 735),
+    "1": (925, 659, 963, 700),
+    "2": (963, 659, 998, 700),
+    "3": (998, 659, 1033, 700),
+    "4": (1033, 659, 1072, 700),
+    "5": (925, 700, 963, 736),
+    "6": (963, 700, 998, 736),
+    "7": (998, 700, 1033, 736),
+    "8": (1033, 700, 1072, 736),
 }
 AUXILIARY_BOXES = {
     "pickup": PICKUP_FEED_BOX,
@@ -133,6 +149,14 @@ class Box:
     top: int
     right: int
     bottom: int
+
+    @property
+    def width(self) -> int:
+        return max(0, self.right - self.left)
+
+    @property
+    def height(self) -> int:
+        return max(0, self.bottom - self.top)
 
     def as_tuple(self) -> tuple[int, int, int, int]:
         return (self.left, self.top, self.right, self.bottom)
@@ -242,3 +266,31 @@ def scale_shortcut_box(
 ) -> Box:
     """Map a shortcut-grid box to the current client pixels."""
     return shortcut_transform(client_size).map_box(box)
+
+
+def shortcut_slot_boxes_for_parent(parent: Box) -> dict[str, Box]:
+    """Map the calibrated eight cells into an already-cropped grid frame.
+
+    Live capture may first locate the actual frame from its border pixels.  In
+    that case the frame can be a few pixels larger/smaller than the fallback
+    transform.  Deriving every cell from that one parent keeps all columns and
+    rows aligned and prevents independent rounding from creating slanted
+    boundaries.
+    """
+    frame_left, frame_top, frame_right, frame_bottom = SHORTCUT_BOX
+    frame_width = max(1, frame_right - frame_left)
+    frame_height = max(1, frame_bottom - frame_top)
+    result: dict[str, Box] = {}
+    for slot, raw in SHORTCUT_SLOT_BOXES.items():
+        left, top, right, bottom = raw
+        mapped_left = parent.left + round((left - frame_left) * parent.width / frame_width)
+        mapped_top = parent.top + round((top - frame_top) * parent.height / frame_height)
+        mapped_right = parent.left + round((right - frame_left) * parent.width / frame_width)
+        mapped_bottom = parent.top + round((bottom - frame_top) * parent.height / frame_height)
+        result[slot] = Box(
+            max(parent.left, min(parent.right - 1, mapped_left)),
+            max(parent.top, min(parent.bottom - 1, mapped_top)),
+            max(parent.left + 1, min(parent.right, mapped_right)),
+            max(parent.top + 1, min(parent.bottom, mapped_bottom)),
+        )
+    return result

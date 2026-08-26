@@ -23,6 +23,13 @@ def test_static_auxiliary_capture_returns_full_and_fast_subcrops():
     for slot in SHORTCUT_SLOT_BOXES:
         image = regions[f"shortcut:{slot}"]
         assert image.width > 0 and image.height > 0
+    # The eight OCR crops must tile the measured parent frame.  This catches
+    # both the old oversized parent and the old inner boxes that cut a digit.
+    top_row = [regions[f"shortcut:{slot}"] for slot in ("1", "2", "3", "4")]
+    bottom_row = [regions[f"shortcut:{slot}"] for slot in ("5", "6", "7", "8")]
+    assert sum(image.width for image in top_row) == regions["shortcut"].width
+    assert sum(image.width for image in bottom_row) == regions["shortcut"].width
+    assert top_row[0].height + bottom_row[0].height == regions["shortcut"].height
     for line in PICKUP_LINE_BOXES:
         image = regions[f"pickup:{line}"]
         assert image.width > 0 and image.height > 0

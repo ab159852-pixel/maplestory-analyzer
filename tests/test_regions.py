@@ -1,15 +1,22 @@
 """scale_box scaling math -- pure, no images/OCR."""
 from maple_analyzer.regions import (
     AUXILIARY_BOXES,
+    Box,
     FIELD_BOXES,
     REFERENCE_CLIENT_SIZE,
+    SHORTCUT_BOX,
+    SHORTCUT_SLOT_BOXES,
     STAT_PANEL_BOX,
     scale_box,
     region_transform,
     scale_shortcut_box,
     scale_top_left_box,
+    shortcut_slot_boxes_for_parent,
 )
-from maple_analyzer.capture import _pickup_boxes_for_client
+from maple_analyzer.capture import _pickup_boxes_for_client, detect_shortcut_frame
+from conftest import SAMPLE_IMAGE, SAMPLE_IMAGE_1920
+from PIL import Image
+from maple_analyzer.ocr import _shortcut_quantity_strip
 
 
 def test_identity_scale_at_reference_size():
@@ -66,14 +73,54 @@ def test_top_left_box_does_not_apply_viewport_letterbox():
 
 
 def test_shortcut_grid_is_width_scaled_and_bottom_anchored():
-    # The game keeps the shortcut cell geometry tied to client width even when
-    # the captured client is a few pixels shorter than the reference viewport.
-    parent = scale_shortcut_box((915, 650, 1080, 742), (1368, 769))
-    slot = scale_shortcut_box((960, 700, 997, 735), (1368, 769))
+    # The fallback transform remains deterministic before the border detector
+    # has a frame to measure.  The eight cells must still be inside one parent.
+    parent = scale_shortcut_box(SHORTCUT_BOX, (1368, 769))
+    slot = scale_shortcut_box(SHORTCUT_SLOT_BOXES["2"], (1368, 769))
 
-    assert parent.as_tuple() == (927, 617, 1094, 710)
+    assert parent.as_tuple() == (937, 626, 1085, 704)
     assert parent.left <= slot.left < slot.right <= parent.right
     assert parent.top <= slot.top < slot.bottom <= parent.bottom
+
+
+def test_shortcut_cells_are_aligned_and_non_overlapping():
+    for parent in (
+        Box(0, 0, SHORTCUT_BOX[2] - SHORTCUT_BOX[0], SHORTCUT_BOX[3] - SHORTCUT_BOX[1]),
+        Box(0, 0, 147, 77),
+        Box(0, 0, 206, 108),
+    ):
+        slots = shortcut_slot_boxes_for_parent(parent)
+        assert set(slots) == set(SHORTCUT_SLOT_BOXES)
+        assert all(
+            0 <= box.left < box.right <= parent.width
+            and 0 <= box.top < box.bottom <= parent.height
+            for box in slots.values()
+        )
+        for row in (("1", "2", "3", "4"), ("5", "6", "7", "8")):
+            assert [slots[slot].top for slot in row].count(slots[row[0]].top) == 4
+            assert [slots[slot].bottom for slot in row].count(slots[row[0]].bottom) == 4
+            for left, right in zip(row, row[1:]):
+                assert slots[left].right <= slots[right].left
+
+
+def test_shortcut_quantity_strip_keeps_the_complete_four_digit_width():
+    # The crop is already bounded by separator midpoints.  The OCR strip must
+    # retain the rightmost pixels because the fourth digit can reach that edge.
+    for width, height in ((38, 41), (35, 41), (39, 36), (53, 58)):
+        strip = _shortcut_quantity_strip(Image.new("RGB", (width, height)))
+        assert strip.width == width
+        assert strip.height == height - round(height * 0.48)
+
+
+def test_shortcut_frame_detector_tracks_real_reference_sizes():
+    for path in (SAMPLE_IMAGE, SAMPLE_IMAGE_1920):
+        image = Image.open(path).convert("RGB")
+        expected = scale_shortcut_box(SHORTCUT_BOX, image.size)
+        frame = detect_shortcut_frame(image, expected)
+        assert frame.width >= round(expected.width * 0.65)
+        assert frame.height >= round(expected.height * 0.60)
+        assert 0 <= frame.left < frame.right <= image.width
+        assert 0 <= frame.top < frame.bottom <= image.height
 
 
 def test_wide_client_extends_pickup_feed_to_the_actual_client_edge():

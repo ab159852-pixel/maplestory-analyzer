@@ -30,7 +30,13 @@ from typing import Any, Iterable, Mapping
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 from .numeric_ocr import OnnxNumericRecognizer, crop_level_badge
-from .regions import SHORTCUT_BOX, SHORTCUT_SLOT_BOXES
+from .regions import (
+    MAX_SHORTCUT_QUANTITY,
+    Box,
+    SHORTCUT_BOX,
+    SHORTCUT_SLOT_BOXES,
+    shortcut_slot_boxes_for_parent,
+)
 
 
 # Whole-bar detection is useful as a geometry-aware verification pass, but it
@@ -415,11 +421,11 @@ class StatPanelOcr:
     ) -> dict[str, int]:
         """Read all visible shortcut quantities from the parent bar.
 
-        At non-reference client sizes a quantity can extend across the small
-        per-cell crop boundary (for example ``1180`` becomes ``118`` and the
-        next cell is read as ``7465``).  Detection on the complete bar retains
-        the glyph box; its horizontal position lets us split a merged run and
-        assign the pieces back to slots without guessing from a single cell.
+        The capture layer first measures the outer frame and then cuts the
+        complete eight cells at the actual separator midpoints.  Detection on
+        the complete bar remains a validation fallback, but the primary path
+        no longer relies on a narrow inner crop that can turn ``1570`` into
+        ``57`` at another DPI scale.
         """
         required = set(required_slots or ())
         blue = set(blue_slots or ())
@@ -550,6 +556,7 @@ class StatPanelOcr:
         ref_h = SHORTCUT_BOX[3] - SHORTCUT_BOX[1]
         scale_x = parent_w / ref_w
         scale_y = parent_h / ref_h
+        local_slot_boxes = shortcut_slot_boxes_for_parent(Box(0, 0, parent_w, parent_h))
         blue_slot_ids = {str(slot_id) for slot_id in blue_slots}
         counts: dict[str, int] = {}
         last_signatures = dict(getattr(self, "_shortcut_last_cell_signatures", {}) or {})
@@ -558,7 +565,7 @@ class StatPanelOcr:
         current_values: dict[str, int | None] = {}
         pending: dict[str, tuple[str, Image.Image]] = {}
         for slot_id in required_slots:
-            box = SHORTCUT_SLOT_BOXES.get(str(slot_id))
+            box = local_slot_boxes.get(str(slot_id))
             if box is None:
                 continue
             # The capture layer already returns the complete measured cell.
@@ -575,12 +582,7 @@ class StatPanelOcr:
                 # digit and turn 1180 into 80.
                 crop = direct_crop
             else:
-                crop = image.crop((
-                    max(0, round((box[0] - SHORTCUT_BOX[0]) * scale_x)),
-                    max(0, round((box[1] - SHORTCUT_BOX[1]) * scale_y)),
-                    min(parent_w, round((box[2] - SHORTCUT_BOX[0]) * scale_x)),
-                    min(parent_h, round((box[3] - SHORTCUT_BOX[1]) * scale_y)),
-                ))
+                crop = image.crop(box.as_tuple())
             slot_key = f"{slot_id}:{str(slot_id) in blue_slot_ids}"
             signature = _shortcut_crop_signature(crop)
             current_signatures[slot_key] = signature
@@ -737,17 +739,14 @@ class StatPanelOcr:
             return {}
 
         parent_w, parent_h = image.size
-        ref_w = SHORTCUT_BOX[2] - SHORTCUT_BOX[0]
-        ref_h = SHORTCUT_BOX[3] - SHORTCUT_BOX[1]
-        scale_x = parent_w / ref_w
-        scale_y = parent_h / ref_h
+        local_slot_boxes = shortcut_slot_boxes_for_parent(Box(0, 0, parent_w, parent_h))
         centers_x = [
-            ((box[0] + box[2]) / 2 - SHORTCUT_BOX[0]) * scale_x
-            for box in SHORTCUT_SLOT_BOXES.values()
+            (box.left + box.right) / 2
+            for box in local_slot_boxes.values()
         ]
         centers_y = [
-            ((SHORTCUT_SLOT_BOXES["1"][1] + SHORTCUT_SLOT_BOXES["1"][3]) / 2 - SHORTCUT_BOX[1]) * scale_y,
-            ((SHORTCUT_SLOT_BOXES["5"][1] + SHORTCUT_SLOT_BOXES["5"][3]) / 2 - SHORTCUT_BOX[1]) * scale_y,
+            (local_slot_boxes["1"].top + local_slot_boxes["1"].bottom) / 2,
+            (local_slot_boxes["5"].top + local_slot_boxes["5"].bottom) / 2,
         ]
 
         # The game may add a small left inset at a different render scale.
@@ -810,10 +809,15 @@ class StatPanelOcr:
                     start = stop
                 pieces.append(digits[start:])
             for column, piece in zip(columns, pieces):
-                if not piece or int(piece) < 0:
+                if not piece:
                     continue
                 slot = str(column + 1)
                 value = int(piece)
+                if not 0 <= value <= MAX_SHORTCUT_QUANTITY:
+                    # A detector run can span multiple cells.  Never let a
+                    # merged five-or-more-digit run become a quantity for one
+                    # slot; the isolated-cell path will provide the safe read.
+                    continue
                 previous = counts.get(slot)
                 if previous is None or len(str(value)) > len(str(previous)):
                     counts[slot] = value
@@ -990,7 +994,10 @@ def _select_slot_consensus(
     It is safe only after the values have received the same number of votes;
     this prevents a single wide/neighbor-merged read from winning by length.
     """
-    values = [value for value in candidates if 0 <= value <= 999_999]
+    values = [
+        value for value in candidates
+        if isinstance(value, int) and 0 <= value <= MAX_SHORTCUT_QUANTITY
+    ]
     if not values:
         return None
     counts = Counter(values)
@@ -1018,7 +1025,7 @@ def _extract_shortcut_count(text: str) -> int | None:
         value = int(matches[-1].replace(",", ""))
     except ValueError:
         return None
-    return value if 0 <= value <= 999_999 else None
+    return value if 0 <= value <= MAX_SHORTCUT_QUANTITY else None
 
 
 def _numeric_shortcut_text_is_usable(text: str) -> bool:
@@ -1039,7 +1046,10 @@ def _select_blue_shortcut_candidate(
     relationships before ordinary voting, then fall back to the normal
     independent-view consensus.
     """
-    values = [value for value in candidates if 0 <= value <= 999_999]
+    values = [
+        value for value in candidates
+        if isinstance(value, int) and 0 <= value <= MAX_SHORTCUT_QUANTITY
+    ]
     if not values:
         return None
     unique = sorted(set(values), key=lambda value: (len(str(value)), value), reverse=True)
@@ -1062,12 +1072,11 @@ def _shortcut_quantity_strip(image: Image.Image) -> Image.Image:
     if width <= 1 or height <= 1:
         return image.crop((0, 0, max(1, width), max(1, height)))
     top = max(0, min(height - 1, round(height * 0.48)))
-    # The final one or two pixels often contain the neighbouring cell's
-    # outlined stroke at non-reference DPI scales.  Trim proportionally so
-    # the same rule works for 37px cells and larger direct captures.
-    right_trim = max(1, round(width * 0.055))
-    right = max(1, width - right_trim)
-    return image.crop((0, top, right, height))
+    # The caller now supplies the complete cell, split at the real separator
+    # midpoint.  Do not trim the right edge: the fourth glyph of a 4-digit
+    # quantity can occupy those final pixels (the old proportional trim was
+    # exactly why values such as ``1570`` could become ``157``/``57``).
+    return image.crop((0, top, width, height))
 
 
 def _shortcut_crop_signature(image: Image.Image) -> tuple:

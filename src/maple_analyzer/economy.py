@@ -15,7 +15,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Iterable
 
-from .regions import SHORTCUT_SLOT_BOXES
+from .regions import MAX_SHORTCUT_QUANTITY, SHORTCUT_SLOT_BOXES
 from .settings import PotionSlotConfig
 
 _MESOS_RE = re.compile(r"[+]?(\d[\d,]*)")
@@ -193,15 +193,21 @@ def mesos_text_needs_full_detection(text: str) -> bool:
 
 
 def parse_slot_count(text: str) -> int | None:
-    """Read the last integer in one configured shortcut-slot crop."""
+    """Read one valid four-digit-or-less shortcut quantity.
+
+    OCR can merge a neighbouring cell or attach an unrelated UI number to the
+    quantity.  The game domain has a strict upper bound, so a five-digit result
+    is invalid input rather than a plausible inventory value.
+    """
     normalized = str(text).translate(str.maketrans("０１２３４５６７８９，", "0123456789,"))
     matches = _INTEGER_RE.findall(normalized.replace(",", ""))
     if not matches:
         return None
     try:
-        return int(matches[-1])
+        value = int(matches[-1])
     except ValueError:
         return None
+    return value if 0 <= value <= MAX_SHORTCUT_QUANTITY else None
 
 
 @dataclass(frozen=True)
@@ -428,7 +434,7 @@ class EconomyTracker:
         self.begin_quick_slot_baseline()
         timestamp = time.monotonic() if now is None else now
         for slot_id, count in counts.items():
-            if count >= 0:
+            if isinstance(count, int) and 0 <= count <= MAX_SHORTCUT_QUANTITY:
                 self._shortcut_baseline[slot_id] = count
                 self._slot_counts[slot_id] = count
                 self._shortcut_observed[slot_id] = count
@@ -544,7 +550,11 @@ class EconomyTracker:
         or false mesos costs.
         """
         timestamp = time.monotonic() if now is None else now
-        valid_counts = {slot_id: count for slot_id, count in counts.items() if count >= 0}
+        valid_counts = {
+            slot_id: count
+            for slot_id, count in counts.items()
+            if isinstance(count, int) and 0 <= count <= MAX_SHORTCUT_QUANTITY
+        }
         if not valid_counts:
             return 0
         # Keep direct users of EconomyTracker safe too.  The overlay normally
@@ -734,7 +744,11 @@ class EconomyTracker:
         ``_slot_charged`` prevents double counting already confirmed drinks.
         """
         timestamp = time.monotonic() if now is None else now
-        valid_counts = {slot_id: count for slot_id, count in counts.items() if count >= 0}
+        valid_counts = {
+            slot_id: count
+            for slot_id, count in counts.items()
+            if isinstance(count, int) and 0 <= count <= MAX_SHORTCUT_QUANTITY
+        }
         if not valid_counts:
             return 0
         if not self._shortcut_baseline:

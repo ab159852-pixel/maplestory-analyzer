@@ -31,15 +31,16 @@ from .regions import (
     AUXILIARY_BOXES,
     BAR_BOXES,
     CONTEXT_BOXES,
+    Box,
     FIELD_BOXES,
     REFERENCE_CLIENT_SIZE,
     PICKUP_LINE_BOXES,
     SHORTCUT_BOX,
-    SHORTCUT_SLOT_BOXES,
     STAT_PANEL_BOX,
     scale_box,
     scale_shortcut_box,
     scale_top_left_box,
+    shortcut_slot_boxes_for_parent,
 )
 
 
@@ -157,6 +158,140 @@ def _pickup_boxes_for_client(client_size: tuple[int, int]) -> dict[str, tuple[in
     return boxes
 
 
+def _shortcut_scan_box(client_size: tuple[int, int]) -> Box:
+    """Return a small search area around the expected shortcut frame.
+
+    The shortcut frame is detected from its chrome before the eight cells are
+    cropped.  The search margin is intentionally larger than the historical
+    crop error, but still much smaller than a full client capture.
+    """
+    expected = scale_shortcut_box(SHORTCUT_BOX, client_size)
+    pad_x = max(18, round(expected.width * 0.24))
+    pad_y = max(18, round(expected.height * 0.30))
+    return Box(
+        max(0, expected.left - pad_x),
+        max(0, expected.top - pad_y),
+        min(client_size[0], expected.right + pad_x),
+        min(client_size[1], expected.bottom + pad_y),
+    )
+
+
+def _edge_peaks(values, start: int, threshold: float) -> list[tuple[int, float]]:
+    """Find separated local edge peaks without importing a CV dependency."""
+    peaks: list[tuple[int, float]] = []
+    for index in range(1, len(values) - 1):
+        value = float(values[index])
+        if value < threshold or value < float(values[index - 1]) or value < float(values[index + 1]):
+            continue
+        position = start + index
+        if peaks and position - peaks[-1][0] <= 2:
+            if value > peaks[-1][1]:
+                peaks[-1] = (position, value)
+        else:
+            peaks.append((position, value))
+    return peaks
+
+
+def detect_shortcut_frame(image: Image.Image, expected: Box | None = None) -> Box:
+    """Locate the visible shortcut frame and return one calibrated parent box.
+
+    Resolution alone is not a reliable scale source here: Windows DPI, the
+    game's client size, and letterboxing can each change by a few pixels.  The
+    frame has two strong full-height vertical edges and two strong full-width
+    horizontal edges.  Finding those edges in a bounded neighbourhood lets
+    the same eight-cell geometry follow the actual rendered game UI.
+
+    If a compositor frame is mid-transition or the border is not visible, the
+    deterministic resolution transform remains the safe fallback.
+    """
+    if expected is None:
+        expected = scale_shortcut_box(SHORTCUT_BOX, image.size)
+    expected = Box(
+        max(0, min(image.width - 1, expected.left)),
+        max(0, min(image.height - 1, expected.top)),
+        max(1, min(image.width, expected.right)),
+        max(1, min(image.height, expected.bottom)),
+    )
+    if expected.right <= expected.left or expected.bottom <= expected.top:
+        return expected
+    try:
+        import numpy as np
+
+        pad_x = max(18, round(expected.width * 0.24))
+        pad_y = max(18, round(expected.height * 0.30))
+        x0 = max(1, expected.left - pad_x)
+        y0 = max(1, expected.top - pad_y)
+        x1 = min(image.width - 1, expected.right + pad_x)
+        y1 = min(image.height - 1, expected.bottom + pad_y)
+        if x1 - x0 < 20 or y1 - y0 < 20:
+            return expected
+        gray = np.asarray(image.convert("L"), dtype=np.float32)
+        vertical = np.abs(np.diff(gray[y0:y1, x0:x1], axis=1)).mean(axis=0)
+        horizontal = np.abs(np.diff(gray[y0:y1, x0:x1], axis=0)).mean(axis=1)
+        if not len(vertical) or not len(horizontal):
+            return expected
+
+        x_peaks = _edge_peaks(vertical, x0 + 1, max(18.0, float(vertical.max()) * 0.55))
+        y_peaks = _edge_peaks(horizontal, y0 + 1, max(18.0, float(horizontal.max()) * 0.55))
+        expected_width = max(1, expected.width)
+        expected_height = max(1, expected.height)
+        expected_center_x = (expected.left + expected.right) / 2
+        expected_center_y = (expected.top + expected.bottom) / 2
+
+        x_candidates: list[tuple[float, int, int]] = []
+        for left, left_score in x_peaks:
+            for right, right_score in x_peaks:
+                width = right - left
+                if width < expected_width * 0.65 or width > expected_width * 1.45:
+                    continue
+                score = (
+                    left_score
+                    + right_score
+                    - abs(width - expected_width) * 0.55
+                    - abs((left + right) / 2 - expected_center_x) * 0.35
+                )
+                x_candidates.append((score, left, right))
+
+        y_candidates: list[tuple[float, int, int]] = []
+        for top, top_score in y_peaks:
+            for bottom, bottom_score in y_peaks:
+                height = bottom - top
+                if height < expected_height * 0.60 or height > expected_height * 1.45:
+                    continue
+                score = (
+                    top_score
+                    + bottom_score
+                    - abs(height - expected_height) * 0.65
+                    - abs((top + bottom) / 2 - expected_center_y) * 0.40
+                )
+                y_candidates.append((score, top, bottom))
+
+        if not x_candidates or not y_candidates:
+            return expected
+        _, left, right = max(x_candidates)
+        _, top, bottom = max(y_candidates)
+        if right - left < 20 or bottom - top < 20:
+            return expected
+        return Box(left, top, right, bottom)
+    except Exception:
+        # Numpy is bundled in the normal build, but capture must remain usable
+        # with a minimal source environment as well.
+        return expected
+
+
+def _shortcut_parent_regions(source: Image.Image, frame: Box) -> dict[str, Image.Image]:
+    """Crop one frame and all eight cells from the exact same parent box."""
+    parent = source.crop(frame.as_tuple())
+    local_parent = Box(0, 0, parent.width, parent.height)
+    slots = shortcut_slot_boxes_for_parent(local_parent)
+    regions = {"shortcut": parent}
+    regions.update({
+        f"shortcut:{slot}": parent.crop(box.as_tuple())
+        for slot, box in slots.items()
+    })
+    return regions
+
+
 def field_sample_points(client_size: tuple[int, int]) -> list[tuple[int, int]]:
     """Client-relative points to probe for occlusion: the four corners of each
     FIELD_BOX, inset by a pixel so a corner lands inside its own box.
@@ -225,6 +360,7 @@ class StaticImageCapture:
 
     def __init__(self, path: str | Path):
         self._image = Image.open(path).convert("RGB")
+        self.shortcut_frame: Box | None = None
 
     def grab_full(self) -> Image.Image:
         return self._image.copy()
@@ -250,12 +386,9 @@ class StaticImageCapture:
     def grab_auxiliary(self) -> dict[str, Image.Image]:
         capture_boxes = _pickup_boxes_for_client(self._image.size)
         regions = {
-            name: self._image.crop(
-                (scale_shortcut_box if name == "shortcut" else scale_box)(
-                    capture_boxes[name], self._image.size
-                ).as_tuple()
-            )
+            name: self._image.crop(scale_box(capture_boxes[name], self._image.size).as_tuple())
             for name in capture_boxes
+            if name != "shortcut"
         }
         pickup = regions["pickup"]
         pickup_parent = scale_box(capture_boxes["pickup"], self._image.size)
@@ -271,12 +404,9 @@ class StaticImageCapture:
                 round(right_box * actual_width / reference_width),
                 round(bottom_box * actual_height / reference_height),
             ))
-        regions.update({
-            f"shortcut:{slot}": self._image.crop(
-                scale_shortcut_box(box, self._image.size).as_tuple()
-            )
-            for slot, box in SHORTCUT_SLOT_BOXES.items()
-        })
+        expected = scale_shortcut_box(SHORTCUT_BOX, self._image.size)
+        self.shortcut_frame = detect_shortcut_frame(self._image, expected)
+        regions.update(_shortcut_parent_regions(self._image, self.shortcut_frame))
         return regions
 
     def grab_context(self) -> dict[str, Image.Image]:
@@ -316,6 +446,7 @@ class GameWindowCapture:
         # useful number when diagnosing a bad read from a log after the fact
         # -- and the one thing missing from every capture taken so far.
         self.client_size: tuple[int, int] | None = None
+        self.shortcut_frame: Box | None = None
         # Status, economy, and context workers share one mss desktop grabber.
         # Serialize only the short screen-capture sections; OCR remains fully
         # independent and can never block the Tk thread.
@@ -721,12 +852,14 @@ class GameWindowCapture:
             capture_boxes = _pickup_boxes_for_client(client_size)
             regions: dict[str, Image.Image] = {
                 name: graphics.crop(
-                    (scale_shortcut_box if name == "shortcut" else scale_box)(
-                        capture_boxes[name], client_size
-                    ).as_tuple()
+                    scale_box(capture_boxes[name], client_size).as_tuple()
                 )
                 for name in capture_boxes
+                if name != "shortcut"
             }
+            expected = scale_shortcut_box(SHORTCUT_BOX, client_size)
+            self.shortcut_frame = detect_shortcut_frame(graphics, expected)
+            regions.update(_shortcut_parent_regions(graphics, self.shortcut_frame))
         else:
             left, top, right, bottom = client_rect
             client_size = (right - left, bottom - top)
@@ -742,9 +875,9 @@ class GameWindowCapture:
                 capture_boxes = _pickup_boxes_for_client(client_size)
                 regions = {}
                 for name, raw_box in capture_boxes.items():
-                    box = (scale_shortcut_box if name == "shortcut" else scale_box)(
-                        raw_box, client_size
-                    )
+                    if name == "shortcut":
+                        continue
+                    box = scale_box(raw_box, client_size)
                     shot = self._mss.grab({
                         "left": left + box.left,
                         "top": top + box.top,
@@ -752,6 +885,37 @@ class GameWindowCapture:
                         "height": box.bottom - box.top,
                     })
                     regions[name] = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+
+                # The desktop fallback cannot use the game's hidden pixels,
+                # so capture a small expanded neighbourhood and detect the
+                # frame inside it.  This is still far cheaper than grabbing
+                # the whole desktop and it prevents a few DPI pixels from
+                # moving the eight quantity crops into adjacent cells.
+                scan_box = _shortcut_scan_box(client_size)
+                scan_shot = self._mss.grab({
+                    "left": left + scan_box.left,
+                    "top": top + scan_box.top,
+                    "width": scan_box.right - scan_box.left,
+                    "height": scan_box.bottom - scan_box.top,
+                })
+                scan_image = Image.frombytes(
+                    "RGB", scan_shot.size, scan_shot.bgra, "raw", "BGRX"
+                )
+                expected = scale_shortcut_box(SHORTCUT_BOX, client_size)
+                expected_local = Box(
+                    expected.left - scan_box.left,
+                    expected.top - scan_box.top,
+                    expected.right - scan_box.left,
+                    expected.bottom - scan_box.top,
+                )
+                frame_local = detect_shortcut_frame(scan_image, expected_local)
+                regions.update(_shortcut_parent_regions(scan_image, frame_local))
+                self.shortcut_frame = Box(
+                    frame_local.left + scan_box.left,
+                    frame_local.top + scan_box.top,
+                    frame_local.right + scan_box.left,
+                    frame_local.bottom + scan_box.top,
+                )
 
         pickup = regions["pickup"]
         pickup_parent = scale_box(_pickup_boxes_for_client(client_size)["pickup"], client_size)
@@ -766,17 +930,6 @@ class GameWindowCapture:
                 round(right_box * actual_feed_size[0] / reference_feed_width),
                 round(bottom_box * actual_feed_size[1] / reference_feed_height),
             ))
-        shortcut = regions["shortcut"]
-        parent = scale_shortcut_box(SHORTCUT_BOX, client_size)
-        for slot, raw_box in SHORTCUT_SLOT_BOXES.items():
-            box = scale_shortcut_box(raw_box, client_size)
-            local = (
-                box.left - parent.left,
-                box.top - parent.top,
-                box.right - parent.left,
-                box.bottom - parent.top,
-            )
-            regions[f"shortcut:{slot}"] = shortcut.crop(local)
         return regions
 
     def grab_context(self) -> dict[str, Image.Image]:

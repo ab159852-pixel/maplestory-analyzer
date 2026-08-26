@@ -21,6 +21,7 @@ from PIL import Image
 
 from .economy import mesos_text_needs_full_detection, parse_mesos_amount, parse_slot_count
 from .bar_flash import BarFlashDetector
+from .diagnostics import log_exception
 from .parser import StatSnapshot, parse_fields
 from .regions import (
     PICKUP_LINE_BOXES,
@@ -502,13 +503,65 @@ class BackgroundMonitor:
         if self._threads:
             return
         self._threads = [
-            threading.Thread(target=self._status_loop, name="maple-status-monitor", daemon=True),
-            threading.Thread(target=self._auxiliary_loop, name="maple-economy-monitor", daemon=True),
-            threading.Thread(target=self._pickup_loop, name="maple-pickup-monitor", daemon=True),
-            threading.Thread(target=self._context_loop, name="maple-context-monitor", daemon=True),
+            threading.Thread(
+                target=self._worker_entry,
+                args=(self._status_loop, "status"),
+                name="maple-status-monitor",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._worker_entry,
+                args=(self._auxiliary_loop, "economy"),
+                name="maple-economy-monitor",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._worker_entry,
+                args=(self._pickup_loop, "pickup"),
+                name="maple-pickup-monitor",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._worker_entry,
+                args=(self._context_loop, "context"),
+                name="maple-context-monitor",
+                daemon=True,
+            ),
         ]
         for thread in self._threads:
             thread.start()
+
+    def _worker_entry(self, worker, label: str) -> None:
+        """Keep one unexpected worker exception from killing monitoring.
+
+        Each loop already handles expected capture/OCR failures locally. This
+        outer boundary is for regressions in code outside those inner blocks
+        (queue delivery, timing, third-party image objects, or a future edit).
+        It logs the complete traceback and retries after a short backoff while
+        the user can still see the HUD and stop the session normally.
+        """
+        if label == "context" and not callable(getattr(self.source, "grab_context", None)):
+            # Older/custom capture adapters may not expose the optional
+            # background map/job surface.  This worker is optional; do not
+            # turn that normal capability gap into an endless crash-log loop.
+            return
+        while not self._stop.is_set():
+            try:
+                worker()
+            except Exception as exc:
+                log_exception(f"monitor worker crashed: {label}", exc)
+                self._stop.wait(0.5)
+                continue
+            if self._stop.is_set():
+                return
+            # A monitor loop should only return after stop. Treat an
+            # unexpected return as recoverable instead of silently losing live
+            # OCR for the rest of the session.
+            log_exception(
+                f"monitor worker exited unexpectedly: {label}",
+                RuntimeError("worker returned before monitor stop was requested"),
+            )
+            self._stop.wait(0.5)
 
     def stop(self) -> None:
         self._stop.set()

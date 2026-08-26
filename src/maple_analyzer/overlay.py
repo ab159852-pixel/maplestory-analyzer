@@ -53,6 +53,7 @@ from typing import Protocol
 import customtkinter as ctk
 
 from .capture import PANEL_OBSCURED, set_process_dpi_awareness
+from .diagnostics import install_exception_logging, install_tk_exception_logging, log_exception
 from .drop_lookup import (
     DropLookupError,
     MapDropSummary,
@@ -310,6 +311,7 @@ def _fmt_summary(s: SessionSummary, index: int) -> str:
 
 class OverlayApp:
     def __init__(self, source: PanelSource):
+        self._crash_log_path = install_exception_logging()
         self._source = source
         # RapidOCR loads ONNX models and can take several seconds on first
         # start.  Constructing it before Tk's mainloop made the application
@@ -366,6 +368,7 @@ class OverlayApp:
         self._last_capture_error: str | None = None
         self._last_aux_error: str | None = None
         self._last_client_size: tuple[int, int] | None = None
+        self._last_shortcut_frame: tuple[int, int, int, int] | None = None
         # The first shortcut OCR result after Start/Resume is an inventory
         # baseline, never a potion-use event.
         self._potion_baseline_pending = True
@@ -425,6 +428,7 @@ class OverlayApp:
         ctk.set_window_scaling(self._settings.scale_pct / 100)
 
         self.root = ctk.CTk()
+        install_tk_exception_logging(self.root)
         self.root.title(APP_DISPLAY_NAME)
         # Replace the dated native Windows frame with a small application-owned
         # titlebar.  Apart from matching the glass UI, this prevents the
@@ -2565,7 +2569,17 @@ class OverlayApp:
             with contextlib.suppress(Exception):
                 self._set_status_error(self._t("status_error_unknown", detail=str(e)))
         finally:
-            self.root.after(next_delay, self._tick)
+            # ``after`` itself can raise when a close/update callback destroys
+            # the root while this callback is unwinding.  That exception used
+            # to escape Tk's callback boundary and made a normal close look
+            # like a random process crash.  Normalize the delay and make the
+            # final scheduling operation best-effort.
+            try:
+                safe_delay = max(25, min(5000, int(next_delay)))
+            except Exception:
+                safe_delay = TARGET_MS
+            with contextlib.suppress(Exception):
+                self.root.after(safe_delay, self._tick)
 
     @staticmethod
     def _log(message: str) -> None:
@@ -2769,6 +2783,11 @@ class OverlayApp:
         if client_size is not None and client_size != self._last_client_size:
             self._log(f"[{time.strftime('%H:%M:%S')}] client size: {client_size[0]}x{client_size[1]}")
             self._last_client_size = client_size
+        shortcut_frame = getattr(self._source, "shortcut_frame", None)
+        shortcut_tuple = getattr(shortcut_frame, "as_tuple", lambda: None)()
+        if shortcut_tuple is not None and shortcut_tuple != self._last_shortcut_frame:
+            self._log(f"[{time.strftime('%H:%M:%S')}] shortcut frame: {shortcut_tuple}")
+            self._last_shortcut_frame = shortcut_tuple
         read_fields = getattr(self._ocr, "read_fields", None)
         if callable(read_fields):
             field_text = read_fields(field_images)
@@ -3233,6 +3252,7 @@ class OverlayApp:
         self._commit_session_to_history()
         self._session.pause()
         self._run_state = "stopped"
+        self._closing = False
         getattr(self, "_set_monitor_aux_enabled", lambda _enabled: None)(False)
         self._apply_run_state()
         self._render(self._last)  # immediate feedback, don't wait for next tick
@@ -3856,14 +3876,35 @@ class OverlayApp:
 
     def _on_close(self) -> None:
         """Flush the latest preferences/history before closing the HUD."""
-        if self._run_state in ("running", "paused"):
-            self._commit_session_to_history()
-        monitor = getattr(self, "_monitor", None)
-        if monitor is not None:
-            monitor.stop()
-        _maybe_persist_settings(self)
-        _maybe_persist_history(self)
-        self.root.destroy()
+        if getattr(self, "_closing", False):
+            return
+        self._closing = True
+        try:
+            if self._run_state in ("running", "paused"):
+                self._commit_session_to_history()
+        except Exception as exc:
+            log_exception("close/finalize error", exc)
+        finally:
+            monitor = getattr(self, "_monitor", None)
+            if monitor is not None:
+                with contextlib.suppress(Exception):
+                    monitor.stop()
+            with contextlib.suppress(Exception):
+                _maybe_persist_settings(self)
+            with contextlib.suppress(Exception):
+                _maybe_persist_history(self)
+            with contextlib.suppress(Exception):
+                self.root.quit()
+            with contextlib.suppress(Exception):
+                self.root.destroy()
 
     def run(self) -> None:
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        except BaseException as exc:
+            # Keep a traceback even when a third-party Tk/customtkinter call
+            # escapes the callback hook.  Re-raise so source runs retain their
+            # normal debugging semantics; frozen builds are handled by the
+            # installed sys.excepthook.
+            log_exception("Tk mainloop exception", exc)
+            raise

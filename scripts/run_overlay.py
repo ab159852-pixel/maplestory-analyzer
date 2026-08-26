@@ -10,6 +10,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from maple_analyzer.diagnostics import install_exception_logging
+
+if __name__ == "__main__":
+    install_exception_logging()
+
 from maple_analyzer.capture import GameWindowCapture
 from maple_analyzer.overlay import OverlayApp
 
