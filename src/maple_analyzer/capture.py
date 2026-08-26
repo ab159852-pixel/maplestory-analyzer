@@ -29,6 +29,7 @@ from PIL import Image
 
 from .regions import (
     AUXILIARY_BOXES,
+    BAR_BOXES,
     CONTEXT_BOXES,
     FIELD_BOXES,
     REFERENCE_CLIENT_SIZE,
@@ -45,6 +46,98 @@ from .regions import (
 # panel. Routine and recoverable, so it travels the same path as the
 # minimized/not-found states -- see overlay._do_tick and _localize_error.
 PANEL_OBSCURED = "stat panel is obscured"
+
+
+def set_process_dpi_awareness() -> None:
+    """Use physical pixels for Win32 client rectangles and captured frames.
+
+    ``GetClientRect``/``ClientToScreen`` and Windows Graphics Capture must
+    describe the same coordinate space.  A system-DPI-aware process can get
+    logical coordinates while WGC returns physical pixels, which shifts every
+    OCR crop on a monitor whose scale is not 100%.  Per-monitor-v2 is the
+    strongest available context and the older shcore API is kept as a
+    compatibility fallback for older Windows builds.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (HANDLE)-4
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return
+    except Exception:
+        pass
+    try:
+        import ctypes
+
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+    except Exception:
+        pass
+
+
+def _crop_frame_to_client(
+    image: Image.Image,
+    client_rect: tuple[int, int, int, int],
+    window_rect: tuple[int, int, int, int],
+    *,
+    item_size: tuple[int, int] | None = None,
+) -> Image.Image | None:
+    """Convert a WGC frame into client-relative pixels.
+
+    A ``GraphicsCaptureItem`` may expose either the client surface or the
+    complete HWND depending on the Windows version/window class.  Never
+    infer that from the frame *size* alone: the old implementation created a
+    client-sized pool for a full-window item, so a same-sized frame could
+    still contain a resized title bar.  The item size plus the actual HWND
+    geometry lets us distinguish the two cases and scale the crop precisely.
+    """
+    client_left, client_top, client_right, client_bottom = client_rect
+    window_left, window_top, window_right, window_bottom = window_rect
+    client_width = client_right - client_left
+    client_height = client_bottom - client_top
+    window_width = window_right - window_left
+    window_height = window_bottom - window_top
+    if min(client_width, client_height, window_width, window_height) <= 0:
+        return None
+    client_size = (client_width, client_height)
+    window_size = (window_width, window_height)
+
+    # A client-only item is already in the coordinate system expected by
+    # regions.py.  Normalize a rare pool-size mismatch without introducing a
+    # second coordinate conversion.
+    if item_size == client_size:
+        if image.size == client_size:
+            return image
+        return image.resize(client_size, Image.Resampling.BILINEAR)
+
+    # When there is no non-client frame, the direct-sized result is safe only
+    # if the HWND itself has the same dimensions.  This intentionally rejects
+    # the old ``full window resized to client size`` shortcut.
+    if image.size == client_size and window_size == client_size:
+        return image
+
+    # A full-window WGC frame is anchored at the HWND's top-left.  Scale the
+    # client offset independently on each axis so a DPI transition or a
+    # compositor frame with a one-pixel rounding difference cannot drift the
+    # right/bottom edge of the crop.
+    if item_size not in (None, window_size) and image.size != window_size:
+        return None
+    scale_x = image.width / window_width
+    scale_y = image.height / window_height
+    crop_left = round((client_left - window_left) * scale_x)
+    crop_top = round((client_top - window_top) * scale_y)
+    crop_right = round((client_right - window_left) * scale_x)
+    crop_bottom = round((client_bottom - window_top) * scale_y)
+    if not (
+        0 <= crop_left < crop_right <= image.width
+        and 0 <= crop_top < crop_bottom <= image.height
+    ):
+        return None
+    cropped = image.crop((crop_left, crop_top, crop_right, crop_bottom))
+    if cropped.size != client_size:
+        cropped = cropped.resize(client_size, Image.Resampling.BILINEAR)
+    return cropped
 
 
 def _pickup_boxes_for_client(client_size: tuple[int, int]) -> dict[str, tuple[int, int, int, int]]:
@@ -106,9 +199,14 @@ class WindowCapture(Protocol):
         """Just the stat panel crop, scaled to the current client size."""
         ...
 
-    def grab_fields(self) -> dict[str, Image.Image]:
+    def grab_fields(self, *, include_bar_signals: bool = False) -> dict[str, Image.Image]:
         """One crop per FIELD_BOXES entry ('LV'/'HP'/'MP'/'EXP'), for
-        recognition-only OCR -- see ocr.py's read_field()."""
+        recognition-only OCR -- see ocr.py's read_field().
+
+        ``include_bar_signals`` is used by the live monitor to request the
+        same-frame HP/MP bar crops without changing the four-field contract
+        used by tests and custom capture sources.
+        """
         ...
 
     def grab_auxiliary(self) -> dict[str, Image.Image]:
@@ -133,11 +231,19 @@ class StaticImageCapture:
         box = scale_box(STAT_PANEL_BOX, self._image.size)
         return self._image.crop(box.as_tuple())
 
-    def grab_fields(self) -> dict[str, Image.Image]:
-        return {
+    def grab_fields(self, *, include_bar_signals: bool = False) -> dict[str, Image.Image]:
+        fields = {
             name: self._image.crop(scale_box(box, self._image.size).as_tuple())
             for name, box in FIELD_BOXES.items()
         }
+        if include_bar_signals:
+            fields.update({
+                f"__bar_{resource}": self._image.crop(
+                    scale_box(box, self._image.size).as_tuple()
+                )
+                for resource, box in BAR_BOXES.items()
+            })
+        return fields
 
     def grab_auxiliary(self) -> dict[str, Image.Image]:
         regions = {
@@ -174,6 +280,11 @@ class GameWindowCapture:
     def __init__(self, title_substring: str = "新楓之谷", process_name: str = "Maplestory"):
         if sys.platform != "win32":
             raise RuntimeError("GameWindowCapture requires Windows (pywin32 + real desktop)")
+        # Must run before pywin32/mss query geometry, not after the first
+        # capture.  Otherwise the first frame can establish a logical-pixel
+        # coordinate system that remains wrong after the process is made DPI
+        # aware.
+        set_process_dpi_awareness()
         import mss
         import win32api
         import win32con
@@ -278,7 +389,38 @@ class GameWindowCapture:
         left, top, right, bottom = self._win32gui.GetClientRect(hwnd)
         left, top = self._win32gui.ClientToScreen(hwnd, (left, top))
         right, bottom = self._win32gui.ClientToScreen(hwnd, (right, bottom))
+        if right <= left or bottom <= top:
+            raise RuntimeError("game window has an invalid client size")
         return left, top, right, bottom
+
+    def _window_rect_on_screen(self, hwnd: int) -> tuple[int, int, int, int]:
+        """Return the visible HWND frame in the same physical space as client_rect.
+
+        ``GetWindowRect`` can include an invisible resize border on modern
+        Windows.  DWM's extended frame bounds omit that border and therefore
+        line up with the compositor frame used by WGC; the Win32 rectangle is
+        retained as a safe fallback for older systems and test doubles.
+        """
+        rect = tuple(int(value) for value in self._win32gui.GetWindowRect(hwnd))
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            frame = wintypes.RECT()
+            result = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                hwnd,
+                9,  # DWMWA_EXTENDED_FRAME_BOUNDS
+                ctypes.byref(frame),
+                ctypes.sizeof(frame),
+            )
+            candidate = (
+                int(frame.left), int(frame.top), int(frame.right), int(frame.bottom)
+            )
+            if result == 0 and candidate[2] > candidate[0] and candidate[3] > candidate[1]:
+                return candidate
+        except Exception:
+            pass
+        return rect
 
     def _try_graphics_frame(
         self, client_rect: tuple[int, int, int, int]
@@ -298,7 +440,12 @@ class GameWindowCapture:
             hwnd = self._hwnd or self._find_window()
             client_width = client_rect[2] - client_rect[0]
             client_height = client_rect[3] - client_rect[1]
-            capture_size = (client_width, client_height)
+            client_size = (client_width, client_height)
+            window_rect = self._window_rect_on_screen(hwnd)
+            capture_size = (
+                window_rect[2] - window_rect[0],
+                window_rect[3] - window_rect[1],
+            )
             if self._graphics_capture is None or getattr(self, "_graphics_capture_size", None) != capture_size:
                 # A resized game window needs a new frame pool.  Reusing the
                 # old pool makes WGC return the old bitmap size and the former
@@ -309,40 +456,29 @@ class GameWindowCapture:
                 if old_capture is not None:
                     with contextlib.suppress(Exception):
                         old_capture.close()
-                self._graphics_capture = WindowsGraphicsCapture(
-                    hwnd, capture_size
-                )
+                # Let WGC use the GraphicsCaptureItem's native physical size.
+                # Passing client_size here was incorrect for a top-level HWND:
+                # Windows resized the full window (including its non-client
+                # frame) into a client-sized bitmap before OCR saw it. The
+                # outer size is only a fallback for a zero-sized item during
+                # the first compositor frame.
+                self._graphics_capture = WindowsGraphicsCapture(hwnd, capture_size)
                 self._graphics_capture_size = capture_size
             image = self._graphics_capture.grab(timeout=1.2)
-            if image.size == capture_size:
-                self.capture_backend = "windows-graphics"
-                return image
-
-            # Some Windows builds include the non-client frame in a window
-            # capture. Convert it back to the same client-relative coordinate
-            # system used by regions.py before handing it to OCR.
-            window_left, window_top, _window_right, _window_bottom = self._win32gui.GetWindowRect(hwnd)
-            offset_x = client_rect[0] - window_left
-            offset_y = client_rect[1] - window_top
-            crop_box = (
-                offset_x,
-                offset_y,
-                offset_x + client_width,
-                offset_y + client_height,
+            item_size = getattr(self._graphics_capture, "item_size", None)
+            frame = _crop_frame_to_client(
+                image,
+                client_rect,
+                window_rect,
+                item_size=item_size,
             )
-            if (
-                offset_x >= 0
-                and offset_y >= 0
-                and crop_box[2] <= image.width
-                and crop_box[3] <= image.height
-            ):
-                cropped = image.crop(crop_box)
-                if cropped.size == (client_width, client_height):
-                    self.capture_backend = "windows-graphics"
-                    return cropped
+            if frame is not None:
+                self.graphics_capture_error = None
+                self.capture_backend = "windows-graphics"
+                return frame
             raise RuntimeError(
                 f"graphics capture size {image.size} does not match client "
-                f"{capture_size}"
+                f"{client_size}; window={capture_size}; item={item_size}"
             )
         except Exception as exc:
             self.graphics_capture_error = str(exc.__cause__ or exc)
@@ -489,11 +625,11 @@ class GameWindowCapture:
         # so the game's own children don't read as something covering it.
         return self._win32gui.GetAncestor(self._win32gui.WindowFromPoint((x, y)), 2)
 
-    def grab_fields(self) -> dict[str, Image.Image]:
+    def grab_fields(self, *, include_bar_signals: bool = False) -> dict[str, Image.Image]:
         with self._capture_lock:
-            return self._grab_fields()
+            return self._grab_fields(include_bar_signals=include_bar_signals)
 
-    def _grab_fields(self) -> dict[str, Image.Image]:
+    def _grab_fields(self, *, include_bar_signals: bool = False) -> dict[str, Image.Image]:
         client_rect = self._client_rect_on_screen()
         # WGC is the live, compositor-independent path.  When it is
         # unavailable, try the visible desktop before PrintWindow: classic
@@ -502,10 +638,18 @@ class GameWindowCapture:
         graphics = self._try_graphics_frame(client_rect)
         if graphics is not None:
             self.client_size = graphics.size
-            return {
+            fields = {
                 name: graphics.crop(scale_box(box, graphics.size).as_tuple())
                 for name, box in FIELD_BOXES.items()
             }
+            if include_bar_signals:
+                fields.update({
+                    f"__bar_{resource}": graphics.crop(
+                        scale_box(box, graphics.size).as_tuple()
+                    )
+                    for resource, box in BAR_BOXES.items()
+                })
+            return fields
 
         # One screen grab covering the whole panel (mss itself is cheap, ~3.5ms
         # measured -- see VERSIONS.md/overlay.py timing notes), then slice each
@@ -541,6 +685,15 @@ class GameWindowCapture:
                 field_box.right - panel_box.left, field_box.bottom - panel_box.top,
             )
             fields[name] = panel.crop(local)
+        if include_bar_signals:
+            for resource, box in BAR_BOXES.items():
+                bar_box = scale_box(box, client_size)
+                fields[f"__bar_{resource}"] = panel.crop((
+                    bar_box.left - panel_box.left,
+                    bar_box.top - panel_box.top,
+                    bar_box.right - panel_box.left,
+                    bar_box.bottom - panel_box.top,
+                ))
         return fields
 
     def grab_auxiliary(self) -> dict[str, Image.Image]:

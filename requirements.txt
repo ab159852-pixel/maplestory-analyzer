@@ -5,6 +5,7 @@ opencv-python-headless
 pillow
 mss
 rapidocr-onnxruntime
+onnxruntime
 customtkinter
 
 # Windows-only: window enumeration / client-rect lookup for targeted capture.

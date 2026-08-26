@@ -52,7 +52,7 @@ from typing import Protocol
 
 import customtkinter as ctk
 
-from .capture import PANEL_OBSCURED
+from .capture import PANEL_OBSCURED, set_process_dpi_awareness
 from .drop_lookup import (
     DropLookupError,
     MapDropSummary,
@@ -111,18 +111,9 @@ else:
         # carry the same unencodable OCR text in its repr.
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-if sys.platform == "win32":
-    # Without declaring DPI awareness, Windows scales the whole rendered
-    # window as a bitmap after the fact -- Tk still thinks the window is
-    # e.g. 420 logical px, but the OS-scaled result doesn't match, and
-    # widget content ends up clipped past the visible window edge (observed
-    # live: value labels cut off mid-digit). Declaring per-monitor-v2
-    # awareness lets Windows and Tk agree on actual pixel dimensions instead.
-    try:
-        import ctypes
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
-    except Exception:
-        pass
+# Keep Tk, Win32 client rectangles, and Windows Graphics Capture in the same
+# physical-pixel coordinate space before the root window is created.
+set_process_dpi_awareness()
 
 TARGET_MS = 300  # target full status/OCR cycle -- 3.33Hz
 # Pickup toasts are brief lower-right notifications. Keep the fallback path
@@ -134,9 +125,12 @@ SCALE_STEP_PCT = 10
 SCALE_MIN_PCT = 50
 SCALE_MAX_PCT = 150
 
-# Live tab's Pause/Resume/Start + Restart button row -- see _apply_run_state.
+# Live tab's Pause/Resume/Start + Stop + Restart button row -- see
+# _apply_run_state.
 BUTTON_HEIGHT = 34
 STOPPED_BUTTON_WIDTH = 96  # Start alone, centered -- smaller than the two-button width
+STOP_COLOR = "#b94d78"
+STOP_HOVER = "#df6b9a"
 
 # Color tokens: an obsidian/sapphire base with restrained teal, violet and
 # gold accents.  The extra border/raised tokens keep cards visually layered
@@ -350,6 +344,10 @@ class OverlayApp:
         self._detected_job_name: str | None = None
         self._detected_map_name: str | None = None
         self._context_error: str | None = None
+        # A manual refresh can be clicked while the OCR model is still
+        # loading. Keep the request until BackgroundMonitor exists, otherwise
+        # the button appears to do nothing on a cold start.
+        self._context_refresh_pending = False
         self._session_job_name: str | None = None
         self._session_map_name: str | None = None
         # Drop lookup is deliberately lazy.  The public map/drop scripts are
@@ -784,6 +782,15 @@ class OverlayApp:
             )
             self._set_monitor_aux_enabled(self._run_state == "running")
             self._monitor.start()
+            if self._context_refresh_pending:
+                # The context worker performs an initial scan on startup, but
+                # explicitly wake it as well so a click made during OCR
+                # loading is honored as soon as the worker is ready.
+                self._monitor.request_context()
+        elif self._context_refresh_pending:
+            # Do not leave the button in a permanent "detecting" state when
+            # model initialization failed and no worker can service it.
+            self._context_refresh_pending = False
         self._render(self._last)
 
     def _build_floating_bar(self) -> None:
@@ -794,6 +801,8 @@ class OverlayApp:
         )
         self._floating_bar.pack_forget()
         self._floating_bar.grid_columnconfigure(1, weight=1)
+        self._floating_bar.grid_columnconfigure(2, weight=0)
+        self._floating_bar.grid_columnconfigure(3, weight=0)
 
         brand = ctk.CTkFrame(self._floating_bar, fg_color="transparent")
         brand.grid(row=0, column=0, sticky="nsw", padx=(12, 6), pady=10)
@@ -836,14 +845,30 @@ class OverlayApp:
             self._floating_metric_frames[key] = metric
             self._floating_metric_values[key] = value
 
+        floating_controls = ctk.CTkFrame(self._floating_bar, fg_color="transparent")
+        floating_controls.grid(row=0, column=2, sticky="e", padx=(6, 3), pady=10)
+        self._floating_pause_button = ctk.CTkButton(
+            floating_controls, command=self._on_pause_button_clicked,
+            width=70, height=28, corner_radius=9, fg_color=VIOLET,
+            hover_color=VIOLET_HOVER, text_color="#111326",
+        )
+        self._floating_pause_button.grid(row=0, column=0, padx=(0, 4))
+        self._floating_stop_button = ctk.CTkButton(
+            floating_controls, command=self._on_stop_clicked,
+            width=70, height=28, corner_radius=9, fg_color=STOP_COLOR,
+            hover_color=STOP_HOVER, text_color=INK,
+        )
+        self._floating_stop_button.grid(row=0, column=1)
+
         self._floating_restore_button = ctk.CTkButton(
             self._floating_bar, command=self._toggle_floating_mode,
             width=58, height=28, corner_radius=9, fg_color=ACCENT,
             hover_color="#7ff2e0", text_color=ACCENT_INK,
         )
         self._i18n(self._floating_restore_button, "hud_button_exit", size=9, bold=True)
-        self._floating_restore_button.grid(row=0, column=2, sticky="e", padx=(6, 12), pady=10)
+        self._floating_restore_button.grid(row=0, column=3, sticky="e", padx=(3, 12), pady=10)
         self._apply_floating_visibility()
+        self._apply_run_state()
         self._refresh_floating_metric_labels()
 
     def _set_alpha(self, opacity_pct: int) -> None:
@@ -996,8 +1021,8 @@ class OverlayApp:
         # start tracking before browsing any optional detail.
         button_row = ctk.CTkFrame(parent, fg_color="transparent")
         button_row.grid(row=2, column=0, sticky="ew", padx=2, pady=(3, 6))
-        button_row.grid_columnconfigure(0, weight=1)
-        button_row.grid_columnconfigure(1, weight=1)
+        for column in range(3):
+            button_row.grid_columnconfigure(column, weight=1)
 
         self._pause_button = ctk.CTkButton(
             button_row, command=self._on_pause_button_clicked,
@@ -1006,13 +1031,21 @@ class OverlayApp:
         )
         self._pause_button.grid(row=0, column=0, sticky="ew", padx=(0, 3))
 
+        self._stop_button = ctk.CTkButton(
+            button_row, command=self._on_stop_clicked,
+            fg_color=STOP_COLOR, hover_color=STOP_HOVER, text_color=INK,
+            corner_radius=11, height=34,
+        )
+        self._i18n(self._stop_button, "stop_button", size=12, bold=True)
+        self._stop_button.grid(row=0, column=1, sticky="ew", padx=3)
+
         self._restart_button = ctk.CTkButton(
             button_row, command=self._on_restart_clicked,
             fg_color=ACCENT, text_color=ACCENT_INK, hover_color="#84f2e3",
             corner_radius=11, height=34,
         )
         self._i18n(self._restart_button, "restart_button", size=12, bold=True)
-        self._restart_button.grid(row=0, column=1, sticky="ew", padx=(3, 0))
+        self._restart_button.grid(row=0, column=2, sticky="ew", padx=(3, 0))
 
         self._build_drop_lookup_card(parent, row=3)
 
@@ -1931,10 +1964,14 @@ class OverlayApp:
         _maybe_persist_settings(self)
 
     def _refresh_context(self) -> None:
+        self._context_refresh_pending = True
         monitor = getattr(self, "_monitor", None)
         if monitor is not None:
             monitor.request_context()
         self._context_error = None
+        refresh_button = getattr(self, "_context_refresh_button", None)
+        if refresh_button is not None:
+            refresh_button.configure(text=self._t("context_refreshing"))
         self._render_context()
 
     def _current_job_name(self) -> str | None:
@@ -1954,6 +1991,15 @@ class OverlayApp:
         return self._settings.map_name_override or None
 
     def _render_context(self) -> None:
+        refresh_button = getattr(self, "_context_refresh_button", None)
+        if refresh_button is not None:
+            refresh_button.configure(
+                text=self._t(
+                    "context_refreshing"
+                    if getattr(self, "_context_refresh_pending", False)
+                    else "context_refresh"
+                )
+            )
         values = getattr(self, "_context_value_labels", {})
         if not values:
             return
@@ -2355,6 +2401,7 @@ class OverlayApp:
                 reading = monitor.context_queue.get_nowait()
             except queue.Empty:
                 break
+            self._context_refresh_pending = False
             self._context_error = reading.error
             if reading.map_name:
                 self._detected_map_name = reading.map_name
@@ -2838,22 +2885,58 @@ class OverlayApp:
         self._apply_run_state()
         self._render(self._last)  # immediate feedback, don't wait for next tick
 
+    def _on_stop_clicked(self) -> None:
+        """Finalize the current interval and stop collecting a new one.
+
+        Stop is intentionally different from Pause: the current result is
+        committed to History once, the Session clock is frozen, and the user
+        can later press Start/Resume to begin a fresh interval.  Keeping the
+        floating bar visible means the user can stop without restoring the
+        full application first.
+        """
+        if self._run_state == "stopped":
+            return
+        self._commit_session_to_history()
+        self._session.pause()
+        self._run_state = "stopped"
+        getattr(self, "_set_monitor_aux_enabled", lambda _enabled: None)(False)
+        self._apply_run_state()
+        self._render(self._last)  # immediate feedback, don't wait for next tick
+
     def _apply_run_state(self) -> None:
         label_key = {"running": "pause_button", "paused": "resume_button", "stopped": "start_button"}[self._run_state]
         self._pause_button.configure(text=self._t(label_key), font=self._font(12, bold=True))
-        # A Restart with nothing running/paused to restart from doesn't mean
+        stop_button = getattr(self, "_stop_button", None)
+        if stop_button is not None:
+            stop_button.configure(text=self._t("stop_button"), font=self._font(12, bold=True))
+        # A Restart/Stop with nothing running/paused to act on doesn't mean
         # anything -- Start (the pause button's role while stopped) already
         # covers beginning the next session. As the sole button in the row
-        # it's centered and shrunk rather than stretched across both
-        # columns the way the two-button running/paused layout is.
+        # it's centered and shrunk rather than stretched across all three
+        # columns the way the running/paused layout is.
         if self._run_state == "stopped":
             self._restart_button.grid_remove()
+            if stop_button is not None:
+                stop_button.grid_remove()
             self._pause_button.configure(width=STOPPED_BUTTON_WIDTH, height=BUTTON_HEIGHT)
-            self._pause_button.grid(row=0, column=0, columnspan=2, sticky="", padx=0)
+            self._pause_button.grid(row=0, column=0, columnspan=3, sticky="", padx=0)
         else:
             self._pause_button.configure(width=140, height=BUTTON_HEIGHT)  # CTkButton's own default width
             self._pause_button.grid(row=0, column=0, columnspan=1, sticky="ew", padx=(0, 3))
-            self._restart_button.grid(row=0, column=1, columnspan=1, sticky="ew", padx=(3, 0))
+            if stop_button is not None:
+                stop_button.grid(row=0, column=1, columnspan=1, sticky="ew", padx=3)
+            self._restart_button.grid(row=0, column=2, columnspan=1, sticky="ew", padx=(3, 0))
+
+        floating_pause = getattr(self, "_floating_pause_button", None)
+        floating_stop = getattr(self, "_floating_stop_button", None)
+        if floating_pause is not None:
+            floating_pause.configure(text=self._t(label_key), font=self._font(9, bold=True))
+        if floating_stop is not None:
+            floating_stop.configure(text=self._t("stop_button"), font=self._font(9, bold=True))
+            if self._run_state == "stopped":
+                floating_stop.grid_remove()
+            else:
+                floating_stop.grid(row=0, column=1)
 
     def _rebuild_history_cards(self) -> None:
         self._update_history_overview()

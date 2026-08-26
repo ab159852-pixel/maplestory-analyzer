@@ -1,8 +1,13 @@
-"""Thin wrapper around RapidOCR (PP-OCR recognition, ONNX/CPU).
+"""OCR adapters for the fixed MapleStory HUD regions.
 
 See VERSIONS.md for why rapidocr-onnxruntime stands in for the spec's originally
 named PP-OCRv6-tiny ONNX model -- same OCR family, bundled models, no manual
 model-file wiring.
+
+Numeric status fields now prefer the bundled PP-OCR English/numeric
+recognition-only model through ONNX Runtime. RapidOCR remains available for
+Chinese context regions and as a compatibility fallback when the numeric
+model is unavailable.
 
 Recognition-only, not detection+recognition: benchmarked live against the real
 game (2026-08-17), detection (finding text regions in an image) was ~600-680ms
@@ -23,6 +28,7 @@ from typing import Any, Iterable
 
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
+from .numeric_ocr import OnnxNumericRecognizer, crop_level_badge
 from .regions import SHORTCUT_BOX, SHORTCUT_SLOT_BOXES
 
 
@@ -38,6 +44,14 @@ class OcrLine:
 
 class StatPanelOcr:
     def __init__(self) -> None:
+        # This model is deliberately recognition-only and is run on the four
+        # already-cropped numeric fields as one batch.  Keep a safe RapidOCR
+        # fallback for older portable builds that do not contain the model.
+        try:
+            self._numeric_engine = OnnxNumericRecognizer()
+        except Exception:
+            self._numeric_engine = None
+
         # Keep the heavyweight ONNX/RapidOCR import out of module import time.
         # The HUD can paint immediately, then OverlayApp constructs this class
         # on its background loader once the user already has a responsive
@@ -54,6 +68,39 @@ class StatPanelOcr:
         which field it is reading and can validate/retry only the fields whose
         first recognition is structurally weak.
         """
+        numeric_text = self._read_numeric_field(image)
+        if numeric_text:
+            # ``read_field`` is intentionally field-agnostic because it is
+            # also used for map/job context OCR.  Only accept a numeric-model
+            # result when its shape proves that it is one of the status
+            # fields; otherwise a random digit from a Chinese crop can leak
+            # into the context parser.
+            is_pair = bool(
+                re.search(r"\b(?:HP|MP)\D*\d+\D+\d+", numeric_text, re.IGNORECASE)
+            )
+            is_exp = _looks_like_exp(numeric_text)
+            is_level = bool(re.search(r"\b(?:L)?V\.?", numeric_text, re.IGNORECASE))
+            if is_level:
+                # The full crop can make adjacent equal digits collapse.  A
+                # colour-located badge removes the label and recovers the
+                # complete value without invoking the slower detector OCR.
+                badge_text = self._read_numeric_field(crop_level_badge(image))
+                level = _single_level_number(badge_text)
+                if level is not None:
+                    return f"LV.{level}"
+            if is_pair or is_exp:
+                repaired = _repair_numeric_result(numeric_text)
+                if repaired is not None:
+                    return repaired
+            # The compatibility API does not receive a field name.  When the
+            # numeric result itself proves contradictory (or the LV label was
+            # clipped and repeated digits may have collapsed), let RapidOCR
+            # re-read this one crop rather than returning a bad value.
+            fallback_text, _fallback_records = self._read_once(image)
+            if fallback_text:
+                return fallback_text
+            return numeric_text
+
         text, _records = self._read_once(image)
         # Tiny EXP glyphs occasionally arrive with a space inserted inside the
         # current value (``EXP100 100[01.00%]``) or with the opening bracket
@@ -88,10 +135,57 @@ class StatPanelOcr:
         would be substantially slower and would not solve the usual tiny-font
         failure mode.
         """
-        return {
-            name: self._read_typed_field(name, image)
-            for name, image in images.items()
-        }
+        numeric_texts: dict[str, str] = {}
+        if self._numeric_engine is not None:
+            try:
+                numeric_images = dict(images)
+                if "LV" in numeric_images:
+                    # Keep LV in the same one-batch inference as HP/MP/EXP,
+                    # but feed the model the colour-located number badge.
+                    numeric_images["LV"] = crop_level_badge(numeric_images["LV"])
+                numeric_texts = self._numeric_engine.read_fields(numeric_images)
+            except Exception:
+                # A broken numeric model must not stop the live HUD; switch
+                # this instance to the tested RapidOCR fallback.
+                self._numeric_engine = None
+
+        result: dict[str, str] = {}
+        for name, image in images.items():
+            numeric_text = numeric_texts.get(name, "")
+            if name.upper() == "LV" and numeric_text:
+                # The batch image above is the orange badge, so normalize its
+                # single numeric token to the parser's explicit LV shape.
+                level = _single_level_number(numeric_text)
+                if level is not None:
+                    numeric_text = f"LV.{level}"
+            level_needs_check = (
+                name.upper() == "LV" and _numeric_level_needs_verification(numeric_text)
+            )
+            if (
+                _numeric_text_is_usable(name, numeric_text)
+                and _numeric_value_is_plausible(name, numeric_text)
+                and not level_needs_check
+            ):
+                # The recognition model occasionally omits the final percent
+                # glyph when it is rendered at the edge of the crop.  The
+                # bracketed decimal is still structurally unambiguous, so
+                # preserve the fast model result instead of invoking a second
+                # engine just to recover the decoration.
+                if name.upper() == "EXP" and "%" not in numeric_text:
+                    numeric_text = f"{numeric_text}%"
+                result[name] = numeric_text
+            else:
+                result[name] = self._read_typed_field(name, image)
+        return result
+
+    def _read_numeric_field(self, image: Image.Image) -> str:
+        if self._numeric_engine is None:
+            return ""
+        try:
+            return self._numeric_engine.read_fields({"field": image}).get("field", "")
+        except Exception:
+            self._numeric_engine = None
+            return ""
 
     def _read_typed_field(self, field: str, image: Image.Image) -> str:
         first_text, first_records = self._read_once(image)
@@ -602,6 +696,92 @@ def _field_is_valid(field: str, text: str) -> bool:
     if field.upper() == "EXP":
         return _looks_like_exp(text)
     return bool(text.strip())
+
+
+def _numeric_text_is_usable(field: str, text: str) -> bool:
+    """Accept a numeric-model result only when its shape is plausible.
+
+    The LV crop intentionally clips the left side of the label at some
+    render scales, so the model may return ``V.69`` rather than ``LV.69``.  The
+    parser already has a bounded single-number fallback for that crop; the
+    other fields retain their stronger structural requirements.
+    """
+    if not text.strip():
+        return False
+    upper = field.upper()
+    if upper in {"HP", "MP"}:
+        return bool(re.search(r"\d+\D+\d+", text))
+    if upper == "EXP":
+        return bool(
+            re.search(
+                r"EXP\D{0,3}\d{3,}\s*[\[({]\s*\d{1,2}[.\s:]\d{2}\s*%?",
+                text,
+                re.IGNORECASE,
+            )
+        )
+    if upper == "LV":
+        # The crop can clip the leading L, leaving ``V.69``.  That is still a
+        # valid level result; the one-digit case is checked separately because
+        # greedy CTC can collapse adjacent equal digits (``44`` -> ``4``).
+        return bool(re.search(r"(?<!\d)\d{1,3}(?!\d)", text))
+    return True
+
+
+def _numeric_value_is_plausible(field: str, text: str) -> bool:
+    """Reject physically impossible numeric reads before they enter state."""
+    if field.upper() not in {"HP", "MP"}:
+        return True
+    match = re.search(r"(\d+)\D+(\d+)", text)
+    if not match:
+        return False
+    current, maximum = (int(match.group(index)) for index in (1, 2))
+    # A current resource cannot exceed its maximum.  This catches the common
+    # one-glyph confusion such as the real 2816 being read as 2818, while the
+    # fallback path gets a chance to re-read that single field.
+    return maximum > 0 and current <= maximum
+
+
+def _single_level_number(text: str) -> int | None:
+    """Extract one bounded level token from the isolated orange badge."""
+    numbers = re.findall(r"(?<!\d)(\d{1,3})(?!\d)", text or "")
+    if len(numbers) != 1:
+        return None
+    return int(numbers[0])
+
+
+def _numeric_level_needs_verification(text: str) -> bool:
+    """Use the compatibility OCR only for an ambiguous one-digit level."""
+    match = re.search(r"(?<!\d)(\d{1,3})(?!\d)", text)
+    return bool(
+        match
+        and (len(match.group(1)) == 1 or match.group(1).startswith("0"))
+    )
+
+
+def _repair_numeric_result(text: str) -> str | None:
+    """Repair safe decorations or reject an obviously ambiguous OCR result.
+
+    ``read_field`` is retained as a field-agnostic compatibility API, so this
+    helper uses only evidence present in the recognized string itself.
+    """
+    if re.search(r"\bV\.?\s*\.\s*\d{1,3}\b", text, re.IGNORECASE) and not re.search(
+        r"\bLV\b", text, re.IGNORECASE
+    ):
+        # Adjacent equal level digits can collapse in greedy CTC decoding.
+        return None
+    if re.search(r"\bLV\b", text, re.IGNORECASE) and not re.search(r"\d", text):
+        return None
+    pair = re.search(r"\b(?:HP|MP)\D*(\d+)\D+(\d+)", text, re.IGNORECASE)
+    if pair and int(pair.group(1)) > int(pair.group(2)):
+        return None
+    if re.search(
+        r"\bEXP\D{0,3}\d{3,}\s*[\[({]\s*\d{1,2}[.\s:]\d{2}\s*[\])}]?\s*$",
+        text,
+        re.IGNORECASE,
+    ):
+        closing = text[-1:] if text[-1:] in "]]})" else ""
+        return f"{text[:-1] if closing else text}%{closing}"
+    return text
 
 
 def _field_signature(field: str, text: str) -> object:

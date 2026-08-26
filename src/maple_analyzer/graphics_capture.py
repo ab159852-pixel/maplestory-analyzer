@@ -58,11 +58,20 @@ class WindowsGraphicsCapture:
             item_size = self._item.size
             item_width = int(item_size.width)
             item_height = int(item_size.height)
+            self._item_size = (
+                (item_width, item_height)
+                if item_width > 0 and item_height > 0
+                else None
+            )
             # A few Win32 window classes report a zero GraphicsCaptureItem
-            # size until their first compositor frame.  The client rectangle
-            # is already known by GameWindowCapture and is a safe, stable
-            # frame-pool size for the same HWND.
-            width, height = capture_size or (item_width, item_height)
+            # size until their first compositor frame.  The HWND frame size
+            # supplied by GameWindowCapture is only a fallback in that case;
+            # using it unconditionally would resize a full-window item before
+            # the client crop gets a chance to remove its title bar.
+            if self._item_size is not None:
+                width, height = self._item_size
+            else:
+                width, height = capture_size or (item_width, item_height)
             if width <= 0 or height <= 0:
                 raise GraphicsCaptureError(
                     f"invalid capture size {(width, height)} for HWND {hwnd}"
@@ -93,6 +102,11 @@ class WindowsGraphicsCapture:
     @property
     def size(self) -> tuple[int, int]:
         return self._capture_size
+
+    @property
+    def item_size(self) -> tuple[int, int] | None:
+        """Native physical size of the GraphicsCaptureItem, if available."""
+        return self._item_size
 
     def _on_frame_arrived(self, sender: Any, _args: Any) -> None:
         if self._closed:

@@ -39,6 +39,16 @@ FIELD_BOXES = {
     "EXP": (712, 766, 858, 788),
 }
 
+# The fixed HP/MP bar frames sit below the value text.  They are captured as
+# lightweight visual signals, not passed through OCR: MapleStory briefly
+# changes this frame/highlight when a potion is consumed.  Keeping these
+# boxes separate from FIELD_BOXES preserves the exact four-field OCR contract
+# used by the demo and regression fixtures.
+BAR_BOXES = {
+    "hp": (486, 777, 600, 799),
+    "mp": (600, 777, 712, 799),
+}
+
 # Auxiliary regions used by the economy tracker.  They are deliberately kept
 # outside STAT_PANEL_BOX so the existing HP/MP/EXP crops stay unchanged.
 # Coordinates are measured from the same 1351x800 client screenshot used by

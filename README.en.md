@@ -31,6 +31,10 @@ anything to the game.
   reading live while paused, but nothing is added to EXP gained or HP/MP
   lost and the timer stops counting down; Resume picks back up from where
   it left off, and whatever happened during the pause isn't counted.
+- **Stop Test** — after Start, both the full view and floating HUD provide
+  Pause and Stop Test controls. Stop saves the current interval to History,
+  freezes its timer, and lets you start a fresh interval without restoring the
+  full interface first.
 - **Sessions** — stats reset on a timer (default 10 minutes, adjustable) so
   "EXP diff" always means "since this session started." When the timer ends
   it commits to History and stops by default (toggle off in Settings to go
@@ -169,17 +173,17 @@ identically whether started via the .exe or this command.
 
 ## Publish a release (maintainers)
 
-This source currently contains `APP_VERSION = 1.0.9`. For each release, bump
+This source currently contains `APP_VERSION = 1.0.10`. For each release, bump
 `APP_VERSION` in `src/maple_analyzer/version.py`, commit the change, and push a
 matching tag, for example:
 
 ```powershell
-git tag v1.0.9
-git push origin v1.0.9
+git tag v1.0.10
+git push origin v1.0.10
 ```
 
 GitHub Actions installs dependencies, builds
-`MapleStoryAnalyzer-v1.0.9-win64.zip`, writes a SHA-256 checksum, and publishes
+`MapleStoryAnalyzer-v1.0.10-win64.zip`, writes a SHA-256 checksum, and publishes
 the Release automatically. Packaged users will be offered the update next time
 the app starts.
 

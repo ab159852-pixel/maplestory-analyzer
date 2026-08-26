@@ -108,6 +108,7 @@ class _StubApp:
         self._status_pill = _StubWidget()
         self._timer_label = _StubWidget()
         self._pause_button = _StubWidget()
+        self._stop_button = _StubWidget()
         self._restart_button = _StubWidget()
         self._value_labels: dict = defaultdict(_StubWidget)
         self._bars: dict = defaultdict(_StubWidget)
@@ -136,6 +137,7 @@ class _StubApp:
     _finalize_and_maybe_stop = OverlayApp._finalize_and_maybe_stop
     _on_restart_clicked = OverlayApp._on_restart_clicked
     _on_pause_button_clicked = OverlayApp._on_pause_button_clicked
+    _on_stop_clicked = OverlayApp._on_stop_clicked
     _apply_run_state = OverlayApp._apply_run_state
     _on_delete_history_clicked = OverlayApp._on_delete_history_clicked
 
@@ -193,6 +195,23 @@ def test_pause_button_cycles_running_paused_running():
     app._on_pause_button_clicked()  # paused -> running
     assert app._run_state == "running"
     assert app._pause_button.cget("text") == app._t("pause_button")
+
+
+def test_stop_commits_current_session_and_allows_a_fresh_start():
+    app = _StubApp()
+    app._on_pause_button_clicked()
+    _calibrate(app, gains=(100,))
+    app._session._start_time -= 5
+
+    app._on_stop_clicked()
+
+    assert app._run_state == "stopped"
+    assert len(app._session_history) == 1
+    assert app._stop_button.grid_info() == {}
+
+    app._on_pause_button_clicked()  # stopped -> fresh running session
+    assert app._run_state == "running"
+    assert len(app._session_history) == 1
 
 
 # --- ten-minute interval rollover -----------------------------------------

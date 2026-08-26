@@ -87,6 +87,7 @@ _STRINGS: dict[str, dict[Lang, str]] = {
     "pause_button": {"en": "Pause", "zh": "暫停"},
     "resume_button": {"en": "Resume", "zh": "繼續"},
     "start_button": {"en": "Start Session", "zh": "開始"},
+    "stop_button": {"en": "Stop Test", "zh": "停止測試"},
 
     "history_empty": {"en": "No sessions yet", "zh": "尚無紀錄"},
     "history_session": {"en": "SESSION #{n}", "zh": "紀錄 #{n}"},
@@ -112,6 +113,7 @@ _STRINGS: dict[str, dict[Lang, str]] = {
     "context_detecting": {"en": "Detecting…", "zh": "辨識中…"},
     "context_unknown": {"en": "Not detected", "zh": "尚未辨識"},
     "context_refresh": {"en": "Refresh", "zh": "重新辨識"},
+    "context_refreshing": {"en": "Detecting…", "zh": "辨識中…"},
     "context_header": {"en": "CONTEXT", "zh": "遊戲資訊"},
     "drop_lookup_header": {"en": "MAP DROP LOOKUP", "zh": "地圖掉落速查"},
     "drop_lookup_button": {"en": "Lookup drops", "zh": "掉落速查"},

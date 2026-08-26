@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from .economy import parse_mesos_amount, parse_slot_count
+from .bar_flash import BarFlashDetector
 from .parser import StatSnapshot, parse_fields
 from .regions import (
     PICKUP_LINE_BOXES,
@@ -49,6 +50,10 @@ class StatusReading:
     error: str | None = None
     client_size: tuple[int, int] | None = None
     timestamp: float | None = None
+    # Edge-triggered visual events from the game's HP/MP bar frame.  The
+    # economy tracker applies the configured potion-slot kind before using
+    # these events, so this is evidence, not an unconditional drink count.
+    bar_flash: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -337,6 +342,7 @@ class BackgroundMonitor:
         self._potion_slots: tuple[PotionSlotConfig, ...] = ()
         self._threads: list[threading.Thread] = []
         self._next_pickup_detection = 0.0
+        self._bar_flash_detector = BarFlashDetector()
 
     def start(self) -> None:
         if self._threads:
@@ -379,6 +385,10 @@ class BackgroundMonitor:
     def request_context(self) -> None:
         self._context_request.set()
 
+    def reset_bar_flash_detection(self) -> None:
+        """Start a fresh visual baseline after Start/Resume."""
+        self._bar_flash_detector.reset()
+
     def configure_auxiliary(
         self,
         *,
@@ -405,15 +415,32 @@ class BackgroundMonitor:
     def _status_loop(self) -> None:
         while not self._stop.is_set():
             started = time.perf_counter()
+            bar_flash: tuple[str, ...] = ()
             try:
-                field_images = self.source.grab_fields()
+                try:
+                    field_images = self.source.grab_fields(include_bar_signals=True)
+                except TypeError:
+                    # Keep lightweight/custom capture sources compatible with
+                    # the original four-field method signature.
+                    field_images = self.source.grab_fields()
+                ocr_images = {
+                    name: image
+                    for name, image in field_images.items()
+                    if not name.startswith("__bar_")
+                }
+                bar_images = {
+                    name.removeprefix("__bar_"): image
+                    for name, image in field_images.items()
+                    if name.startswith("__bar_")
+                }
+                bar_flash = self._bar_flash_detector.update(bar_images)
                 read_fields = getattr(self.ocr, "read_fields", None)
                 if callable(read_fields):
-                    field_text = read_fields(field_images)
+                    field_text = read_fields(ocr_images)
                 else:
                     field_text = {
                         name: self.ocr.read_field(image)
-                        for name, image in field_images.items()
+                        for name, image in ocr_images.items()
                     }
                 snapshot = parse_fields(field_text)
                 error = None
@@ -430,6 +457,7 @@ class BackgroundMonitor:
                     error=error,
                     client_size=getattr(self.source, "client_size", None),
                     timestamp=time.monotonic(),
+                    bar_flash=bar_flash,
                 ),
             )
             with self._lock:

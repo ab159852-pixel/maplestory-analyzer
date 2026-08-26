@@ -5,11 +5,18 @@ venv/
 *.db
 *.sqlite
 *.onnx
+!assets/paddle_models/
+!assets/paddle_models/en_PP-OCRv4_mobile_rec/
+!assets/paddle_models/en_PP-OCRv4_mobile_rec/inference.onnx
 .DS_Store
 overlay_std*.log
 overlay.pid
 overlay_screenshot.png
 .pytest_cache/
+.pytest-*/
+.paddlex/
+.cache/
+diagnostics/
 
 # PyInstaller build output
 build/

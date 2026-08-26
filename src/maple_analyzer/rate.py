@@ -841,7 +841,10 @@ class Session:
         elapsed = self.elapsed(now)
         if diff is None or elapsed <= 3:
             return None
-        return int(diff / elapsed * window_s)
+        # Timestamp subtraction can leave a mathematically integral result a
+        # few ulps below the integer (for example 5999.999999999).  Rounding
+        # keeps the displayed projection stable without changing its unit.
+        return int(round(diff / elapsed * window_s))
 
     def finalize(self, interval_minutes: float | None = None, now: float | None = None) -> SessionSummary:
         end_time = now if now is not None else time.time()
