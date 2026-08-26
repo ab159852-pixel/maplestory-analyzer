@@ -161,6 +161,31 @@ MP_COLOR = "#8cb4ff"
 EXP_COLOR = "#ffd27a"
 OK_COLOR = "#78efc2"
 TRACK_BG = "#3c1e31"
+CTK_THEME_FILE_NAME = "maple_insight_dark_blue.json"
+
+
+def _ctk_theme_candidates() -> tuple[Path, ...]:
+    """Return theme locations for source runs and one-folder PyInstaller builds."""
+    candidates: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass) / CTK_THEME_FILE_NAME)
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).resolve().parent / CTK_THEME_FILE_NAME)
+    candidates.append(Path(__file__).resolve().parents[2] / "assets" / CTK_THEME_FILE_NAME)
+    return tuple(candidates)
+
+
+def _configure_ctk_theme() -> None:
+    """Load the app-owned theme first, then retain CustomTkinter's fallback."""
+    for theme_path in _ctk_theme_candidates():
+        if theme_path.is_file():
+            ctk.set_default_color_theme(str(theme_path))
+            return
+    # This preserves source environments that have a complete CustomTkinter
+    # installation, while the project-owned theme above makes the packaged
+    # app independent of the package's optional data-file collection.
+    ctk.set_default_color_theme("dark-blue")
 
 # Chrome text (tabs, headers, buttons, switches, kv labels -- anything that
 # can carry translated content) picks its font family from the active
@@ -366,9 +391,13 @@ class OverlayApp:
         self._update_checking = False
         self._update_manual_check = False
         self._update_prompted_version: str | None = None
+        self._update_button_busy = False
+        self._update_status_key = "update_status_idle"
+        self._update_status_args: dict[str, object] = {}
+        self._update_status_color = INK_FAINT
 
         ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("dark-blue")
+        _configure_ctk_theme()
         # Applied before the window/widgets are built so the default window
         # size below is already at the configured scale, not built at 100%
         # then rescaled after the fact.
@@ -515,6 +544,33 @@ class OverlayApp:
             return self._t("status_error_obscured")
         return message
 
+    def _render_update_status(self) -> None:
+        label = getattr(self, "_update_status_label", None)
+        if label is None:
+            return
+        label.configure(
+            text=self._t(self._update_status_key, **self._update_status_args),
+            text_color=self._update_status_color,
+            font=self._font(9),
+        )
+
+    def _set_update_status(self, key: str, *, color: str = INK_FAINT, **kwargs: object) -> None:
+        self._update_status_key = key
+        self._update_status_args = kwargs
+        self._update_status_color = color
+        self._render_update_status()
+
+    def _set_update_button_busy(self, busy: bool) -> None:
+        self._update_button_busy = busy
+        button = getattr(self, "_update_button", None)
+        if button is None:
+            return
+        button.configure(
+            state="disabled" if busy else "normal",
+            text=self._t("settings_checking_updates" if busy else "settings_check_updates"),
+            font=self._font(10, bold=True),
+        )
+
     def _font(self, size: int, bold: bool = False) -> tuple:
         """Chrome-text font at the given size, in the active language's font
         family (see _FONT_FAMILY). Use for any widget that renders translated
@@ -582,6 +638,8 @@ class OverlayApp:
         self._hud_mode_button.configure(
             text=self._t("hud_button_exit" if self._floating_mode else "hud_button_enter")
         )
+        self._set_update_button_busy(self._update_button_busy)
+        self._render_update_status()
         # _pause_button's text depends on _run_state, not just language, so it
         # isn't in _i18n_labels -- _apply_run_state() re-derives it from
         # scratch, which also happens to pick up the new language/font.
@@ -619,8 +677,9 @@ class OverlayApp:
 
     def _start_update_check(self, *, manual: bool = False) -> None:
         """Start a non-blocking release check for the packaged app only."""
-        if not getattr(sys, "frozen", False) or self._update_checking:
-            if manual and not getattr(sys, "frozen", False):
+        if not getattr(sys, "frozen", False):
+            if manual:
+                self._set_update_status("update_status_dev", color=INK_DIM)
                 with self._modal():
                     messagebox.showinfo(
                         self._t("update_title"),
@@ -628,8 +687,18 @@ class OverlayApp:
                         parent=self.root,
                     )
             return
+        if self._update_checking:
+            # A delayed automatic check may still be running when the user
+            # opens Settings and clicks manually. Keep that request marked as
+            # manual so its result is surfaced instead of silently discarded.
+            if manual:
+                self._update_manual_check = True
+                self._set_update_status("update_status_waiting", color=EXP_COLOR)
+            return
         self._update_checking = True
         self._update_manual_check = manual
+        self._set_update_button_busy(True)
+        self._set_update_status("update_status_checking", color=EXP_COLOR)
         threading.Thread(
             target=self._update_check_worker,
             name="maple-update-check",
@@ -665,8 +734,10 @@ class OverlayApp:
 
     def _offer_update(self, info: UpdateInfo) -> None:
         if self._update_prompted_version == info.version:
+            self._set_update_button_busy(False)
             return
         self._update_prompted_version = info.version
+        self._set_update_status("update_status_available", version=info.version, color=OK_COLOR)
         notes = info.notes.strip()
         if len(notes) > 700:
             notes = notes[:700].rstrip() + "…"
@@ -681,8 +752,12 @@ class OverlayApp:
                 self._t("update_title"), prompt, parent=self.root
             )
         if not accepted:
+            self._set_update_button_busy(False)
+            self._set_update_status("update_status_cancelled")
             return
         self._update_checking = True
+        self._set_update_button_busy(True)
+        self._set_update_status("update_status_downloading", version=info.version, color=EXP_COLOR)
         threading.Thread(
             target=self._update_download_worker,
             args=(info,),
@@ -698,6 +773,11 @@ class OverlayApp:
                     was_manual = self._update_manual_check
                     self._update_checking = False
                     self._update_manual_check = False
+                    detail = str(payload).strip()
+                    if len(detail) > 120:
+                        detail = detail[:120].rstrip() + "…"
+                    self._set_update_button_busy(False)
+                    self._set_update_status("update_status_error", detail=detail, color=HP_COLOR)
                     if was_manual:
                         with self._modal():
                             messagebox.showerror(
@@ -711,7 +791,10 @@ class OverlayApp:
                     self._update_manual_check = False
                     if isinstance(payload, UpdateInfo):
                         self._offer_update(payload)
-                    elif was_manual:
+                    else:
+                        self._set_update_button_busy(False)
+                        self._set_update_status("update_status_latest", version=APP_VERSION, color=OK_COLOR)
+                    if not isinstance(payload, UpdateInfo) and was_manual:
                         with self._modal():
                             messagebox.showinfo(
                                 self._t("update_title"),
@@ -720,6 +803,11 @@ class OverlayApp:
                             )
                 elif kind == "download_error":
                     self._update_checking = False
+                    detail = str(payload).strip()
+                    if len(detail) > 120:
+                        detail = detail[:120].rstrip() + "…"
+                    self._set_update_button_busy(False)
+                    self._set_update_status("update_status_error", detail=detail, color=HP_COLOR)
                     with self._modal():
                         messagebox.showerror(
                             self._t("update_title"),
@@ -731,6 +819,7 @@ class OverlayApp:
                     info, path = payload
                     if not isinstance(info, UpdateInfo):
                         continue
+                    self._set_update_status("update_status_ready", version=info.version, color=OK_COLOR)
                     with self._modal():
                         accepted = messagebox.askyesno(
                             self._t("update_ready_title"),
@@ -740,10 +829,14 @@ class OverlayApp:
                     if not accepted:
                         with contextlib.suppress(OSError):
                             path.unlink()
+                        self._set_update_button_busy(False)
+                        self._set_update_status("update_status_cancelled")
                         continue
                     try:
                         schedule_update(path)
                     except UpdateError as exc:
+                        self._set_update_button_busy(False)
+                        self._set_update_status("update_status_error", detail=str(exc), color=HP_COLOR)
                         with self._modal():
                             messagebox.showerror(
                                 self._t("update_title"),
@@ -751,6 +844,7 @@ class OverlayApp:
                                 parent=self.root,
                             )
                     else:
+                        self._set_update_status("update_status_installing", version=info.version, color=OK_COLOR)
                         self._on_close()
         except queue.Empty:
             pass
@@ -1646,6 +1740,11 @@ class OverlayApp:
         )
         self._i18n(self._update_button, "settings_check_updates", size=10, bold=True)
         self._update_button.pack(fill="x", padx=12, pady=(0, 7))
+        self._update_status_label = ctk.CTkLabel(
+            window_card, anchor="w", justify="left", text_color=INK_FAINT,
+        )
+        self._update_status_label.pack(fill="x", padx=12, pady=(0, 9))
+        self._render_update_status()
 
         hud_card = ctk.CTkFrame(
             scroll, fg_color=SURFACE, corner_radius=14,

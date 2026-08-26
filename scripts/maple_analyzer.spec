@@ -23,7 +23,7 @@ repo_root = Path(SPECPATH).resolve().parent
 # same as the source run at 100%, 125%, and 150% display scaling.
 DPI_MANIFEST = r'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="1.0.11.0" processorArchitecture="*" name="MapleStoryAnalyzer" type="win32"/>
+  <assemblyIdentity version="1.0.12.0" processorArchitecture="*" name="MapleStoryAnalyzer" type="win32"/>
   <description>Maple Insight live efficiency HUD</description>
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
@@ -40,6 +40,7 @@ hiddenimports = []
 # ``icon=`` embeds the executable's shell icon, while Tk needs the same ICO
 # available at runtime for the title bar/taskbar icon.
 datas.append((str(repo_root / "assets" / "maple_insight.ico"), "."))
+datas.append((str(repo_root / "assets" / "maple_insight_dark_blue.json"), "."))
 datas.append((
     str(repo_root / "assets" / "paddle_models" / "en_PP-OCRv4_mobile_rec" / "inference.onnx"),
     "paddle_models/en_PP-OCRv4_mobile_rec",

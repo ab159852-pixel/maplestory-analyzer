@@ -43,6 +43,13 @@ def test_stale_or_prerelease_is_not_offered():
     assert parse_latest_release(payload, current_version="1.0.4") is None
 
 
+def test_newer_release_is_offered_for_updater_test():
+    info = parse_latest_release(_release_payload(tag="v1.0.11"), current_version="1.0.10")
+
+    assert info is not None
+    assert info.version == "1.0.11"
+
+
 def test_archive_members_reject_zip_slip_and_require_app_executable():
     safe_buffer = BytesIO()
     with zipfile.ZipFile(safe_buffer, "w") as archive:
