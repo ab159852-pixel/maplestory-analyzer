@@ -233,6 +233,11 @@ class EconomySnapshot:
     # can verify the baseline before trusting potion-use totals.
     shortcut_baseline: dict[str, int] = field(default_factory=dict)
     shortcut_current: dict[str, int] = field(default_factory=dict)
+    # Latest plausible OCR observation. This may differ from
+    # ``shortcut_current`` for one or two frames while the economy validator
+    # confirms that a decrease is a real drink; it is display-only and must
+    # never be used to calculate cost.
+    shortcut_observed: dict[str, int] = field(default_factory=dict)
     shortcut_baseline_ready: bool = False
 
 
@@ -628,6 +633,11 @@ class EconomyTracker:
                 # produces a plausible stable value.
                 self._slot_candidates.pop(slot_id, None)
                 continue
+
+            # Publish a plausible lower observation immediately so the UI can
+            # prove that OCR saw a quantity change. The trusted quantity and
+            # cost ledger still wait for the confirmation/rate gates below.
+            self._shortcut_observed[slot_id] = current
 
             candidate = self._slot_candidates.get(slot_id)
             candidate_is_recent = (
@@ -1055,6 +1065,7 @@ class EconomyTracker:
             # as 6 from 116 must never leak into the UI while a decrease is
             # being validated.
             shortcut_current=dict(self._slot_counts),
+            shortcut_observed=dict(self._shortcut_observed),
             shortcut_baseline_ready=bool(self._shortcut_baseline),
         )
 

@@ -210,6 +210,7 @@ _STRINGS: dict[str, dict[Lang, str]] = {
     "settings_default_recovery_mp": {"en": "MP recovery match after slot drop", "zh": "快捷欄下降後的 MP 回復辨識值"},
     "potion_compact": {"en": "{uses} uses · {cost:,}", "zh": "{uses} 次 · {cost:,}"},
     "potion_inventory_pending": {"en": "detecting initial quantities…", "zh": "正在偵測初始數量…"},
+    "potion_inventory_unconfirmed": {"en": "latest OCR, pending confirmation", "zh": "最新 OCR，待確認"},
     "potion_inventory_compact": {"en": "start {values}", "zh": "初始 {values}"},
     "settings_potion_slots_hint": {
         "en": "Cost/uses come only from quantity decreases. Recovery is used only to label a confirmed potion event; natural/skill recovery is never charged.",

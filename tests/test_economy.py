@@ -364,12 +364,14 @@ def test_snapshot_exposes_initial_and_current_shortcut_quantities():
     # One lower OCR frame is only a candidate; the live quantity remains
     # stable until the same decrease is observed again.
     assert tracker.snapshot.shortcut_current == {"1": 1180, "2": 2037}
+    assert tracker.snapshot.shortcut_observed == {"1": 1179, "2": 2037}
     tracker.record_quick_slot_counts({"1": 1179, "2": 2037}, now=1.75)
 
     snapshot = tracker.snapshot
     assert snapshot.shortcut_baseline_ready is True
     assert snapshot.shortcut_baseline == {"1": 1180, "2": 2037}
     assert snapshot.shortcut_current == {"1": 1179, "2": 2037}
+    assert snapshot.shortcut_observed == {"1": 1179, "2": 2037}
 
 
 def test_truncated_shortcut_ocr_never_jumps_inventory_to_a_suffix():

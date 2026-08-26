@@ -34,6 +34,10 @@ from .settings import PotionSlotConfig
 AUX_SCAN_MIN_MS = 200
 PICKUP_SCAN_MIN_MS = 100
 PICKUP_DETECTION_INTERVAL_S = 0.35
+# The EXP percentage is rounded to two decimals. Keep the display guard as
+# loose as Session.EXP_TOTAL_BAND, but prevent a structurally valid OCR frame
+# from replacing a good same-level value with an impossible total.
+EXP_DISPLAY_TOTAL_BAND = 0.25
 
 
 class MonitorSource(Protocol):
@@ -76,6 +80,71 @@ class ContextReading:
     map_name: str | None = None
     job_name: str | None = None
     error: str | None = None
+
+
+def merge_status_snapshots(previous: StatSnapshot, incoming: StatSnapshot) -> StatSnapshot:
+    """Merge one status frame without publishing transient EXP disappearance.
+
+    Parser output is structurally valid before it reaches this boundary, but a
+    tiny EXP crop can still produce a plausible number that is lower than the
+    previous same-level value or implies a completely different level total.
+    Missing fields already carry forward here; the extra monotonic/percentage
+    checks keep a single bad frame from making the live EXP value visibly jump
+    backwards and then poisoning the next rate calculation.
+    """
+    merged = StatSnapshot(*(
+        new if new is not None else old
+        for new, old in zip(vars(incoming).values(), vars(previous).values())
+    ))
+    if previous.exp_cur is None or incoming.exp_cur is None:
+        return merged
+
+    previous_level = previous.level
+    incoming_level = incoming.level
+    level_increased = (
+        previous_level is not None
+        and incoming_level is not None
+        and incoming_level > previous_level
+    )
+    confirmed_level_up = level_increased and incoming.exp_cur < previous.exp_cur
+
+    # A level change without the corresponding EXP reset is normally a one-frame
+    # level OCR error. Hold the old level so it cannot weaken the same-level
+    # EXP guard or make Session bank a phantom level-up.
+    if (
+        previous_level is not None
+        and incoming_level is not None
+        and incoming_level != previous_level
+        and not confirmed_level_up
+    ):
+        merged.level = previous_level
+
+    if confirmed_level_up:
+        return merged
+
+    # EXP cannot decrease within one level. If the level OCR is missing for the
+    # actual level-up, holding this frame is safer than showing an EXP reset;
+    # the next frame with a confirmed level will be accepted normally.
+    if incoming.exp_cur < previous.exp_cur:
+        merged.exp_cur = previous.exp_cur
+        merged.exp_pct = previous.exp_pct if previous.exp_pct is not None else incoming.exp_pct
+        return merged
+
+    previous_pct = previous.exp_pct
+    incoming_pct = incoming.exp_pct
+    if previous_pct is None or incoming_pct is None or previous_pct <= 0 or incoming_pct <= 0:
+        return merged
+
+    previous_total = previous.exp_cur / (previous_pct / 100)
+    incoming_total = incoming.exp_cur / (incoming_pct / 100)
+    band = EXP_DISPLAY_TOTAL_BAND + (0.005 / incoming_pct)
+    if previous_total > 0 and abs(incoming_total / previous_total - 1) > band:
+        # Keep both pieces together. Publishing the new number with the old
+        # percentage (or vice versa) would make the next frame look like a
+        # real level-total change to the rate/session layer.
+        merged.exp_cur = previous.exp_cur
+        merged.exp_pct = previous.exp_pct
+    return merged
 
 
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")

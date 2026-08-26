@@ -71,7 +71,7 @@ from .economy import (
     parse_slot_count,
 )
 from .i18n import Lang, t
-from .monitor import BackgroundMonitor
+from .monitor import BackgroundMonitor, merge_status_snapshots
 from .ocr import StatPanelOcr
 from .parser import StatSnapshot, parse_fields
 from .rate import Session, SessionSummary
@@ -2631,10 +2631,7 @@ class OverlayApp:
                     )
                     self._last_client_size = reading.client_size
                 snap = reading.snapshot
-                merged = StatSnapshot(*(
-                    new if new is not None else old
-                    for new, old in zip(vars(snap).values(), vars(self._last).values())
-                ))
+                merged = merge_status_snapshots(self._last, snap)
                 self._last = merged
                 if self._run_state == "running":
                     if economy is not None:
@@ -3665,20 +3662,29 @@ class OverlayApp:
         economy = getattr(self, "_economy", None)
         if economy is not None:
             economy_snapshot = economy.snapshot
+            pending_observation = False
             if economy_snapshot.shortcut_baseline_ready:
-                # Pair each slot's initial quantity with its latest trusted
-                # quantity.  This makes a potion drop visible immediately and
-                # gives the user a direct sanity check for OCR baselines.
+                # Pair each slot's initial quantity with the latest plausible
+                # OCR observation.  The economy tracker keeps a separate
+                # trusted quantity for cost accounting, so a one-frame lower
+                # read can be shown immediately with a clear pending marker.
                 inventory_values = []
+                observed = getattr(economy_snapshot, "shortcut_observed", {})
                 for slot_id, initial in economy_snapshot.shortcut_baseline.items():
-                    current = economy_snapshot.shortcut_current.get(slot_id, initial)
-                    inventory_values.append(f"{slot_id}:{initial:,}→{current:,}")
+                    trusted = economy_snapshot.shortcut_current.get(slot_id, initial)
+                    current = observed.get(slot_id, trusted)
+                    pending = current != trusted
+                    pending_observation = pending_observation or pending
+                    inventory_values.append(f"{slot_id}:{initial:,}→{current:,}{'*' if pending else ''}")
                 inventory_text = " · ".join(inventory_values) or self._t("potion_inventory_pending")
+                if pending_observation:
+                    inventory_text += f" ({self._t('potion_inventory_unconfirmed')})"
             else:
                 inventory_text = self._t("potion_inventory_pending")
             self._value_labels["shortcut_inventory"].configure(
                 text=inventory_text,
-                text_color=OK_COLOR if economy_snapshot.shortcut_baseline_ready else EXP_COLOR,
+                text_color=(EXP_COLOR if pending_observation else OK_COLOR)
+                if economy_snapshot.shortcut_baseline_ready else EXP_COLOR,
             )
             self._value_labels["mesos"].configure(
                 text=f"+{economy_snapshot.mesos:,}",
@@ -3805,11 +3811,18 @@ class OverlayApp:
         hp_recovery_savings = getattr(economy_snapshot, "hp_recovery_savings", 0.0) if economy_snapshot is not None else 0.0
         mp_recovery_savings = getattr(economy_snapshot, "mp_recovery_savings", 0.0) if economy_snapshot is not None else 0.0
         if economy_snapshot is not None and economy_snapshot.shortcut_baseline_ready:
-            inventory_values = [
-                f"{slot_id}:{economy_snapshot.shortcut_current.get(slot_id, initial):,}"
-                for slot_id, initial in economy_snapshot.shortcut_baseline.items()
-            ]
+            observed = getattr(economy_snapshot, "shortcut_observed", {})
+            pending_observation = False
+            inventory_values = []
+            for slot_id, initial in economy_snapshot.shortcut_baseline.items():
+                trusted = economy_snapshot.shortcut_current.get(slot_id, initial)
+                current = observed.get(slot_id, trusted)
+                pending = current != trusted
+                pending_observation = pending_observation or pending
+                inventory_values.append(f"{slot_id}:{current:,}{'*' if pending else ''}")
             shortcut_inventory = " · ".join(inventory_values) or "--"
+            if pending_observation:
+                shortcut_inventory += f" ({self._t('potion_inventory_unconfirmed')})"
         else:
             shortcut_inventory = self._t("potion_inventory_pending")
         exp_diff = self._session.exp_diff

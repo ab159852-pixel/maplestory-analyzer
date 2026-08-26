@@ -595,21 +595,35 @@ class StatPanelOcr:
                 continue
             pending[slot_key] = (str(slot_id), crop)
 
-        # Recognition-only RapidOCR supports a list of crops and batches the
-        # ONNX inference.  Calling it once for all changed cells is both much
-        # faster and more consistent than running two views per cell.  The
-        # temporal economy validator remains the authority on whether a new
-        # number is a real inventory change.
-        primary_texts = self._read_shortcut_text_batch({
-            key: crop for key, (_slot_id, crop) in pending.items()
-        })
         for slot_key, (slot_id, crop) in pending.items():
-            count = _extract_shortcut_count(primary_texts.get(slot_key, ""))
-            if count is None:
-                # A missing batch result is uncommon (usually a redraw).  Use
-                # the stricter two-view path only for that cell, not for every
-                # cell on every sample.
-                count = self.read_slot_count(crop, allow_singleton=True, fast=True)
+            # The quantity is the small white run at the bottom of the cell.
+            # Reading the whole cell makes RapidOCR rediscover the key label and
+            # item artwork; on a CPU-only machine that costs roughly 0.2-0.4s
+            # per slot and lets several drinks happen before the next sample.
+            # Keep the crop local to this measured cell and read only the
+            # quantity strip instead.
+            fast_count = self._read_shortcut_quantity_strip(
+                crop,
+                blue=slot_key.endswith(":True"),
+                previous=last_values.get(slot_key),
+            )
+            count = fast_count
+            previous_count = last_values.get(slot_key)
+            if count is None or previous_count is None or count != previous_count:
+                # The strip is an excellent change detector, but a one-line
+                # recognition-only crop can still confuse a glyph with a
+                # neighbour on a different item theme (2703 -> 8042 is a real
+                # example). Validate only a first read or a changed candidate
+                # against the complete isolated cell. Stable cells never pay
+                # this cost, so the normal 0.2-0.3s cadence remains responsive.
+                full_text, _records = self._read_shortcut_once(crop)
+                full_count = _extract_shortcut_count(full_text)
+                if full_count is not None:
+                    count = full_count
+                elif count is None:
+                    # A redraw can temporarily erase both views. Use the
+                    # existing multi-view cell reader only for that miss.
+                    count = self.read_slot_count(crop, allow_singleton=True, fast=True)
             if count is None and slot_key.endswith(":True"):
                 # The blue icon can cover a leading stroke.  Keep the colour
                 # recovery as a targeted fallback for blanks only; applying it
@@ -630,6 +644,56 @@ class StatPanelOcr:
         self._shortcut_last_cell_signatures = current_signatures
         self._shortcut_last_cell_values = current_values
         return counts
+
+    def _read_shortcut_quantity_strip(
+        self,
+        image: Image.Image,
+        *,
+        blue: bool,
+        previous: int | None = None,
+    ) -> int | None:
+        """Read only the quantity glyphs from one already-isolated cell.
+
+        The capture layer supplies a cell crop with the correct DPI transform.
+        Its lower half is stable across client sizes, while the keyboard label
+        and item artwork above it are not useful for a numeric read.  Blue MP
+        artwork can still leak into grayscale OCR, so include red/green channel
+        views and let the suffix/prefix resolver choose the complete value.
+
+        ``previous`` is intentionally only a hint.  The economy tracker remains
+        the authority for whether a decrease is a real drink; this function is
+        allowed to return a new observation so the UI can show that OCR saw it.
+        """
+        strip = _shortcut_quantity_strip(image)
+        if strip.width <= 1 or strip.height <= 1:
+            return None
+
+        rgb = strip.convert("RGB")
+        variants: list[Image.Image] = [rgb]
+        if blue:
+            # Preserve the RGB view for ordinary/both-type items.  Red and
+            # green suppress most blue potion artwork while keeping the white
+            # quantity outline.  A wrong trailing stroke is corrected by
+            # _select_blue_shortcut_candidate below.
+            variants.extend(rgb.getchannel(channel).convert("RGB") for channel in ("R", "G"))
+
+        candidates: list[int] = []
+        for variant in variants:
+            try:
+                text, _records = self._read_shortcut_once(variant)
+            except Exception:
+                continue
+            value = _extract_shortcut_count(text)
+            if value is not None:
+                candidates.append(value)
+
+        if not candidates:
+            return None
+        if blue:
+            return _select_blue_shortcut_candidate(candidates, allow_singleton=True)
+        # A non-blue cell needs only one clean recognition view.  Its isolated
+        # geometry plus the temporal validator protects the accounting path.
+        return _select_slot_consensus(candidates, allow_singleton=True)
 
     def _read_shortcut_text_batch(
         self,
@@ -992,6 +1056,20 @@ def _select_blue_shortcut_candidate(
     return _select_slot_consensus(values, allow_singleton=allow_singleton)
 
 
+def _shortcut_quantity_strip(image: Image.Image) -> Image.Image:
+    """Return the proportional bottom strip that contains the quantity text."""
+    width, height = image.size
+    if width <= 1 or height <= 1:
+        return image.crop((0, 0, max(1, width), max(1, height)))
+    top = max(0, min(height - 1, round(height * 0.48)))
+    # The final one or two pixels often contain the neighbouring cell's
+    # outlined stroke at non-reference DPI scales.  Trim proportionally so
+    # the same rule works for 37px cells and larger direct captures.
+    right_trim = max(1, round(width * 0.055))
+    right = max(1, width - right_trim)
+    return image.crop((0, top, right, height))
+
+
 def _shortcut_crop_signature(image: Image.Image) -> tuple:
     """Return a cheap signature for the quantity strip, not the icon.
 
@@ -999,9 +1077,7 @@ def _shortcut_crop_signature(image: Image.Image) -> tuple:
     grayscale bottom strip lets the monitor skip OCR while the quantity stays
     unchanged, while any actual inventory digit change still wakes the cell.
     """
-    height = image.height
-    top = max(0, round(height * 0.35))
-    strip = image.crop((0, top, image.width, height)).convert("L")
+    strip = _shortcut_quantity_strip(image).convert("L")
     reduced = strip.resize(
         (max(8, strip.width // 2), max(6, strip.height // 2)),
         getattr(Image, "Resampling", Image).BILINEAR,
