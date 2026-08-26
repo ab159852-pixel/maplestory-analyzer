@@ -9,7 +9,7 @@ from maple_analyzer.updates import _safe_archive_members, parse_latest_release
 def _release_payload(*, tag: str = "v1.0.5") -> dict:
     return {
         "tag_name": tag,
-        "html_url": f"https://github.com/neo85824/maplestory-analyzer/releases/tag/{tag}",
+        "html_url": f"https://github.com/ab159852-pixel/maplestory-analyzer/releases/tag/{tag}",
         "body": "Improve OCR and automatic resolution scaling.",
         "assets": [
             {

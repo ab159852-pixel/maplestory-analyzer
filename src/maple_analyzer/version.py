@@ -7,5 +7,5 @@ from __future__ import annotations
 APP_NAME = "MapleStoryAnalyzer"
 APP_DISPLAY_NAME = "Maple Insight"
 APP_VERSION = "1.0.10"
-GITHUB_REPOSITORY = "neo85824/maplestory-analyzer"
+GITHUB_REPOSITORY = "ab159852-pixel/maplestory-analyzer"
 RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
