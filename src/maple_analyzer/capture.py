@@ -38,6 +38,7 @@ from .regions import (
     SHORTCUT_SLOT_BOXES,
     STAT_PANEL_BOX,
     scale_box,
+    scale_shortcut_box,
     scale_top_left_box,
 )
 
@@ -171,7 +172,8 @@ def field_sample_points(client_size: tuple[int, int]) -> list[tuple[int, int]]:
 def box_sample_points(boxes, client_size: tuple[int, int]) -> list[tuple[int, int]]:
     points: list[tuple[int, int]] = []
     for box in boxes:
-        b = scale_box(box, client_size)
+        mapper = scale_shortcut_box if box == SHORTCUT_BOX else scale_box
+        b = mapper(box, client_size)
         points += [
             (b.left + 1, b.top + 1), (b.right - 2, b.top + 1),
             (b.left + 1, b.bottom - 2), (b.right - 2, b.bottom - 2),
@@ -247,7 +249,11 @@ class StaticImageCapture:
 
     def grab_auxiliary(self) -> dict[str, Image.Image]:
         regions = {
-            name: self._image.crop(scale_box(box, self._image.size).as_tuple())
+            name: self._image.crop(
+                (scale_shortcut_box if name == "shortcut" else scale_box)(
+                    box, self._image.size
+                ).as_tuple()
+            )
             for name, box in AUXILIARY_BOXES.items()
         }
         pickup = regions["pickup"]
@@ -262,14 +268,16 @@ class StaticImageCapture:
                 round(bottom_box * pickup.height / reference_height),
             ))
         regions.update({
-            f"shortcut:{slot}": self._image.crop(scale_box(box, self._image.size).as_tuple())
+            f"shortcut:{slot}": self._image.crop(
+                scale_shortcut_box(box, self._image.size).as_tuple()
+            )
             for slot, box in SHORTCUT_SLOT_BOXES.items()
         })
         return regions
 
     def grab_context(self) -> dict[str, Image.Image]:
         return {
-            name: self._image.crop(scale_box(box, self._image.size).as_tuple())
+            name: self._image.crop(scale_top_left_box(box, self._image.size).as_tuple())
             for name, box in CONTEXT_BOXES.items()
         }
 
@@ -708,7 +716,11 @@ class GameWindowCapture:
             self.client_size = client_size
             capture_boxes = _pickup_boxes_for_client(client_size)
             regions: dict[str, Image.Image] = {
-                name: graphics.crop(scale_box(capture_boxes[name], client_size).as_tuple())
+                name: graphics.crop(
+                    (scale_shortcut_box if name == "shortcut" else scale_box)(
+                        capture_boxes[name], client_size
+                    ).as_tuple()
+                )
                 for name in capture_boxes
             }
         else:
@@ -726,7 +738,9 @@ class GameWindowCapture:
                 capture_boxes = _pickup_boxes_for_client(client_size)
                 regions = {}
                 for name, raw_box in capture_boxes.items():
-                    box = scale_box(raw_box, client_size)
+                    box = (scale_shortcut_box if name == "shortcut" else scale_box)(
+                        raw_box, client_size
+                    )
                     shot = self._mss.grab({
                         "left": left + box.left,
                         "top": top + box.top,
@@ -749,9 +763,9 @@ class GameWindowCapture:
                 round(bottom_box * actual_feed_size[1] / reference_feed_height),
             ))
         shortcut = regions["shortcut"]
-        parent = scale_box(SHORTCUT_BOX, client_size)
+        parent = scale_shortcut_box(SHORTCUT_BOX, client_size)
         for slot, raw_box in SHORTCUT_SLOT_BOXES.items():
-            box = scale_box(raw_box, client_size)
+            box = scale_shortcut_box(raw_box, client_size)
             local = (
                 box.left - parent.left,
                 box.top - parent.top,

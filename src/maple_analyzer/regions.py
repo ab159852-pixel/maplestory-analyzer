@@ -1,11 +1,12 @@
 """Crop-box definitions for the stat panel and its fields.
 
 The boxes are measured in a reference game viewport, then mapped to the actual
-client pixels reported by the capture backend on every frame.  The mapping keeps
-the game's aspect ratio, centers horizontal letterboxing, and anchors the bottom
-HUD to the bottom of the client.  That is more stable than independently
-stretching x/y coordinates when a user resizes a window or moves it between DPI
-scales.
+client pixels reported by the capture backend on every frame.  The main status
+panel uses the game's aspect-ratio transform.  The shortcut grid is a separate
+bottom HUD layer: MapleStory scales that layer from the client width and keeps
+it bottom-anchored even when the captured client is a little shorter than the
+reference viewport.  Keeping those transforms explicit prevents the shortcut
+quantities from drifting into the neighbouring cell on a different device.
 """
 from __future__ import annotations
 
@@ -45,8 +46,11 @@ FIELD_BOXES = {
 # boxes separate from FIELD_BOXES preserves the exact four-field OCR contract
 # used by the demo and regression fixtures.
 BAR_BOXES = {
-    "hp": (486, 777, 600, 799),
-    "mp": (600, 777, 712, 799),
+    # The numeric HP/MP text occupies the first few rows above the coloured
+    # bar.  Keeping it out of this signal is important: a text redraw is not
+    # the game's potion-flash effect and must never become a drink hint.
+    "hp": (486, 785, 600, 800),
+    "mp": (600, 785, 712, 800),
 }
 
 # Auxiliary regions used by the economy tracker.  They are deliberately kept
@@ -196,3 +200,38 @@ def scale_top_left_box(
         offset_x=0,
         offset_y=0,
     ).map_box(box)
+
+
+def shortcut_transform(client_size: tuple[int, int]) -> RegionTransform:
+    """Build the transform for the bottom-right shortcut grid.
+
+    The shortcut/action HUD is rendered as a width-scaled layer, rather than
+    being fitted to the full captured aspect ratio.  In particular, a
+    1368x769 client keeps nearly the reference shortcut cell size; applying
+    ``region_transform`` there shrinks the cells and shifts the first column
+    left far enough for OCR to read a neighbouring quantity.  Width scaling
+    preserves the grid geometry and bottom anchoring while still adapting to
+    genuinely wider clients such as 1920px captures.
+    """
+    ref_w, ref_h = REFERENCE_CLIENT_SIZE
+    client_w, client_h = client_size
+    if ref_w <= 0 or ref_h <= 0 or client_w <= 0 or client_h <= 0:
+        raise ValueError(f"invalid client size: {client_size!r}")
+    scale = client_w / ref_w
+    rendered_h = ref_h * scale
+    return RegionTransform(
+        client_size=client_size,
+        scale=scale,
+        # The bottom HUD is centred horizontally in the client layer.  Since
+        # the layer's logical width equals the reference width, this is zero
+        # at the reference size and naturally tracks a wider client.
+        offset_x=0,
+        offset_y=client_h - rendered_h,
+    )
+
+
+def scale_shortcut_box(
+    box: tuple[int, int, int, int], client_size: tuple[int, int]
+) -> Box:
+    """Map a shortcut-grid box to the current client pixels."""
+    return shortcut_transform(client_size).map_box(box)

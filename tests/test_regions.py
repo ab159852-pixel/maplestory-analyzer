@@ -5,6 +5,7 @@ from maple_analyzer.regions import (
     STAT_PANEL_BOX,
     region_transform,
     scale_box,
+    scale_shortcut_box,
     scale_top_left_box,
 )
 
@@ -60,3 +61,14 @@ def test_top_left_box_does_not_apply_viewport_letterbox():
     assert centered.left > anchored.left
     assert anchored.left == round(box[0] * transform.scale)
     assert anchored.top == round(box[1] * transform.scale)
+
+
+def test_shortcut_grid_is_width_scaled_and_bottom_anchored():
+    # The game keeps the shortcut cell geometry tied to client width even when
+    # the captured client is a few pixels shorter than the reference viewport.
+    parent = scale_shortcut_box((915, 650, 1080, 742), (1368, 769))
+    slot = scale_shortcut_box((960, 700, 997, 735), (1368, 769))
+
+    assert parent.as_tuple() == (927, 617, 1094, 710)
+    assert parent.left <= slot.left < slot.right <= parent.right
+    assert parent.top <= slot.top < slot.bottom <= parent.bottom

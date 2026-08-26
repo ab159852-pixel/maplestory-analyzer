@@ -85,7 +85,11 @@ def _bundled_model_dir() -> Path | None:
     candidates: list[Path] = []
     frozen_root = getattr(sys, "_MEIPASS", None)
     if frozen_root:
-        candidates.append(Path(frozen_root) / MODEL_RELATIVE_DIR)
+        root = Path(frozen_root)
+        candidates.extend((root / MODEL_RELATIVE_DIR, root / "_internal" / MODEL_RELATIVE_DIR))
+    if getattr(sys, "frozen", False):
+        root = Path(sys.executable).resolve().parent
+        candidates.extend((root / MODEL_RELATIVE_DIR, root / "_internal" / MODEL_RELATIVE_DIR))
 
     source_root = Path(__file__).resolve().parents[2]
     candidates.append(source_root / "assets" / MODEL_RELATIVE_DIR)

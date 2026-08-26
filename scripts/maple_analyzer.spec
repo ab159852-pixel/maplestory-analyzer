@@ -23,7 +23,7 @@ repo_root = Path(SPECPATH).resolve().parent
 # same as the source run at 100%, 125%, and 150% display scaling.
 DPI_MANIFEST = r'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="1.0.12.0" processorArchitecture="*" name="MapleStoryAnalyzer" type="win32"/>
+  <assemblyIdentity version="1.0.13.0" processorArchitecture="*" name="MapleStoryAnalyzer" type="win32"/>
   <description>Maple Insight live efficiency HUD</description>
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
@@ -51,6 +51,17 @@ for pkg in ("customtkinter", "rapidocr_onnxruntime", "winrt", "mss"):
     datas += pkg_datas
     binaries += pkg_binaries
     hiddenimports += pkg_hiddenimports
+
+# CustomTkinter imports ThemeManager at module import time and that manager
+# loads ``blue.json`` before OverlayApp can switch to the project-owned theme.
+# PyInstaller's collect_all has not been reliable across CustomTkinter/Python
+# combinations, so preserve every built-in theme explicitly.  Missing one of
+# these files makes the frozen exe fail before the first window is painted.
+import customtkinter
+
+builtin_theme_dir = Path(customtkinter.__file__).resolve().parent / "assets" / "themes"
+for theme_path in builtin_theme_dir.glob("*.json"):
+    datas.append((str(theme_path), "customtkinter/assets/themes"))
 
 # customtkinter is built on top of tkinter.  Some portable Python runtimes
 # make tkinter.Tk() unavailable to PyInstaller's isolated probe (for example

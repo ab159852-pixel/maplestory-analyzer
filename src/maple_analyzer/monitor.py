@@ -13,6 +13,7 @@ import queue
 import re
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -126,6 +127,14 @@ def _normalize_context_text(value: str, *, kind: str) -> str:
     """Normalize the few stable Traditional/Simplified OCR substitutions."""
     text = _clean_context_text(value)
     if kind == "map":
+        # A shifted crop can capture the mini-map tab caption instead of the
+        # second line.  These strings are UI chrome, never a real map name;
+        # rejecting them is safer than allowing them into the stable candidate
+        # streak and the drop lookup request.
+        if "小地圖" in text or "小地图" in text:
+            return ""
+        if text in {"國地圖", "国地图", "地圖國", "地图国"}:
+            return ""
         # The client renders 第3軍營, while RapidOCR sometimes returns the
         # simplified glyphs 军/营 on this very small second-line crop.  管 is
         # another common visual confusion for 營 in the same tiny font.
@@ -181,7 +190,17 @@ def _select_context_candidate(candidates: list[str], *, kind: str) -> str | None
             if _CANONICAL_BARRACKS_RE.search(_compact_map_text(candidate))
         ]
         if complete:
-            return max(complete, key=len)
+            candidates = complete
+    # A single enlarged/detection retry can still return a plausible but wrong
+    # CJK string.  Prefer the mode across all views, with the most recent
+    # candidate breaking a tie, instead of selecting the longest or last OCR
+    # result unconditionally.
+    counts = Counter(candidates)
+    highest = max(counts.values())
+    winners = {candidate for candidate, count in counts.items() if count == highest}
+    for candidate in reversed(candidates):
+        if candidate in winners:
+            return candidate
     return candidates[-1]
 
 
@@ -506,10 +525,17 @@ class BackgroundMonitor:
                 if potion_due:
                     read_shortcut_counts = getattr(self.ocr, "read_shortcut_counts", None)
                     if callable(read_shortcut_counts) and regions.get("shortcut") is not None:
-                        configured_ids = {slot.slot for slot in configured_slots}
+                        # With no explicit settings rows, ``slots`` contains
+                        # the all-eight fallback.  Pass those observed cells
+                        # as required too; otherwise the full-bar detector can
+                        # merge a neighbouring quantity and feed it into the
+                        # economy validator before the per-cell fast path ever
+                        # gets a chance to read it.
+                        observed_slots = configured_slots or slots
+                        configured_ids = {slot.slot for slot in observed_slots}
                         blue_ids = {
                             slot.slot
-                            for slot in configured_slots
+                            for slot in observed_slots
                             if slot.kind in ("mp", "both")
                         }
                         try:

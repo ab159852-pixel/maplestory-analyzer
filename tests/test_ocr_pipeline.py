@@ -95,3 +95,75 @@ def test_blue_shortcut_prefers_complete_quantity_over_suffix_read():
     )
 
     assert count == 86
+
+
+def test_shortcut_count_rejects_first_spurious_digit_and_keeps_consensus_value():
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    readings = iter([
+        ("6", []),       # key-label/partial read from the first view
+        ("2676", []),
+        ("2676", []),
+        ("2676", []),
+    ])
+    ocr._read_once = lambda _image: next(readings)
+
+    from PIL import Image
+    assert ocr.read_slot_count(Image.new("RGB", (36, 27))) == 2676
+
+
+def test_shortcut_count_returns_none_without_independent_agreement():
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    readings = iter([
+        ("2676", []),
+        ("1875", []),
+        ("676", []),
+        ("875", []),
+    ])
+    ocr._read_once = lambda _image: next(readings)
+
+    from PIL import Image
+    assert ocr.read_slot_count(Image.new("RGB", (36, 27))) is None
+
+
+def test_shortcut_fast_cell_read_does_not_overwrite_complete_full_bar_value():
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._read_shortcut_slot_counts = lambda *_args: {"1": 118}
+    ocr.read_lines = lambda _image: [
+        OcrLine("1180", y=54, x=38.5, left=24, right=53),
+    ]
+
+    from PIL import Image
+    counts = ocr.read_shortcut_counts(Image.new("RGB", (297, 166)), {"1"})
+
+    assert counts["1"] == 1180
+
+
+def test_shortcut_full_validation_is_cached_when_fast_value_is_stable():
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._read_shortcut_slot_counts = lambda *_args: {"1": 1180}
+    calls = {"full": 0}
+
+    def read_lines(_image):
+        calls["full"] += 1
+        return [OcrLine("1180", y=54, x=38.5, left=24, right=53)]
+
+    ocr.read_lines = read_lines
+
+    from PIL import Image
+    image = Image.new("RGB", (297, 166))
+    assert ocr.read_shortcut_counts(image, {"1"})["1"] == 1180
+    assert ocr.read_shortcut_counts(image, {"1"})["1"] == 1180
+    assert calls["full"] == 1
+
+
+def test_shortcut_positioned_value_wins_over_neighbour_cell_merge():
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._read_shortcut_slot_counts = lambda *_args: {"6": 26765}
+    ocr.read_lines = lambda _image: [
+        OcrLine("2676", y=122, x=114.3, left=90, right=140),
+    ]
+
+    from PIL import Image
+    counts = ocr.read_shortcut_counts(Image.new("RGB", (297, 166)), {"6"})
+
+    assert counts["6"] == 2676

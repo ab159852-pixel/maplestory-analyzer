@@ -17,6 +17,12 @@ def test_mesos_parser_anchors_on_pickup_marker_and_ignores_exp():
     assert parse_slot_count("Ctrl 2,048") == 2048
 
 
+def test_mesos_parser_handles_fullwidth_digits_and_common_ocr_money_glyphs():
+    assert parse_mesos_amount("獲取椋略。(＋１，２３４)") == 1234
+    assert parse_mesos_amount("取楓略。(+275)") == 275
+    assert parse_slot_count("Ctrl ２，６７６") == 2676
+
+
 def test_mesos_feed_counts_new_lines_once_while_they_remain_visible():
     tracker = MesosFeedTracker()
 
@@ -49,6 +55,23 @@ def test_shortcut_drop_is_the_only_source_of_cost_and_classifies_recovery():
     assert snapshot.hp_recovery_potion == 50
     assert snapshot.hp_recovery_natural == 0
     assert snapshot.hp_recovery_savings == 0
+
+
+def test_bar_flash_can_confirm_one_frame_drop_but_never_creates_cost_alone():
+    tracker = EconomyTracker([
+        PotionSlotConfig(slot="6", name="HP Potion", kind="hp", cost=25),
+    ])
+    tracker.record_quick_slot_counts({"6": 10}, now=0)
+    tracker.record_bar_flash(("hp",), now=1)
+    assert tracker.snapshot.potion_uses == 0
+
+    # The quantity drop is visible only once.  A matching conservative bar
+    # flash is allowed to confirm exactly one bottle.
+    tracker.record_quick_slot_counts({"6": 9}, now=1.0)
+
+    snapshot = tracker.snapshot
+    assert snapshot.hp_potion_uses == 1
+    assert snapshot.hp_potion_cost == 25
 
 
 def test_monotonic_multi_potion_drop_counts_without_repeated_quantity_frame():

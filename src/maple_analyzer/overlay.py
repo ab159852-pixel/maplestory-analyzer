@@ -132,30 +132,29 @@ STOPPED_BUTTON_WIDTH = 96  # Start alone, centered -- smaller than the two-butto
 STOP_COLOR = "#b94d78"
 STOP_HOVER = "#df6b9a"
 
-# Color tokens: an obsidian/sapphire base with restrained teal, violet and
-# gold accents.  The extra border/raised tokens keep cards visually layered
-# instead of making the whole window read as one flat dark rectangle.
-# Night-pink glass palette.  CustomTkinter does not provide per-widget alpha
-# compositing, so the jelly/glow effect is built from close translucent-like
-# surfaces, bright hairline borders, and high-contrast hover/selected layers.
-BG = "#0f0915"
-SURFACE = "#1e1326"
-SURFACE_2 = "#281832"
-SURFACE_RAISED = "#33203e"
-SURFACE_ELEVATED = "#42284d"
-BORDER = "#784866"
-BORDER_SOFT = "#432842"
-INK = "#fff1fa"
-INK_DIM = "#e0b6d1"
-INK_FAINT = "#a47b99"
-ACCENT = "#ff8dcc"
-ACCENT_INK = "#351126"
-VIOLET = "#ff79c8"
-VIOLET_HOVER = "#ffb0e1"
-TAB_SURFACE = "#160d1e"
-TAB_UNSELECTED = "#321a38"
-TAB_HOVER = "#633052"
-GLOW_BORDER = "#c764a5"
+# Color tokens: an obsidian/sapphire glass palette with restrained aqua,
+# violet and gold accents.  CustomTkinter has no per-widget alpha compositing,
+# so the flowing-glass feel is built from layered near-transparent surfaces,
+# hairline highlights and deliberately low-contrast secondary borders instead
+# of a flat magenta rectangle.
+BG = "#080d18"
+SURFACE = "#101a2b"
+SURFACE_2 = "#15243a"
+SURFACE_RAISED = "#1b2e48"
+SURFACE_ELEVATED = "#24415f"
+BORDER = "#38597a"
+BORDER_SOFT = "#253c58"
+INK = "#edf6ff"
+INK_DIM = "#b2c7df"
+INK_FAINT = "#7894b3"
+ACCENT = "#7ee8dc"
+ACCENT_INK = "#08212b"
+VIOLET = "#8b7bff"
+VIOLET_HOVER = "#b3abff"
+TAB_SURFACE = "#0c1423"
+TAB_UNSELECTED = "#1b2940"
+TAB_HOVER = "#314766"
+GLOW_BORDER = "#78c7d9"
 HP_COLOR = "#ff789d"
 MP_COLOR = "#8cb4ff"
 EXP_COLOR = "#ffd27a"
@@ -169,10 +168,13 @@ def _ctk_theme_candidates() -> tuple[Path, ...]:
     candidates: list[Path] = []
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
-        candidates.append(Path(meipass) / CTK_THEME_FILE_NAME)
+        root = Path(meipass)
+        candidates.extend((root / CTK_THEME_FILE_NAME, root / "_internal" / CTK_THEME_FILE_NAME))
     if getattr(sys, "frozen", False):
-        candidates.append(Path(sys.executable).resolve().parent / CTK_THEME_FILE_NAME)
-    candidates.append(Path(__file__).resolve().parents[2] / "assets" / CTK_THEME_FILE_NAME)
+        root = Path(sys.executable).resolve().parent
+        candidates.extend((root / CTK_THEME_FILE_NAME, root / "_internal" / CTK_THEME_FILE_NAME))
+    source_root = Path(__file__).resolve().parents[2]
+    candidates.extend((source_root / "assets" / CTK_THEME_FILE_NAME, source_root / CTK_THEME_FILE_NAME))
     return tuple(candidates)
 
 
@@ -368,6 +370,13 @@ class OverlayApp:
         self._saved_topmost = self._settings.topmost
         self._detected_job_name: str | None = None
         self._detected_map_name: str | None = None
+        # Context OCR is intentionally low-frequency, but one noisy frame can
+        # still look like a valid CJK map name.  Keep a candidate streak and
+        # only publish a new value after two consistent worker readings.
+        self._map_candidate: str | None = None
+        self._map_candidate_hits = 0
+        self._job_candidate: str | None = None
+        self._job_candidate_hits = 0
         self._context_error: str | None = None
         # A manual refresh can be clicked while the OCR model is still
         # loading. Keep the request until BackgroundMonitor exists, otherwise
@@ -406,12 +415,19 @@ class OverlayApp:
 
         self.root = ctk.CTk()
         self.root.title(APP_DISPLAY_NAME)
+        # Replace the dated native Windows frame with a small application-owned
+        # titlebar.  Apart from matching the glass UI, this prevents the
+        # rounded shell from being visually cut off by the OS frame inset.
+        self.root.overrideredirect(True)
+        self.root.bind("<Map>", self._restore_borderless_window)
         # PyInstaller's ``icon=`` sets the executable/file icon, but Tk uses
         # a separate runtime window icon.  Set that explicitly as well so the
         # title bar and taskbar do not keep showing the old default icon.
         icon_candidates = (
             Path(sys.executable).resolve().parent / "maple_insight.ico",
+            Path(sys.executable).resolve().parent / "_internal" / "maple_insight.ico",
             Path(getattr(sys, "_MEIPASS", "")) / "maple_insight.ico",
+            Path(getattr(sys, "_MEIPASS", "")) / "_internal" / "maple_insight.ico",
             Path(__file__).resolve().parents[2] / "assets" / "maple_insight.ico",
         )
         for icon_path in icon_candidates:
@@ -427,43 +443,17 @@ class OverlayApp:
         # Live content remains vertically scrollable, so the larger canvas is
         # used for hierarchy rather than squeezing more rows into view.
         self._full_geometry = "760x900+40+40"
+        self._normal_geometry = self._full_geometry
+        self._window_maximized = False
+        self._drag_state: tuple[int, int, int, int] | None = None
         self.root.geometry(self._full_geometry)
         self.root.minsize(420, 520)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        self._build_window_chrome()
         self._shell = ctk.CTkFrame(self.root, fg_color="transparent")
-        self._shell.pack(fill="both", expand=True, padx=14, pady=14)
+        self._shell.pack(fill="both", expand=True, padx=10, pady=(8, 10))
         shell = self._shell
-        header = ctk.CTkFrame(
-            shell, fg_color=SURFACE, corner_radius=18, height=72,
-            border_width=1, border_color=BORDER,
-        )
-        header.pack(fill="x", padx=(0, 64), pady=(0, 8))
-        header.pack_propagate(False)
-        brand = ctk.CTkFrame(header, fg_color="transparent")
-        brand.pack(side="left", fill="both", expand=True, padx=(16, 4))
-        ctk.CTkLabel(
-            brand, text="MSA", width=42, height=42, corner_radius=13,
-            fg_color=VIOLET, text_color="#111326", font=("Segoe UI", 14, "bold"),
-        ).pack(side="left", pady=14)
-        title_box = ctk.CTkFrame(brand, fg_color="transparent")
-        title_box.pack(side="left", fill="both", expand=True, padx=(12, 0))
-        ctk.CTkLabel(
-            title_box, text="MAPLE INSIGHT", anchor="w",
-            text_color=INK, font=("Segoe UI", 13, "bold"),
-        ).pack(anchor="w", pady=(14, 0))
-        ctk.CTkLabel(
-            title_box, text="CONTROL CENTER  ·  LIVE 0.3s SAMPLING", anchor="w",
-            text_color=INK_FAINT, font=("Segoe UI", 8, "bold"),
-        ).pack(anchor="w")
-        self._hud_mode_button = ctk.CTkButton(
-            header, text="HUD", command=self._toggle_floating_mode,
-            width=76, height=30, corner_radius=10,
-            fg_color=SURFACE_ELEVATED, hover_color=BORDER, text_color=INK,
-            font=("Segoe UI", 10, "bold"),
-        )
-        self._hud_mode_button.pack(side="right", padx=(4, 16), pady=21)
-
         self._tabview = ctk.CTkTabview(
             shell, fg_color=BG, segmented_button_fg_color=SURFACE,
             segmented_button_selected_color=VIOLET,
@@ -887,6 +877,157 @@ class OverlayApp:
             self._context_refresh_pending = False
         self._render(self._last)
 
+    def _build_window_chrome(self) -> None:
+        """Build the frameless glass titlebar and its window controls."""
+        chrome = ctk.CTkFrame(
+            self.root,
+            fg_color=SURFACE,
+            corner_radius=16,
+            border_width=1,
+            border_color=BORDER,
+            height=58,
+        )
+        chrome.pack(fill="x", padx=10, pady=(10, 0))
+        chrome.pack_propagate(False)
+        chrome.grid_columnconfigure(1, weight=1)
+        self._window_chrome = chrome
+
+        # A single luminous hairline gives the frame a continuous top edge;
+        # it is deliberately inset so rounded corners never look clipped.
+        shine = ctk.CTkFrame(chrome, fg_color=GLOW_BORDER, height=1, corner_radius=1)
+        shine.place(relx=0.06, rely=0.02, relwidth=0.88, anchor="nw")
+
+        logo = ctk.CTkLabel(
+            chrome,
+            text="MSA",
+            width=42,
+            height=36,
+            corner_radius=12,
+            fg_color=ACCENT,
+            text_color=ACCENT_INK,
+            font=("Segoe UI", 13, "bold"),
+        )
+        logo.grid(row=0, column=0, rowspan=2, padx=(14, 10), pady=10)
+
+        identity = ctk.CTkFrame(chrome, fg_color="transparent")
+        identity.grid(row=0, column=1, rowspan=2, sticky="nsew", pady=7)
+        self._window_title_label = ctk.CTkLabel(
+            identity,
+            text="MAPLE INSIGHT",
+            anchor="w",
+            text_color=INK,
+            font=("Segoe UI", 12, "bold"),
+        )
+        self._window_title_label.pack(anchor="w")
+        self._window_subtitle_label = ctk.CTkLabel(
+            identity,
+            text="CONTROL CENTER  ·  LIVE 0.3s SAMPLING",
+            anchor="w",
+            text_color=INK_FAINT,
+            font=("Segoe UI", 8, "bold"),
+        )
+        self._window_subtitle_label.pack(anchor="w")
+
+        controls = ctk.CTkFrame(chrome, fg_color="transparent")
+        controls.grid(row=0, column=2, rowspan=2, sticky="e", padx=(8, 8), pady=8)
+        self._hud_mode_button = ctk.CTkButton(
+            controls,
+            text="HUD",
+            command=self._toggle_floating_mode,
+            width=66,
+            height=30,
+            corner_radius=10,
+            fg_color=SURFACE_ELEVATED,
+            hover_color=TAB_HOVER,
+            text_color=INK,
+            font=("Segoe UI", 9, "bold"),
+        )
+        self._hud_mode_button.grid(row=0, column=0, padx=(0, 7))
+        self._window_min_button = ctk.CTkButton(
+            controls,
+            text="—",
+            command=self._minimize_window,
+            width=30,
+            height=30,
+            corner_radius=9,
+            fg_color="transparent",
+            hover_color=SURFACE_ELEVATED,
+            text_color=INK_DIM,
+            font=("Segoe UI", 13),
+        )
+        self._window_min_button.grid(row=0, column=1, padx=1)
+        self._window_max_button = ctk.CTkButton(
+            controls,
+            text="□",
+            command=self._toggle_window_maximized,
+            width=30,
+            height=30,
+            corner_radius=9,
+            fg_color="transparent",
+            hover_color=SURFACE_ELEVATED,
+            text_color=INK_DIM,
+            font=("Segoe UI", 11),
+        )
+        self._window_max_button.grid(row=0, column=2, padx=1)
+        self._window_close_button = ctk.CTkButton(
+            controls,
+            text="×",
+            command=self._on_close,
+            width=30,
+            height=30,
+            corner_radius=9,
+            fg_color="transparent",
+            hover_color="#8e3c5c",
+            text_color=INK_DIM,
+            font=("Segoe UI", 15),
+        )
+        self._window_close_button.grid(row=0, column=3, padx=(1, 0))
+
+        drag_widgets = (chrome, logo, identity, self._window_title_label, self._window_subtitle_label)
+        for widget in drag_widgets:
+            widget.bind("<ButtonPress-1>", self._start_window_drag, add="+")
+            widget.bind("<B1-Motion>", self._drag_window, add="+")
+            widget.bind("<Double-Button-1>", self._toggle_window_maximized, add="+")
+
+    def _restore_borderless_window(self, _event=None) -> None:
+        # Windows can reapply decoration after a taskbar restore; asserting the
+        # style on Map keeps the custom frame stable without touching geometry.
+        with contextlib.suppress(Exception):
+            self.root.overrideredirect(True)
+
+    def _start_window_drag(self, event) -> None:
+        self._drag_state = (
+            int(event.x_root), int(event.y_root),
+            int(self.root.winfo_x()), int(self.root.winfo_y()),
+        )
+
+    def _drag_window(self, event) -> None:
+        if self._drag_state is None or self._window_maximized:
+            return
+        start_x, start_y, window_x, window_y = self._drag_state
+        x = window_x + int(event.x_root) - start_x
+        y = window_y + int(event.y_root) - start_y
+        self.root.geometry(f"+{x}+{y}")
+
+    def _minimize_window(self) -> None:
+        with contextlib.suppress(Exception):
+            import ctypes
+            ctypes.windll.user32.ShowWindow(int(self.root.winfo_id()), 6)
+            return
+        with contextlib.suppress(Exception):
+            self.root.iconify()
+
+    def _toggle_window_maximized(self, _event=None) -> None:
+        if self._window_maximized:
+            self.root.geometry(self._normal_geometry)
+            self._window_maximized = False
+            return
+        self._normal_geometry = self.root.geometry()
+        width = max(1, int(self.root.winfo_screenwidth()))
+        height = max(1, int(self.root.winfo_screenheight()))
+        self.root.geometry(f"{width}x{height}+0+0")
+        self._window_maximized = True
+
     def _build_floating_bar(self) -> None:
         """Build the compact horizontal work HUD once, then toggle visibility."""
         self._floating_bar = ctk.CTkFrame(
@@ -982,8 +1123,9 @@ class OverlayApp:
         with contextlib.suppress(Exception):
             self._shell.pack_forget()
             self._floating_bar.pack(fill="x", padx=10, pady=10)
-            self.root.geometry("1100x92+40+40")
-            self.root.minsize(700, 70)
+            self._window_maximized = False
+            self.root.geometry("1100x170+40+40")
+            self.root.minsize(700, 130)
         with contextlib.suppress(Exception):
             self.root.attributes("-topmost", True)
         self._set_alpha(self._settings.floating_opacity_pct)
@@ -995,7 +1137,7 @@ class OverlayApp:
         self._floating_mode = False
         with contextlib.suppress(Exception):
             self._floating_bar.pack_forget()
-            self._shell.pack(fill="both", expand=True, padx=14, pady=14)
+            self._shell.pack(fill="both", expand=True, padx=10, pady=(8, 10))
             self.root.geometry(self._full_geometry)
             self.root.minsize(420, 520)
         with contextlib.suppress(Exception):
@@ -2130,6 +2272,9 @@ class OverlayApp:
             economy = getattr(self, "_economy", None)
             if economy is not None:
                 economy.begin_quick_slot_baseline()
+            reset_flash = getattr(monitor, "reset_bar_flash_detection", None)
+            if callable(reset_flash):
+                reset_flash()
             self._potion_baseline_pending = True
             self._potion_baseline_samples.clear()
             self._last_logged_shortcut_counts = None
@@ -2148,20 +2293,21 @@ class OverlayApp:
             if not counts:
                 return
             # The first read is calibration, not accounting.  Require each
-            # slot to repeat the same value in two consecutive auxiliary
-            # frames before making it the session baseline.  This prevents a
-            # single adjacent-cell OCR merge (e.g. 89 -> 895) from defining
-            # the starting inventory for the entire session.
+            # slot to repeat the same value in three of the latest four
+            # auxiliary frames before making it the session baseline.  This
+            # prevents a single adjacent-cell OCR merge (e.g. 89 -> 895) or a
+            # stale frame arriving from the worker queue from defining the
+            # starting inventory for the entire session.
             self._potion_baseline_samples.append(dict(counts))
-            if len(self._potion_baseline_samples) > 3:
-                del self._potion_baseline_samples[:-3]
+            if len(self._potion_baseline_samples) > 4:
+                del self._potion_baseline_samples[:-4]
             stable: dict[str, int] = {}
             for slot_id, count in counts.items():
                 confirmations = sum(
                     sample.get(slot_id) == count
                     for sample in self._potion_baseline_samples
                 )
-                if confirmations >= 2:
+                if confirmations >= 3:
                     stable[slot_id] = count
             if not stable:
                 return
@@ -2470,6 +2616,10 @@ class OverlayApp:
                 ))
                 self._last = merged
                 if self._run_state == "running":
+                    if economy is not None:
+                        record_flash = getattr(economy, "record_bar_flash", None)
+                        if callable(record_flash):
+                            record_flash(getattr(reading, "bar_flash", ()), event_now)
                     self._session.record(
                         merged.exp_cur, merged.hp_cur, merged.mp_cur, merged.exp_pct,
                         hp_max=merged.hp_max, mp_max=merged.mp_max, level=merged.level,
@@ -2503,15 +2653,40 @@ class OverlayApp:
             self._context_refresh_pending = False
             self._context_error = reading.error
             if reading.map_name:
-                self._detected_map_name = reading.map_name
+                self._accept_context_candidate("map", reading.map_name)
             if reading.job_name:
-                self._detected_job_name = reading.job_name
+                self._accept_context_candidate("job", reading.job_name)
             if self._run_state == "running":
                 if self._session_map_name is None and self._current_map_name():
                     self._session_map_name = self._current_map_name()
                 if self._session_job_name is None and self._current_job_name():
                     self._session_job_name = self._current_job_name()
         self._render_context()
+
+    def _accept_context_candidate(self, kind: str, value: str) -> None:
+        """Promote a context OCR value only after a consistent confirmation."""
+        value = value.strip()
+        if not value:
+            return
+        if kind == "map":
+            stable_attr, candidate_attr, hits_attr = (
+                "_detected_map_name", "_map_candidate", "_map_candidate_hits"
+            )
+        else:
+            stable_attr, candidate_attr, hits_attr = (
+                "_detected_job_name", "_job_candidate", "_job_candidate_hits"
+            )
+        candidate = getattr(self, candidate_attr, None)
+        hits = getattr(self, hits_attr, 0)
+        if candidate == value:
+            hits += 1
+        else:
+            candidate = value
+            hits = 1
+        setattr(self, candidate_attr, candidate)
+        setattr(self, hits_attr, hits)
+        if hits >= 2 or getattr(self, stable_attr, None) == value:
+            setattr(self, stable_attr, value)
 
     def _do_tick(self) -> int:
         # Production uses BackgroundMonitor.  The synchronous fallback keeps
@@ -2728,10 +2903,15 @@ class OverlayApp:
             read_shortcut_counts = getattr(self._ocr, "read_shortcut_counts", None)
             if callable(read_shortcut_counts) and regions.get("shortcut") is not None:
                 try:
-                    configured_ids = {slot.slot for slot in configured if slot.enabled}
+                    # Use the exact cells being observed as the fast-path
+                    # requirement.  Falling back to full-bar detection when no
+                    # row is configured allows neighbouring keyboard labels or
+                    # quantities to be assigned to a potion slot.
+                    observed_slots = configured or slots
+                    configured_ids = {slot.slot for slot in observed_slots if slot.enabled}
                     blue_ids = {
                         slot.slot
-                        for slot in configured
+                        for slot in observed_slots
                         if slot.enabled and slot.kind in ("mp", "both")
                     }
                     try:

@@ -48,6 +48,12 @@ MAX_IN_SESSION_RESTOCK_DELTA = 5
 # a real inventory event, even when the OCR value looks numeric.
 POTION_MIN_INTERVAL_SECONDS = 0.5
 POTION_RATE_TOLERANCE_SECONDS = 0.06
+# HP/MP bar flashes are an optional third signal.  They are intentionally not
+# used as a standalone cost source: a shortcut quantity decrease is still
+# required.  A flash may, however, confirm a one-frame quantity drop when the
+# next auxiliary OCR frame is missed. Keep this close to the independent
+# 0.2/0.3s worker cadence so a late OCR artefact cannot borrow an old flash.
+BAR_FLASH_WINDOW_SECONDS = 1.25
 # A final inventory reconciliation may cover a long interval, so it is not
 # limited by the per-scan held-key guard above.  Values larger than this are
 # more likely to be a missing OCR digit than a real single-session depletion.
@@ -97,7 +103,12 @@ def parse_mesos_amount(text: str) -> int | None:
     EXP lines are intentionally ignored even when they contain a number in
     parentheses.
     """
-    compact = re.sub(r"\s+", "", text).replace(",", "")
+    digit_translation = str.maketrans(
+        "０１２３４５６７８９＋，",
+        "0123456789+,",
+    )
+    compact = re.sub(r"\s+", "", str(text)).translate(digit_translation)
+    compact = compact.replace(",", "")
     # The OCR model occasionally emits simplified characters or confuses
     # 楓 with 椋 in the small pickup toast.
     compact = (
@@ -106,6 +117,10 @@ def parse_mesos_amount(text: str) -> int | None:
         .replace("枫币", "楓幣")
         .replace("椋幣", "楓幣")
         .replace("椋币", "楓幣")
+        .replace("楓略", "楓幣")
+        .replace("椋略", "楓幣")
+        .replace("楓弊", "楓幣")
+        .replace("椋弊", "楓幣")
     )
     marker = compact.find("楓幣")
     fallback_without_marker = False
@@ -142,7 +157,8 @@ def parse_mesos_amount(text: str) -> int | None:
 
 def parse_slot_count(text: str) -> int | None:
     """Read the last integer in one configured shortcut-slot crop."""
-    matches = _INTEGER_RE.findall(text.replace(",", ""))
+    normalized = str(text).translate(str.maketrans("０１２３４５６７８９，", "0123456789,"))
+    matches = _INTEGER_RE.findall(normalized.replace(",", ""))
     if not matches:
         return None
     try:
@@ -350,6 +366,11 @@ class EconomyTracker:
         self._shortcut_observed.clear()
         self._slot_candidates.clear()
         self._pending_potions.clear()
+        # A flash captured before Start/Resume belongs to the old visual
+        # baseline.  Carrying it over could confirm an unrelated OCR drop in
+        # the new interval, so the evidence must have the same boundary as
+        # the shortcut inventory baseline.
+        self._recent_bar_flashes = {"hp": [], "mp": []}
 
     def prime_quick_slot_counts(
         self, counts: dict[str, int], now: float | None = None
@@ -393,6 +414,65 @@ class EconomyTracker:
         self._shortcut_observed: dict[str, int] = {}
         self._slot_candidates: dict[str, tuple[int, int, float]] = {}
         self._pending_potions: list[_PendingPotion] = []
+        self._recent_bar_flashes: dict[str, list[float]] = {"hp": [], "mp": []}
+
+    def record_bar_flash(
+        self, resources: Iterable[str], now: float | None = None
+    ) -> None:
+        """Remember conservative HP/MP bar-flash evidence.
+
+        The bar detector is edge-triggered and emits at most one resource per
+        flash.  Keeping the evidence briefly bridges the independent status
+        (0.3s) and shortcut (0.2s) worker cadences.  It never creates a
+        potion use by itself; the quantity must still decrease in a valid
+        configured slot.
+        """
+        timestamp = time.monotonic() if now is None else now
+        if isinstance(resources, str):
+            resources = (resources,)
+        resource_names = {str(value).lower() for value in resources}
+        for kind in ("hp", "mp"):
+            if kind not in resource_names:
+                continue
+            values = self._recent_bar_flashes.setdefault(kind, [])
+            values.append(timestamp)
+            self._recent_bar_flashes[kind] = [
+                value for value in values
+                if timestamp - value <= BAR_FLASH_WINDOW_SECONDS
+            ][-4:]
+
+    def _flash_kind_for_slot(self, slot: PotionSlotConfig) -> tuple[str, ...]:
+        if slot.kind == "hp":
+            return ("hp",)
+        if slot.kind == "mp":
+            return ("mp",)
+        return ("hp", "mp")
+
+    def _consume_matching_bar_flash(
+        self, slot: PotionSlotConfig, timestamp: float
+    ) -> bool:
+        """Consume one nearby flash, if it matches the potion's type."""
+        for kind in self._flash_kind_for_slot(slot):
+            values = self._recent_bar_flashes.get(kind, [])
+            eligible = [
+                (index, value)
+                for index, value in enumerate(values)
+                if abs(timestamp - value) <= BAR_FLASH_WINDOW_SECONDS
+            ]
+            if not eligible:
+                continue
+            index, _value = min(eligible, key=lambda pair: abs(timestamp - pair[1]))
+            values.pop(index)
+            return True
+        return False
+
+    def _has_matching_bar_flash(
+        self, slot: PotionSlotConfig, timestamp: float
+    ) -> bool:
+        return any(
+            any(abs(timestamp - value) <= BAR_FLASH_WINDOW_SECONDS for value in self._recent_bar_flashes.get(kind, ()))
+            for kind in self._flash_kind_for_slot(slot)
+        )
 
     def record_pickup_lines(self, lines: Iterable[object], now: float | None = None) -> int:
         observations: list[MesosObservation] = []
@@ -512,7 +592,13 @@ class EconomyTracker:
             else:
                 confirmations = 1
             self._slot_candidates[slot_id] = (current, confirmations, timestamp)
-            if confirmations >= SLOT_CONFIRMATIONS_REQUIRED:
+            slot = self._by_slot.get(slot_id)
+            flash_confirmed = bool(
+                slot is not None
+                and drop == 1
+                and self._has_matching_bar_flash(slot, timestamp)
+            ) if slot is not None else False
+            if confirmations >= SLOT_CONFIRMATIONS_REQUIRED or flash_confirmed:
                 confirmed_drop = previous - current
                 allowed_drop = self._allowed_drop_for_slot(
                     slot_id, timestamp, reference_at=previous_sample_at
@@ -528,6 +614,8 @@ class EconomyTracker:
                     # Discard it instead of converting a suffix/crop failure
                     # into dozens of potion uses and a false cost.
                     continue
+                if flash_confirmed and slot is not None:
+                    self._consume_matching_bar_flash(slot, timestamp)
                 self._slot_counts[slot_id] = current
                 self._shortcut_observed[slot_id] = current
                 self._slot_last_accepted_at[slot_id] = timestamp
