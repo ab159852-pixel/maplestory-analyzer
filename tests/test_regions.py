@@ -105,11 +105,14 @@ def test_shortcut_cells_are_aligned_and_non_overlapping():
 
 def test_shortcut_quantity_strip_keeps_the_complete_four_digit_width():
     # The crop is already bounded by separator midpoints.  The OCR strip must
-    # retain the rightmost pixels because the fourth digit can reach that edge.
+    # retain the rightmost pixels because the fourth digit can reach that edge,
+    # while trimming only the separator row below the glyphs.
     for width, height in ((38, 41), (35, 41), (39, 36), (53, 58)):
         strip = _shortcut_quantity_strip(Image.new("RGB", (width, height)))
         assert strip.width == width
-        assert strip.height == height - round(height * 0.48)
+        top = round(height * 0.45)
+        bottom = round(height * 0.95)
+        assert strip.height == bottom - top
 
 
 def test_shortcut_frame_detector_tracks_real_reference_sizes():

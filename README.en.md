@@ -52,9 +52,11 @@ anything to the game.
   lines are deduplicated before they are added; if OCR drops the `楓幣` glyphs,
   a conservative pickup-text fallback still recovers the amount.
 - **Potion/recovery tracking** — watches up to eight shortcut slots. Only
-  enabled/configured slots are tracked; when no slot is enabled, quantity drops
-  fall back to shared HP/MP uses with zero cost. Entering a name, price, type,
-  and fixed recovery amount classifies the slot and calculates cost. Potion uses and costs increase only when a shortcut
+  enabled/configured slots are tracked; when no slot is enabled, shortcut OCR
+  and potion accounting stay idle. The eight cell coordinates are still
+  prepared from the game client geometry, and only configured cells are sent
+  to OCR. Entering a name, price, type, and fixed recovery amount classifies
+  the slot and calculates cost. Potion uses and costs increase only when a shortcut
   quantity decreases. A lower OCR value must be confirmed twice, and
   implausibly large jumps are ignored, so a drink animation or a missing digit
   cannot become hundreds of potions. The recovery amount labels a recovery as
@@ -173,17 +175,17 @@ identically whether started via the .exe or this command.
 
 ## Publish a release (maintainers)
 
-This source currently contains `APP_VERSION = 1.0.17`. For each release, bump
+This source currently contains `APP_VERSION = 1.0.18`. For each release, bump
 `APP_VERSION` in `src/maple_analyzer/version.py`, commit the change, and push a
 matching tag, for example:
 
 ```powershell
-git tag v1.0.17
-git push origin v1.0.17
+git tag v1.0.18
+git push origin v1.0.18
 ```
 
 GitHub Actions installs dependencies, builds
-`MapleStoryAnalyzer-v1.0.17-win64.zip`, writes a SHA-256 checksum, and publishes
+`MapleStoryAnalyzer-v1.0.18-win64.zip`, writes a SHA-256 checksum, and publishes
 the Release automatically. Packaged users will be offered the update next time
 the app starts.
 

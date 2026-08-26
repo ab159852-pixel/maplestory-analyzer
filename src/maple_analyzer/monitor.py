@@ -27,12 +27,14 @@ from .regions import (
     PICKUP_LINE_BOXES,
     PICKUP_LINE_HEIGHT,
     PICKUP_LINE_TOP_OFFSET,
-    SHORTCUT_SLOT_BOXES,
 )
 from .settings import PotionSlotConfig
 
 
-AUX_SCAN_MIN_MS = 200
+# Shortcut quantities are a separate fast signal from the pickup feed. Keep
+# the lower bound below the game's usual 0.3-0.7s potion animation so a single
+# use is not hidden behind a slow full-bar OCR pass.
+AUX_SCAN_MIN_MS = 150
 PICKUP_SCAN_MIN_MS = 100
 PICKUP_DETECTION_INTERVAL_S = 0.35
 # The EXP percentage is rounded to two decimals. Keep the display guard as
@@ -458,7 +460,7 @@ class BackgroundMonitor:
         ocr: Any,
         *,
         sample_interval_ms: int = 300,
-        aux_scan_ms: int = 250,
+        aux_scan_ms: int = 200,
         pickup_interval_ms: int = 200,
         context_scan_ms: int = 3000,
     ) -> None:
@@ -626,16 +628,11 @@ class BackgroundMonitor:
             self._track_potions = track_potions
             configured = tuple(slot for slot in potion_slots if slot.enabled)
             self._configured_potion_slots = configured
-            configured_ids = {slot.slot for slot in configured}
-            # Once the user has explicitly mapped potion slots, do not let an
-            # adjacent unconfigured shortcut cell (for example slot 8) be
-            # mistaken for the configured blue-water slot 7 when one OCR
-            # crop is incomplete.  Keep the all-slots fallback only for a
-            # brand-new configuration with no enabled rows at all.
-            self._potion_slots = configured or tuple(
-                PotionSlotConfig(slot=slot, kind="both", enabled=True)
-                for slot in SHORTCUT_SLOT_BOXES
-            )
+            # The geometry still defines all eight cells, but OCR/accounting
+            # must never scan an unconfigured cell.  An empty configuration is
+            # an explicit "do not track shortcut potions" state, not a reason
+            # to fall back to all eight cells.
+            self._potion_slots = configured
 
     def _status_loop(self) -> None:
         while not self._stop.is_set():
@@ -703,7 +700,8 @@ class BackgroundMonitor:
             with self._lock:
                 track_potions = self._track_potions
                 potion_interval = self._aux_scan_ms / 1000
-            if not track_potions:
+                configured_slots = self._configured_potion_slots
+            if not track_potions or not configured_slots:
                 self._stop.wait(0.1)
                 continue
             if not requested and now < next_potion_scan:
@@ -713,7 +711,6 @@ class BackgroundMonitor:
             next_potion_scan = now + potion_interval
             try:
                 with self._lock:
-                    configured_slots = self._configured_potion_slots
                     slots = self._potion_slots
                 regions = self.source.grab_auxiliary()
                 # Quantity changes are the hard real-time signal: a potion
@@ -750,13 +747,18 @@ class BackgroundMonitor:
         slots: tuple[PotionSlotConfig, ...],
     ) -> dict[str, int]:
         """Read only shortcut quantities for the high-frequency worker."""
+        # The settings page is the source of truth for which cells contain
+        # trackable potions.  Do not send the complete bar (or every cell crop)
+        # to OCR when the user has not enabled a row yet.
+        if not configured_slots:
+            return {}
         read_shortcut_counts = getattr(self.ocr, "read_shortcut_counts", None)
         if callable(read_shortcut_counts) and regions.get("shortcut") is not None:
-            # With no explicit settings rows, ``slots`` contains the all-eight
-            # fallback. Pass those observed cells as required too; otherwise
-            # full-bar detection can merge a neighbouring quantity into a
-            # configured potion slot.
-            observed_slots = configured_slots or slots
+            # Pass only the cells explicitly enabled in Settings.  ``slots``
+            # is retained in the signature for adapters created before this
+            # rule was introduced, but it is intentionally not used as a
+            # fallback source of OCR work.
+            observed_slots = configured_slots
             configured_ids = {slot.slot for slot in observed_slots}
             blue_ids = {
                 slot.slot

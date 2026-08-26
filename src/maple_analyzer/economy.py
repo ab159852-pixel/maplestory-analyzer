@@ -15,7 +15,11 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Iterable
 
-from .regions import MAX_SHORTCUT_QUANTITY, SHORTCUT_SLOT_BOXES
+from .regions import (
+    MAX_SHORTCUT_QUANTITY,
+    MAX_SHORTCUT_SINGLE_SAMPLE_DROP,
+    SHORTCUT_SLOT_BOXES,
+)
 from .settings import PotionSlotConfig
 
 _MESOS_RE = re.compile(r"[+]?(\d[\d,]*)")
@@ -34,7 +38,11 @@ SLOT_CONFIRMATIONS_REQUIRED = 2
 # CPU-only machine.  Keep a one-frame lower candidate through that delay so a
 # later identical/lower read can still confirm it.
 SLOT_CANDIDATE_MAX_GAP_SECONDS = 5.0
-MAX_SLOT_DROP_PER_SCAN = 99
+# A stable OCR result may still be a substituted digit (for example
+# 1487 -> 1467).  Never turn that kind of multi-digit jump into a live cost;
+# a longer missing interval is handled by final reconciliation instead.
+MAX_SLOT_DROP_PER_SCAN = MAX_SHORTCUT_SINGLE_SAMPLE_DROP
+SLOT_CORRECTION_CONFIRMATIONS_REQUIRED = 2
 # An increase is not a potion event.  The live session does not refill slots,
 # so upward changes are rejected by default.  The optional restock path below
 # remains available for isolated callers/tests that explicitly need it.
@@ -393,6 +401,7 @@ class EconomyTracker:
             self._shortcut_baseline.clear()
             self._shortcut_observed.clear()
             self._slot_candidates.clear()
+            self._slot_suspect_drops.clear()
             self._pending_potions.clear()
         if default_recovery_hp is not None:
             self._default_recovery_hp = max(0, int(default_recovery_hp))
@@ -413,6 +422,7 @@ class EconomyTracker:
         self._shortcut_baseline.clear()
         self._shortcut_observed.clear()
         self._slot_candidates.clear()
+        self._slot_suspect_drops.clear()
         self._pending_potions.clear()
         # Auxiliary monitoring is disabled while paused/stopped, but the
         # status worker keeps producing frames. Re-anchor HP/MP when it is
@@ -470,6 +480,11 @@ class EconomyTracker:
         self._shortcut_baseline: dict[str, int] = {}
         self._shortcut_observed: dict[str, int] = {}
         self._slot_candidates: dict[str, tuple[int, int, float]] = {}
+        # A live OCR jump of two-to-four items is not charged as permanently
+        # correct just because it repeated.  Keep a small correction marker so
+        # a later stable return to the previous quantity can reverse that
+        # provisional charge instead of leaving the mesos total inflated.
+        self._slot_suspect_drops: dict[str, tuple[int, float]] = {}
         self._pending_potions: list[_PendingPotion] = []
         self._recent_bar_flashes: dict[str, list[float]] = {"hp": [], "mp": []}
 
@@ -587,14 +602,56 @@ class EconomyTracker:
                 continue
 
             if current > previous:
-                # Refilling is outside the live-test model.  An upward change
+                # Refilling is outside the live-test model. An upward change
                 # is therefore never allowed to redefine the trusted value;
                 # this blocks neighbouring-cell merges such as 86 -> 865 and
                 # also prevents a later false increase from inflating the
-                # final potion cost.  Keep the optional historical restock
-                # path available for callers that explicitly opt into it.
+                # final potion cost. There is one narrowly-scoped exception:
+                # if a repeated, multi-item lower value was already charged,
+                # a repeated return toward the session baseline is treated as
+                # OCR correction and the provisional charge is reversed.
+                # Keep the optional historical restock path available for
+                # callers that explicitly opt into it.
                 if not self._allow_in_session_restock:
+                    baseline = self._shortcut_baseline.get(slot_id)
+                    suspect = self._slot_suspect_drops.get(slot_id)
+                    if (
+                        baseline is None
+                        or current > baseline
+                        or suspect is None
+                        or self._slot_charged.get(slot_id, 0) <= 0
+                    ):
+                        self._slot_candidates.pop(slot_id, None)
+                        continue
+                    candidate = self._slot_candidates.get(slot_id)
+                    candidate_is_recent = (
+                        candidate is not None
+                        and timestamp - candidate[2] <= SLOT_CANDIDATE_MAX_GAP_SECONDS
+                    )
+                    if candidate_is_recent and candidate[0] == current:
+                        confirmations = candidate[1] + 1
+                    else:
+                        confirmations = 1
+                    self._slot_candidates[slot_id] = (current, confirmations, timestamp)
+                    self._shortcut_observed[slot_id] = current
+                    if confirmations < SLOT_CORRECTION_CONFIRMATIONS_REQUIRED:
+                        continue
+                    rollback = min(
+                        current - previous,
+                        self._slot_charged.get(slot_id, 0),
+                    )
                     self._slot_candidates.pop(slot_id, None)
+                    if rollback <= 0:
+                        continue
+                    self._slot_counts[slot_id] = current
+                    self._shortcut_observed[slot_id] = current
+                    self._slot_last_accepted_at[slot_id] = timestamp
+                    self._rollback_slot_drop(slot_id, rollback)
+                    remaining = suspect[0] - rollback
+                    if remaining > 1 and current < baseline:
+                        self._slot_suspect_drops[slot_id] = (remaining, suspect[1])
+                    else:
+                        self._slot_suspect_drops.pop(slot_id, None)
                     continue
                 if current - previous > MAX_IN_SESSION_RESTOCK_DELTA:
                     self._slot_candidates.pop(slot_id, None)
@@ -692,6 +749,8 @@ class EconomyTracker:
                 self._shortcut_observed[slot_id] = current
                 self._slot_last_accepted_at[slot_id] = timestamp
                 uses += self._commit_slot_drop(slot_id, confirmed_drop, timestamp)
+                if confirmed_drop > 1:
+                    self._slot_suspect_drops[slot_id] = (confirmed_drop, timestamp)
         return uses
 
     def _allowed_drop_for_slot(
@@ -733,6 +792,56 @@ class EconomyTracker:
         self._register_potion_use(slot, count, now)
         return count
 
+    def _rollback_slot_drop(self, slot_id: str, count: int) -> int:
+        """Reverse a previously charged OCR drop after a stable correction.
+
+        Quantity OCR is allowed to be optimistic for display, but the cost
+        ledger must be reversible when a later stable frame proves that a
+        substituted digit was charged.  This only runs for the narrow
+        correction path above; ordinary upward readings remain ignored.
+        """
+        slot = self._by_slot.get(slot_id)
+        charged = self._slot_charged.get(slot_id, 0)
+        if slot is None or count <= 0 or charged <= 0:
+            return 0
+        amount = min(count, charged)
+        self._slot_charged[slot_id] = charged - amount
+        if self._slot_charged[slot_id] <= 0:
+            self._slot_charged.pop(slot_id, None)
+
+        cost = max(0, slot.cost) * amount
+        self._potion_uses = max(0, self._potion_uses - amount)
+        self._potion_cost = max(0, self._potion_cost - cost)
+        if slot.kind == "hp":
+            self._hp_potion_uses = max(0, self._hp_potion_uses - amount)
+            self._hp_potion_cost = max(0, self._hp_potion_cost - cost)
+        elif slot.kind == "mp":
+            self._mp_potion_uses = max(0, self._mp_potion_uses - amount)
+            self._mp_potion_cost = max(0, self._mp_potion_cost - cost)
+        else:
+            self._shared_potion_uses = max(0, self._shared_potion_uses - amount)
+            self._shared_potion_cost = max(0, self._shared_potion_cost - cost)
+
+        breakdown_key = slot.name or slot.slot
+        remaining_breakdown = self._potion_breakdown.get(breakdown_key, 0) - amount
+        if remaining_breakdown > 0:
+            self._potion_breakdown[breakdown_key] = remaining_breakdown
+        else:
+            self._potion_breakdown.pop(breakdown_key, None)
+
+        # Remove the newest pending recovery markers for this slot as well;
+        # otherwise a false charge could still relabel the next natural heal as
+        # a potion recovery after its cost has already been corrected.
+        remaining = amount
+        for index in range(len(self._pending_potions) - 1, -1, -1):
+            if self._pending_potions[index].config.slot != slot_id:
+                continue
+            self._pending_potions.pop(index)
+            remaining -= 1
+            if remaining <= 0:
+                break
+        return amount
+
     def reconcile_quick_slot_counts(self, counts: dict[str, int], now: float | None = None) -> int:
         """Reconcile the final visible inventory before pause/restart/close.
 
@@ -762,6 +871,29 @@ class EconomyTracker:
                 self._shortcut_observed[slot_id] = current
                 self._shortcut_baseline[slot_id] = current
                 self._slot_charged[slot_id] = 0
+                continue
+            trusted = self._slot_counts.get(slot_id, baseline)
+            suspect = self._slot_suspect_drops.get(slot_id)
+            if (
+                suspect is not None
+                and baseline >= current > trusted
+                and self._slot_charged.get(slot_id, 0) > 0
+            ):
+                rollback = min(
+                    current - trusted,
+                    self._slot_charged.get(slot_id, 0),
+                )
+                if rollback > 0:
+                    self._slot_counts[slot_id] = current
+                    self._shortcut_observed[slot_id] = current
+                    self._slot_candidates.pop(slot_id, None)
+                    self._slot_last_accepted_at[slot_id] = timestamp
+                    self._rollback_slot_drop(slot_id, rollback)
+                    remaining = suspect[0] - rollback
+                    if remaining > 1 and current < baseline:
+                        self._slot_suspect_drops[slot_id] = (remaining, suspect[1])
+                    else:
+                        self._slot_suspect_drops.pop(slot_id, None)
                 continue
             if current >= baseline:
                 # The live test does not refill slots.  Ignore upward OCR

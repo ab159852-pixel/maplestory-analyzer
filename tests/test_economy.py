@@ -455,6 +455,44 @@ def test_fast_bulk_shortcut_drop_is_rejected_by_realistic_drink_rate():
     assert tracker.snapshot.mp_potion_cost == 0
 
 
+def test_substituted_two_digit_quantity_is_rejected_without_a_cost_event():
+    tracker = EconomyTracker([
+        PotionSlotConfig(slot="7", name="Blue Potion", kind="mp", cost=604),
+    ])
+    tracker.prime_quick_slot_counts({"7": 1487}, now=0)
+
+    # 1487 -> 1467 is a plausible four-digit string to OCR, but it is not a
+    # plausible single live sample. It must not become 20 bottles of cost.
+    tracker.record_quick_slot_counts({"7": 1467}, now=10)
+    tracker.record_quick_slot_counts({"7": 1467}, now=10.5)
+
+    assert tracker.snapshot.shortcut_current == {"7": 1487}
+    assert tracker.snapshot.mp_potion_uses == 0
+    assert tracker.snapshot.mp_potion_cost == 0
+
+
+def test_provisional_multi_item_drop_can_be_reversed_by_stable_quantity_return():
+    tracker = EconomyTracker([
+        PotionSlotConfig(slot="1", name="Red Potion", kind="hp", cost=25),
+    ])
+    tracker.prime_quick_slot_counts({"1": 1000}, now=0)
+
+    # A small multi-item OCR jump is allowed only after the normal gates, but
+    # remains marked as suspicious until the later stable frame confirms it.
+    tracker.record_quick_slot_counts({"1": 996}, now=10)
+    tracker.record_quick_slot_counts({"1": 996}, now=10.5)
+    assert tracker.snapshot.hp_potion_uses == 4
+    assert tracker.snapshot.hp_potion_cost == 100
+
+    # The quantity returning to the session baseline twice proves the earlier
+    # multi-item value was a substituted digit. Reverse both use and cost.
+    tracker.record_quick_slot_counts({"1": 1000}, now=11)
+    tracker.record_quick_slot_counts({"1": 1000}, now=11.5)
+    assert tracker.snapshot.shortcut_current == {"1": 1000}
+    assert tracker.snapshot.hp_potion_uses == 0
+    assert tracker.snapshot.hp_potion_cost == 0
+
+
 def test_live_session_ignores_shortcut_restock_without_refill_action():
     tracker = EconomyTracker([
         PotionSlotConfig(slot="7", name="Blue Potion", kind="mp", cost=604),

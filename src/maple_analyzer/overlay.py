@@ -851,6 +851,13 @@ class OverlayApp:
                     else:
                         self._set_update_status("update_status_installing", version=info.version, color=OK_COLOR)
                         self._on_close()
+                        # The PowerShell helper waits for this exact packaged
+                        # PID before replacing the install directory.  A
+                        # normal Tk destroy may leave the frozen interpreter
+                        # alive briefly, so explicitly terminate only the
+                        # packaged update path after cleanup has completed.
+                        if getattr(sys, "frozen", False):
+                            os._exit(0)
         except queue.Empty:
             pass
         finally:
@@ -1054,6 +1061,8 @@ class OverlayApp:
         self._floating_bar.grid_columnconfigure(1, weight=1)
         self._floating_bar.grid_columnconfigure(2, weight=0)
         self._floating_bar.grid_columnconfigure(3, weight=0)
+        self._floating_bar.grid_rowconfigure(0, weight=1)
+        self._floating_bar.grid_rowconfigure(1, weight=0)
 
         brand = ctk.CTkFrame(self._floating_bar, fg_color="transparent")
         brand.grid(row=0, column=0, sticky="nsw", padx=(12, 6), pady=10)
@@ -1096,8 +1105,16 @@ class OverlayApp:
             self._floating_metric_frames[key] = metric
             self._floating_metric_values[key] = value
 
+        # Keep controls in their own reserved row. Previously they shared the
+        # metric row, so selecting many HUD fields let the metric frames grow
+        # underneath the pause/stop/restore buttons and made both the values
+        # and the controls unreadable. A dedicated row is deterministic at
+        # every window width and never covers a detection item.
         floating_controls = ctk.CTkFrame(self._floating_bar, fg_color="transparent")
-        floating_controls.grid(row=0, column=2, sticky="e", padx=(6, 3), pady=10)
+        floating_controls.grid(
+            row=1, column=0, columnspan=4, sticky="e",
+            padx=(12, 12), pady=(0, 10),
+        )
         self._floating_pause_button = ctk.CTkButton(
             floating_controls, command=self._on_pause_button_clicked,
             width=70, height=28, corner_radius=9, fg_color=VIOLET,
@@ -1112,12 +1129,12 @@ class OverlayApp:
         self._floating_stop_button.grid(row=0, column=1)
 
         self._floating_restore_button = ctk.CTkButton(
-            self._floating_bar, command=self._toggle_floating_mode,
+            floating_controls, command=self._toggle_floating_mode,
             width=58, height=28, corner_radius=9, fg_color=ACCENT,
             hover_color="#7ff2e0", text_color=ACCENT_INK,
         )
         self._i18n(self._floating_restore_button, "hud_button_exit", size=9, bold=True)
-        self._floating_restore_button.grid(row=0, column=3, sticky="e", padx=(3, 12), pady=10)
+        self._floating_restore_button.grid(row=0, column=2, padx=(4, 0))
         self._apply_floating_visibility()
         self._apply_run_state()
         self._refresh_floating_metric_labels()
@@ -1145,8 +1162,8 @@ class OverlayApp:
             self._shell.pack_forget()
             self._floating_bar.pack(fill="x", padx=10, pady=10)
             self._window_maximized = False
-            self.root.geometry("1100x110+40+40")
-            self.root.minsize(700, 90)
+            self.root.geometry("1100x140+40+40")
+            self.root.minsize(700, 120)
         with contextlib.suppress(Exception):
             self.root.attributes("-topmost", True)
         self._set_alpha(self._settings.floating_opacity_pct)
@@ -2287,6 +2304,9 @@ class OverlayApp:
                 track_potions=self._settings.track_potions,
                 potion_slots=self._settings.potion_slots,
             )
+        reset_shortcut_cache = getattr(getattr(self, "_ocr", None), "reset_shortcut_cache", None)
+        if callable(reset_shortcut_cache):
+            reset_shortcut_cache()
 
     def _set_monitor_aux_enabled(self, enabled: bool) -> None:
         monitor = getattr(self, "_monitor", None)
@@ -2294,6 +2314,9 @@ class OverlayApp:
             economy = getattr(self, "_economy", None)
             if economy is not None:
                 economy.begin_quick_slot_baseline()
+            reset_shortcut_cache = getattr(getattr(self, "_ocr", None), "reset_shortcut_cache", None)
+            if callable(reset_shortcut_cache):
+                reset_shortcut_cache()
             reset_flash = getattr(monitor, "reset_bar_flash_detection", None)
             if callable(reset_flash):
                 reset_flash()
@@ -2854,10 +2877,16 @@ class OverlayApp:
         source = getattr(self, "_source", None)
         economy = getattr(self, "_economy", None)
         grab_auxiliary = getattr(source, "grab_auxiliary", None)
+        configured_potions = any(
+            slot.enabled for slot in self._settings.potion_slots
+        )
         if (
             economy is None
             or not callable(grab_auxiliary)
-            or not (self._settings.track_pickup_messages or self._settings.track_potions)
+            or not (
+                self._settings.track_pickup_messages
+                or (self._settings.track_potions and configured_potions)
+            )
         ):
             return
         now = time.monotonic()
@@ -2950,20 +2979,19 @@ class OverlayApp:
         if self._settings.track_potions:
             counts: dict[str, int] = {}
             configured = [slot for slot in self._settings.potion_slots if slot.enabled]
-            configured_ids = {slot.slot for slot in configured}
-            slots = configured + [
-                PotionSlotConfig(slot=slot, kind="both", enabled=True)
-                for slot in SHORTCUT_SLOT_BOXES
-                if slot not in configured_ids
-            ]
+            # The 8-cell geometry is always available from the capture layer,
+            # but only Settings-enabled rows are valid OCR/accounting targets.
+            # An empty configuration means there is nothing to scan.
+            slots = configured
+            if not slots:
+                return
             read_shortcut_counts = getattr(self._ocr, "read_shortcut_counts", None)
             if callable(read_shortcut_counts) and regions.get("shortcut") is not None:
                 try:
-                    # Use the exact cells being observed as the fast-path
-                    # requirement.  Falling back to full-bar detection when no
-                    # row is configured allows neighbouring keyboard labels or
-                    # quantities to be assigned to a potion slot.
-                    observed_slots = configured or slots
+                    # Use only the exact cells enabled by the user.  Never
+                    # fall back to full-bar detection or infer a potion from a
+                    # neighbouring unconfigured cell.
+                    observed_slots = configured
                     configured_ids = {slot.slot for slot in observed_slots if slot.enabled}
                     blue_ids = {
                         slot.slot

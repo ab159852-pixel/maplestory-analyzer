@@ -308,18 +308,35 @@ def schedule_update(zip_path: Path) -> None:
         "-ScriptPath", str(script_path),
         "-StatusPath", str(status_path),
     ]
-    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+    # Do not combine DETACHED_PROCESS with PowerShell.  On this Windows
+    # build that combination can return a child PID and exit immediately
+    # without executing ``-File`` at all; the app then closes while the ZIP
+    # and updater script remain untouched.  CREATE_NO_WINDOW is sufficient
+    # to keep the helper invisible and, unlike DETACHED_PROCESS, actually
+    # runs the script and survives the parent application's exit.
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         # Do not inherit the app directory as the helper's current directory:
         # Windows then treats that directory as in use and Move-Item cannot
         # rename it after the old process exits. A temp working directory also
         # keeps the detached helper independent of the soon-to-close app.
-        subprocess.Popen(
+        status_path.write_text(
+            "launcher-start\n",
+            encoding="utf-8",
+        )
+        helper = subprocess.Popen(
             command,
             cwd=tempfile.gettempdir(),
             creationflags=creation_flags,
             close_fds=True,
         )
+        # Popen returning only proves that CreateProcess accepted the
+        # command.  A fast failure is still useful to surface before the app
+        # exits, instead of leaving the user with a silent no-op.
+        if helper.poll() is not None:
+            raise UpdateError("update helper exited before installation started")
     except Exception as exc:
         script_path.unlink(missing_ok=True)
+        if isinstance(exc, UpdateError):
+            raise
         raise UpdateError("could not start the update helper") from exc

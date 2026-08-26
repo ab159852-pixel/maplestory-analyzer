@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+import inspect
 import zipfile
 
 from maple_analyzer.updates import _POWERSHELL_UPDATER, _safe_archive_members, parse_latest_release
@@ -70,3 +71,15 @@ def test_updater_handles_renamed_exe_and_records_transaction_progress():
     assert "Start-Process -FilePath $targetExe -WorkingDirectory $InstallDir -PassThru" in _POWERSHELL_UPDATER
     assert "$StatusPath" in _POWERSHELL_UPDATER
     assert "update-success" in _POWERSHELL_UPDATER
+
+
+def test_updater_does_not_use_detached_process_for_powershell():
+    # DETACHED_PROCESS can accept CreateProcess but silently skip the
+    # PowerShell -File script on Windows. CREATE_NO_WINDOW keeps it hidden
+    # while allowing the helper to run after the app exits.
+    from maple_analyzer import updates
+
+    source = inspect.getsource(updates.schedule_update)
+    assert 'creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)' in source
+    assert ' | getattr(subprocess, "DETACHED_PROCESS", 0)' not in source
+    assert '"launcher-start\\n"' in source

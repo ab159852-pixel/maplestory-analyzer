@@ -32,6 +32,7 @@ from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from .numeric_ocr import OnnxNumericRecognizer, crop_level_badge
 from .regions import (
     MAX_SHORTCUT_QUANTITY,
+    MAX_SHORTCUT_SINGLE_SAMPLE_DROP,
     Box,
     SHORTCUT_BOX,
     SHORTCUT_SLOT_BOXES,
@@ -209,28 +210,37 @@ class StatPanelOcr:
             self._numeric_engine = None
             return ""
 
+    def reset_shortcut_cache(self) -> None:
+        """Forget shortcut pixels when a new session or slot mapping starts.
+
+        The quantity strip intentionally excludes the item artwork, so a
+        user can replace the potion in the same key while leaving the number
+        unchanged.  Clearing the OCR cache at that boundary prevents the old
+        session's quantity from being reused as the new baseline.
+        """
+        self._shortcut_last_cell_signatures = {}
+        self._shortcut_last_cell_values = {}
+        self._shortcut_last_fast_counts = {}
+        self._shortcut_last_full_counts = {}
+        self._shortcut_last_validation_at = 0.0
+        self._shortcut_validation_signature = None
+
     def _read_shortcut_once(self, image: Image.Image) -> tuple[str, list[OcrLine]]:
         """Read a shortcut quantity with a layout-safe numeric fallback.
 
         Shortcut quantities are the primary source for potion accounting. The
         general RapidOCR recognizer is useful for Chinese UI text, but its
         detector/recognition vocabulary is more likely to return a keyboard
-        label or a neighbouring cell. Use the bundled numeric recognizer for
-        the isolated quantity crop and retain RapidOCR only as a compatibility
-        fallback for development builds without the numeric model.
+        label or a neighbouring cell. Use the bundled numeric recognizer first
+        for an isolated quantity crop and retain RapidOCR only as a
+        compatibility fallback for development builds without the numeric
+        model.  The previous order let a plausible but wrong RapidOCR value
+        such as 1467 overwrite the numeric model's 1487.
         """
-        # The shortcut cell still contains the item icon and keyboard label.
-        # RapidOCR's recognition-only pass is therefore the proven primary
-        # read for this particular layout: the numeric model can otherwise
-        # turn icon strokes into letters (for example ``H87``).  Try it only
-        # when the text recognizer produced no numeric candidate, and accept a
-        # numeric-model result only when it contains digits/separators alone.
-        text, records = self._read_once(image)
-        if _extract_shortcut_count(text) is not None:
-            return text, records
         numeric_text = self._read_numeric_field(image)
         if _numeric_shortcut_text_is_usable(numeric_text):
             return numeric_text, []
+        text, records = self._read_once(image)
         return text, records
 
     def read_text_field(self, image: Image.Image) -> str:
@@ -419,19 +429,28 @@ class StatPanelOcr:
         allow_full_validation: bool = True,
         slot_images: Mapping[str, Image.Image] | None = None,
     ) -> dict[str, int]:
-        """Read all visible shortcut quantities from the parent bar.
+        """Read shortcut quantities from the requested cells in the parent bar.
 
         The capture layer first measures the outer frame and then cuts the
         complete eight cells at the actual separator midpoints.  Detection on
-        the complete bar remains a validation fallback, but the primary path
-        no longer relies on a narrow inner crop that can turn ``1570`` into
-        ``57`` at another DPI scale.
+        the complete bar remains a legacy diagnostic path only when the caller
+        omits ``required_slots``.  Live potion tracking passes the configured
+        cell IDs, so an unconfigured cell never reaches OCR.
         """
+        has_explicit_required_slots = required_slots is not None
         required = set(required_slots or ())
         blue = set(blue_slots or ())
+        if has_explicit_required_slots and not required:
+            # ``None`` preserves the legacy full-bar inspection API for manual
+            # diagnostics.  An explicitly empty iterable comes from Settings
+            # when no potion row is enabled and must perform zero OCR work.
+            return {}
         validation_signature = (tuple(sorted(required)), tuple(sorted(blue)))
         now = time.monotonic()
         last_full_counts = dict(getattr(self, "_shortcut_last_full_counts", {}) or {})
+        previous_counts = dict(last_full_counts)
+        if not previous_counts:
+            previous_counts = dict(getattr(self, "_shortcut_last_fast_counts", {}) or {})
         last_validation_at = float(getattr(self, "_shortcut_last_validation_at", 0.0))
         last_signature = getattr(self, "_shortcut_validation_signature", None)
         configuration_changed = last_signature != validation_signature
@@ -462,6 +481,7 @@ class StatPanelOcr:
                     required,
                     blue,
                     slot_images=slot_images,
+                    previous_counts=previous_counts,
                 )
             except TypeError:
                 # Keep test doubles and older plug-in OCR adapters that still
@@ -485,10 +505,20 @@ class StatPanelOcr:
             return result
 
         # Validate the complete bar only when the numeric path is incomplete
-        # (or when no required slots were supplied).  A positioned full-bar run
-        # can still recover a crop that is temporarily unreadable without
-        # blocking the normal potion cadence.
-        counts = self._shortcut_counts_from_records(image, self.read_lines(image))
+        # (or when no required slots were supplied). A positioned full-bar run
+        # uses the general text model and can produce a plausible *wrong*
+        # number, so it must not replace a missing numeric result in a live
+        # configured potion slot. Keep the last verified numeric value until a
+        # later batch has a clean read; this is safer than turning a transient
+        # blank into a cost event.
+        numeric_engine_available = getattr(self, "_numeric_engine", None) is not None
+        if required and numeric_engine_available:
+            counts = dict(fast_counts)
+            for slot in required - counts.keys():
+                if slot in last_full_counts:
+                    counts[slot] = last_full_counts[slot]
+        else:
+            counts = self._shortcut_counts_from_records(image, self.read_lines(image))
         for slot, value in fast_counts.items():
             positioned = counts.get(slot)
             counts[slot] = (
@@ -504,7 +534,7 @@ class StatPanelOcr:
                 if slot in last_full_counts:
                     counts[slot] = last_full_counts[slot]
         missing = required - counts.keys()
-        if missing:
+        if missing and not numeric_engine_available:
             # Detection occasionally loses only the small glyph run for one
             # slot. Retry enhanced full-bar images only for those slots, and
             # never on the stable fast path above.
@@ -544,6 +574,7 @@ class StatPanelOcr:
         blue_slots: Iterable[str] = (),
         *,
         slot_images: Mapping[str, Image.Image] | None = None,
+        previous_counts: Mapping[str, int] | None = None,
     ) -> dict[str, int]:
         """Read configured cells without running full-bar text detection.
 
@@ -597,36 +628,45 @@ class StatPanelOcr:
                 continue
             pending[slot_key] = (str(slot_id), crop)
 
+        # The numeric recognizer is cheap when used as one ONNX batch, but
+        # eight separate calls (and then a RapidOCR call for every changed
+        # cell) made the old path fall behind the game's 0.3-0.7s potion
+        # animation. Stable, cross-view-validated cells are skipped by the
+        # signature cache above; only a changed strip reaches this batch. The
+        # batch contains several colour views for that one cell and remains
+        # isolated from neighbouring quantities.
+        numeric_counts = self._read_shortcut_numeric_batch(
+            pending,
+            blue_slot_ids=blue_slot_ids,
+            previous_counts=previous_counts,
+        )
+        numeric_engine_available = getattr(self, "_numeric_engine", None) is not None
+
         for slot_key, (slot_id, crop) in pending.items():
-            # The quantity is the small white run at the bottom of the cell.
-            # Reading the whole cell makes RapidOCR rediscover the key label and
-            # item artwork; on a CPU-only machine that costs roughly 0.2-0.4s
-            # per slot and lets several drinks happen before the next sample.
             # Keep the crop local to this measured cell and read only the
-            # quantity strip instead.
-            fast_count = self._read_shortcut_quantity_strip(
-                crop,
-                blue=slot_key.endswith(":True"),
-                previous=last_values.get(slot_key),
-            )
+            # quantity strip. The numeric batch is authoritative for this
+            # number; RapidOCR is only a fallback when the numeric model has
+            # no usable output.
+            fast_count = numeric_counts.get(slot_id)
+            if fast_count is None and not numeric_engine_available:
+                fast_count = self._read_shortcut_quantity_strip(
+                    crop,
+                    blue=slot_key.endswith(":True"),
+                    # ``last_values`` is an OCR cache, not a trusted quantity.
+                    # The trusted previous quantity is only a guard against a
+                    # multi-digit substitution; it does not make a real
+                    # one-bottle decrease impossible.
+                    previous=(previous_counts or {}).get(slot_id),
+                )
             count = fast_count
-            previous_count = last_values.get(slot_key)
-            if count is None or previous_count is None or count != previous_count:
-                # The strip is an excellent change detector, but a one-line
-                # recognition-only crop can still confuse a glyph with a
-                # neighbour on a different item theme (2703 -> 8042 is a real
-                # example). Validate only a first read or a changed candidate
-                # against the complete isolated cell. Stable cells never pay
-                # this cost, so the normal 0.2-0.3s cadence remains responsive.
-                full_text, _records = self._read_shortcut_once(crop)
-                full_count = _extract_shortcut_count(full_text)
-                if full_count is not None:
-                    count = full_count
-                elif count is None:
-                    # A redraw can temporarily erase both views. Use the
-                    # existing multi-view cell reader only for that miss.
-                    count = self.read_slot_count(crop, allow_singleton=True, fast=True)
-            if count is None and slot_key.endswith(":True"):
+            if count is None and not numeric_engine_available:
+                # A redraw can temporarily erase both views. Use the existing
+                # multi-view cell reader only for that miss. Crucially, never
+                # replace a valid numeric-strip result with a whole-cell
+                # RapidOCR result: that was the direct cause of 1487 becoming
+                # 1467/1438 after the geometry fix.
+                count = self.read_slot_count(crop, allow_singleton=True, fast=True)
+            if count is None and slot_key.endswith(":True") and not numeric_engine_available:
                 # The blue icon can cover a leading stroke.  Keep the colour
                 # recovery as a targeted fallback for blanks only; applying it
                 # to every blue cell was the source of slow and suffix-heavy
@@ -646,6 +686,76 @@ class StatPanelOcr:
         self._shortcut_last_cell_signatures = current_signatures
         self._shortcut_last_cell_values = current_values
         return counts
+
+    def _read_shortcut_numeric_batch(
+        self,
+        pending: Mapping[str, tuple[str, Image.Image]],
+        *,
+        blue_slot_ids: set[str],
+        previous_counts: Mapping[str, int] | None = None,
+    ) -> dict[str, int]:
+        """Read pending shortcut quantity strips in one numeric-model batch.
+
+        ``en_PP-OCRv4_mobile_rec`` is a recognition model, not a detector. It
+        is therefore appropriate only after the cell and quantity strip have
+        already been cropped. RGB, grayscale, two white-glyph threshold views,
+        and (for blue cells) colour channels handle the outlined font and item
+        artwork. A value is returned only when the threshold family agrees
+        with an independent colour view; a disagreement is unreadable rather
+        than a reason to guess a new inventory quantity.
+        """
+        numeric_engine = getattr(self, "_numeric_engine", None)
+        if numeric_engine is None or not pending:
+            return {}
+
+        batch: dict[str, Image.Image] = {}
+        owners: dict[str, str] = {}
+        for _slot_key, (slot_id, crop) in pending.items():
+            strip = _shortcut_quantity_strip(crop)
+            if strip.width <= 1 or strip.height <= 1:
+                continue
+            views = _shortcut_numeric_views(strip, blue=slot_id in blue_slot_ids)
+            for view_name, view in views:
+                key = f"shortcut:{slot_id}:{view_name}"
+                batch[key] = view
+                owners[key] = slot_id
+
+        if not batch:
+            return {}
+        try:
+            texts = numeric_engine.read_fields(batch)
+        except Exception:
+            # Keep the instance usable with the RapidOCR fallback. The next
+            # call will not attempt the broken ONNX session again.
+            self._numeric_engine = None
+            return {}
+
+        candidates: dict[str, list[tuple[int, str]]] = {}
+        for key, text in texts.items():
+            if not _numeric_shortcut_text_is_usable(text):
+                continue
+            value = _extract_shortcut_count(text)
+            if value is None:
+                continue
+            view_name = key.rsplit(":", 1)[-1]
+            if not _numeric_shortcut_text_is_clean(text):
+                # A dotted/colon-separated decode can still be a useful
+                # corroboration (183.0 -> 1830), but it must not outweigh a
+                # clean white-glyph view or create a false conflict with one.
+                view_name = f"soft-{view_name}"
+            candidates.setdefault(owners.get(key, ""), []).append((value, view_name))
+
+        result: dict[str, int] = {}
+        for slot_id, values in candidates.items():
+            if not slot_id:
+                continue
+            selected = _select_shortcut_numeric_views(
+                values,
+                previous=(previous_counts or {}).get(slot_id),
+            )
+            if selected is not None:
+                result[slot_id] = selected
+        return result
 
     def _read_shortcut_quantity_strip(
         self,
@@ -670,17 +780,39 @@ class StatPanelOcr:
         if strip.width <= 1 or strip.height <= 1:
             return None
 
-        rgb = strip.convert("RGB")
-        variants: list[Image.Image] = [rgb]
-        if blue:
-            # Preserve the RGB view for ordinary/both-type items.  Red and
-            # green suppress most blue potion artwork while keeping the white
-            # quantity outline.  A wrong trailing stroke is corrected by
-            # _select_blue_shortcut_candidate below.
-            variants.extend(rgb.getchannel(channel).convert("RGB") for channel in ("R", "G"))
+        numeric_views = _shortcut_numeric_views(strip, blue=blue)
+        numeric_candidates: list[tuple[int, str]] = []
+        numeric_available = getattr(self, "_numeric_engine", None) is not None
+        for view_name, variant in numeric_views:
+            try:
+                numeric_text = self._read_numeric_field(variant)
+            except Exception:
+                numeric_text = ""
+            if _numeric_shortcut_text_is_usable(numeric_text):
+                value = _extract_shortcut_count(numeric_text)
+                if value is not None:
+                    if not _numeric_shortcut_text_is_clean(numeric_text):
+                        view_name = f"soft-{view_name}"
+                    numeric_candidates.append((value, view_name))
+
+        if numeric_candidates:
+            # Once a numeric-model result exists, do not let the general text
+            # recognizer override it with a plausible keyboard-label read.
+            # If the numeric views disagree, return no value and let the
+            # temporal/economy layer wait for a clean frame.
+            return _select_shortcut_numeric_views(
+                numeric_candidates,
+                previous=previous,
+            )
+
+        # Once the numeric engine is loaded, a blank numeric frame must remain
+        # blank.  Letting general RapidOCR fill it from a keyboard label or an
+        # item-artifact number would defeat the cross-view guard above.
+        if numeric_available:
+            return None
 
         candidates: list[int] = []
-        for variant in variants:
+        for _view_name, variant in numeric_views:
             try:
                 text, _records = self._read_shortcut_once(variant)
             except Exception:
@@ -1031,8 +1163,148 @@ def _extract_shortcut_count(text: str) -> int | None:
 def _numeric_shortcut_text_is_usable(text: str) -> bool:
     """Accept numeric-model output only when icon strokes are absent."""
     compact = str(text).translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    if not re.fullmatch(r"[\d\s,.:]+", compact):
+        return False
     compact = re.sub(r"[\s,.:]+", "", compact)
     return bool(compact) and compact.isdigit() and _extract_shortcut_count(text) is not None
+
+
+def _numeric_shortcut_text_is_clean(text: str) -> bool:
+    """Return whether a numeric decode contains no OCR punctuation noise."""
+    compact = str(text).translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    return bool(re.fullmatch(r"[\d\s,]+", compact))
+
+
+def _shortcut_numeric_views(
+    image: Image.Image, *, blue: bool
+) -> list[tuple[str, Image.Image]]:
+    """Build small, independent views for the already isolated quantity strip.
+
+    The quantity is white outlined text drawn over an item icon.  The raw and
+    grayscale views preserve the original glyph geometry, while the two
+    threshold views remove most coloured artwork and make thin white strokes
+    repeatable across a redraw.  The red/green views are especially useful for
+    blue MP items, but are also cheap enough to retain as a fallback for any
+    cell.  All views stay inside one measured slot, so no neighbouring quantity
+    can be joined to this number.
+    """
+    rgb = image.convert("RGB")
+    gray = ImageOps.autocontrast(ImageOps.grayscale(rgb))
+    gray_rgb = ImageEnhance.Contrast(gray).enhance(1.35).convert("RGB")
+    views: list[tuple[str, Image.Image]] = [
+        ("rgb", rgb),
+        ("gray", gray_rgb),
+    ]
+    for threshold in (170, 180):
+        white = gray.point(lambda pixel, threshold=threshold: 255 if pixel >= threshold else 0)
+        views.append((f"white{threshold}", white.convert("RGB")))
+    if blue:
+        views.extend(
+            (channel.lower(), rgb.getchannel(channel).convert("RGB"))
+            for channel in ("R", "G")
+        )
+    return views
+
+
+def _select_shortcut_numeric_views(
+    candidates: Iterable[tuple[int, str]], *, previous: int | None
+) -> int | None:
+    """Select a quantity only when colour and white-glyph views corroborate.
+
+    A generic recognizer can consistently turn a game-font ``5`` into ``3``;
+    ordinary majority voting would then make the wrong value look reliable.
+    Prefer a value that appears in both a threshold view and an independent
+    colour view.  If a threshold view conflicts with the colour views, return
+    ``None`` and let the previous trusted quantity remain visible.  This is the
+    key distinction between an unreadable frame and a real inventory change.
+    """
+    values = [
+        (value, str(view_name))
+        for value, view_name in candidates
+        if isinstance(value, int) and 0 <= value <= MAX_SHORTCUT_QUANTITY
+    ]
+    if previous is not None:
+        values = [
+            (value, view_name)
+            for value, view_name in values
+            if value <= previous and previous - value <= MAX_SHORTCUT_SINGLE_SAMPLE_DROP
+        ]
+    if not values:
+        return None
+
+    threshold_values = Counter(
+        value for value, view_name in values if view_name.startswith("white")
+    )
+    colour_values = Counter(
+        value
+        for value, view_name in values
+        if not view_name.startswith(("white", "soft-"))
+    )
+    if threshold_values:
+        # A threshold candidate is the protected white-glyph interpretation.
+        # If more than one threshold value survives, the frame is ambiguous.
+        best_threshold_votes = max(threshold_values.values())
+        threshold_winners = {
+            value for value, votes in threshold_values.items() if votes == best_threshold_votes
+        }
+        if len(threshold_winners) != 1:
+            return None
+        threshold_value = next(iter(threshold_winners))
+        if colour_values:
+            # Require at least one independent colour view to agree.  A
+            # conflicting raw result such as 320 beside threshold 3204 is
+            # intentionally rejected rather than resolved by vote count.
+            if colour_values.get(threshold_value, 0) <= 0:
+                return None
+        elif best_threshold_votes < 2:
+            return None
+        return threshold_value
+
+    # If the threshold views are blank, two independent colour views may still
+    # be sufficient during a brief redraw. A singleton is never a baseline.
+    best_votes = max(colour_values.values()) if colour_values else 0
+    winners = [value for value, votes in colour_values.items() if votes == best_votes]
+    if best_votes < 2 or len(winners) != 1:
+        return None
+    return winners[0]
+
+
+def _select_shortcut_numeric_candidate(
+    candidates: Iterable[int],
+    *,
+    previous: int | None,
+    blue: bool,
+) -> int | None:
+    """Select numeric-model output without accepting a large one-frame jump.
+
+    The quantity font is small enough that two different digit shapes can
+    both be syntactically valid. When a previous value is available, only a
+    small downward movement is safe for a single live sample; an isolated
+    value such as ``1830 -> 1630`` is returned as unreadable and left for the
+    next frame/reconciliation. This is deliberately conservative: a wrong
+    cost is worse than a temporarily stale display.
+    """
+    values = [
+        value
+        for value in candidates
+        if isinstance(value, int) and 0 <= value <= MAX_SHORTCUT_QUANTITY
+    ]
+    if not values:
+        return None
+    if previous is not None:
+        plausible = [
+            value
+            for value in values
+            if value <= previous
+            and previous - value <= MAX_SHORTCUT_SINGLE_SAMPLE_DROP
+        ]
+        if not plausible:
+            return None
+        votes = Counter(plausible)
+        return max(plausible, key=lambda value: (votes[value], value))
+    if blue:
+        return _select_blue_shortcut_candidate(values, allow_singleton=True)
+    return _select_slot_consensus(values, allow_singleton=True)
 
 
 def _select_blue_shortcut_candidate(
@@ -1071,12 +1343,19 @@ def _shortcut_quantity_strip(image: Image.Image) -> Image.Image:
     width, height = image.size
     if width <= 1 or height <= 1:
         return image.crop((0, 0, max(1, width), max(1, height)))
-    top = max(0, min(height - 1, round(height * 0.48)))
+    # The outlined quantity starts one pixel above the old 48% split on the
+    # reference client.  At small cells that single row contains the top bar of
+    # the leading digit; losing it is exactly what made 1209/1830 look like a
+    # two- or three-digit value.  Remove only the final 5% of the cell: it is
+    # the bright separator/shadow line below the number, not part of the last
+    # glyph, and it was causing the model to append a spurious digit.
+    top = max(0, min(height - 1, round(height * 0.45)))
+    bottom = max(top + 1, min(height, round(height * 0.95)))
     # The caller now supplies the complete cell, split at the real separator
     # midpoint.  Do not trim the right edge: the fourth glyph of a 4-digit
     # quantity can occupy those final pixels (the old proportional trim was
     # exactly why values such as ``1570`` could become ``157``/``57``).
-    return image.crop((0, top, width, height))
+    return image.crop((0, top, width, bottom))
 
 
 def _shortcut_crop_signature(image: Image.Image) -> tuple:
@@ -1095,7 +1374,12 @@ def _shortcut_crop_signature(image: Image.Image) -> tuple:
 
 
 def _is_probable_shortcut_ocr_change(previous: int, current: int) -> bool:
-    """Accept only a small non-suffix decrease from a cached quantity."""
+    """Accept only a small non-suffix decrease from a cached quantity.
+
+    A one-frame value with a two-digit jump is not safe to publish as a live
+    inventory change. It can still be recovered by the next numeric frame or
+    by the final session reconciliation.
+    """
     if current == previous:
         return True
     if current > previous:
@@ -1106,7 +1390,7 @@ def _is_probable_shortcut_ocr_change(previous: int, current: int) -> bool:
     current_text = str(current)
     if len(current_text) < len(previous_text) and previous_text.endswith(current_text):
         return False
-    return previous - current <= max(10, min(64, round(previous * 0.05)))
+    return previous - current <= MAX_SHORTCUT_SINGLE_SAMPLE_DROP
 
 
 def _merge_fast_shortcut_counts(

@@ -18,6 +18,12 @@ REFERENCE_CLIENT_SIZE = (1351, 800)  # size of samples/maple_story_ui.jpg
 # most.  Keep this domain rule next to the shortcut geometry so every OCR and
 # accounting path can share the same hard boundary.
 MAX_SHORTCUT_QUANTITY = 9_999
+# A single live shortcut sample is normally one drink (the game consumes a
+# potion every ~0.3-0.7s).  A much larger jump is almost always a missing or
+# substituted digit, not a real inventory event.  Longer gaps are reconciled
+# separately at a session boundary, so keeping this limit small protects the
+# live ledger without losing final accounting.
+MAX_SHORTCUT_SINGLE_SAMPLE_DROP = 4
 
 # Whole stat panel, in absolute pixels at REFERENCE_CLIENT_SIZE. Grabbed once per
 # tick with a single mss.grab() call; FIELD_BOXES below are sliced out of it

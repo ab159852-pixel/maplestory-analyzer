@@ -181,3 +181,154 @@ def test_shortcut_positioned_value_wins_over_neighbour_cell_merge():
     counts = ocr.read_shortcut_counts(Image.new("RGB", (297, 166)), {"6"})
 
     assert counts["6"] == 2676
+
+
+def test_shortcut_numeric_model_wins_over_plausible_general_ocr_value():
+    """A numeric cell read must not be overwritten by a whole-cell text read."""
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._numeric_engine = object()
+    ocr._read_numeric_field = lambda _image: "1487"
+    ocr._read_once = lambda _image: ("1467", [])
+
+    from PIL import Image
+    assert ocr._read_shortcut_once(Image.new("RGB", (38, 20)))[0] == "1487"
+
+
+def test_shortcut_numeric_views_prefer_clean_threshold_consensus_and_reject_conflict():
+    assert ocr_module._select_shortcut_numeric_views(
+        [(1209, "white170"), (1209, "white180"), (269, "soft-rgb")],
+        previous=None,
+    ) == 1209
+    # 320 is a plausible OCR integer, but it conflicts with the threshold
+    # interpretation 3204. Do not let majority voting invent a quantity.
+    assert ocr_module._select_shortcut_numeric_views(
+        [
+            (320, "rgb"), (320, "gray"), (320, "r"),
+            (3204, "white170"), (3204, "white180"),
+        ],
+        previous=None,
+    ) is None
+
+
+def test_shortcut_numeric_batch_accepts_clean_views_and_rejects_large_jump():
+    class FakeNumeric:
+        def __init__(self, values):
+            self.values = values
+
+        def read_fields(self, images):
+            return {
+                key: self.values.get(key.rsplit(":", 1)[-1], "")
+                for key in images
+                if self.values.get(key.rsplit(":", 1)[-1], "")
+            }
+
+    from PIL import Image
+    image = Image.new("RGB", (38, 20))
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._numeric_engine = FakeNumeric(
+        {"rgb": "183.0", "white170": "1830", "white180": "1830"}
+    )
+    assert ocr._read_shortcut_numeric_batch(
+        {"7": ("7", image)},
+        blue_slot_ids=set(),
+        previous_counts={},
+    ) == {"7": 1830}
+
+    ocr._numeric_engine = FakeNumeric(
+        {"rgb": "1630", "white170": "1630", "white180": "1630"}
+    )
+    assert ocr._read_shortcut_numeric_batch(
+        {"7": ("7", image)},
+        blue_slot_ids=set(),
+        previous_counts={"7": 1830},
+    ) == {}
+
+
+def test_numeric_shortcut_cache_skips_onnx_when_the_quantity_strip_is_unchanged():
+    class CountingNumeric:
+        def __init__(self):
+            self.calls = 0
+
+        def read_fields(self, images):
+            self.calls += 1
+            return {key: "1830" for key in images}
+
+    from PIL import Image
+    image = Image.new("RGB", (38, 41))
+    numeric = CountingNumeric()
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._numeric_engine = numeric
+    ocr._shortcut_last_cell_signatures = {}
+    ocr._shortcut_last_cell_values = {}
+
+    first = ocr._read_shortcut_slot_counts(
+        image,
+        {"7"},
+        slot_images={"7": image},
+        previous_counts={},
+    )
+    second = ocr._read_shortcut_slot_counts(
+        image,
+        {"7"},
+        slot_images={"7": image},
+        previous_counts={"7": 1830},
+    )
+
+    assert first == {"7": 1830}
+    assert second == {"7": 1830}
+    assert numeric.calls == 1
+
+
+def test_reset_shortcut_cache_forgets_the_previous_quantity_baseline():
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._shortcut_last_cell_signatures = {"7:True": (1, 2)}
+    ocr._shortcut_last_cell_values = {"7:True": 1830}
+    ocr._shortcut_last_fast_counts = {"7": 1830}
+    ocr._shortcut_last_full_counts = {"7": 1830}
+    ocr._shortcut_last_validation_at = 12.0
+    ocr._shortcut_validation_signature = (("7",), ("7",))
+
+    ocr.reset_shortcut_cache()
+
+    assert ocr._shortcut_last_cell_signatures == {}
+    assert ocr._shortcut_last_cell_values == {}
+    assert ocr._shortcut_last_fast_counts == {}
+    assert ocr._shortcut_last_full_counts == {}
+    assert ocr._shortcut_last_validation_at == 0.0
+    assert ocr._shortcut_validation_signature is None
+
+
+def test_numeric_engine_blank_does_not_fall_back_to_whole_cell_quantity():
+    from PIL import Image
+    image = Image.new("RGB", (38, 20))
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._numeric_engine = object()
+    ocr._read_shortcut_numeric_batch = lambda *args, **kwargs: {}
+    ocr._read_numeric_field = lambda _image: ""
+    ocr._read_once = lambda _image: ("320", [])
+    ocr._shortcut_last_cell_signatures = {}
+    ocr._shortcut_last_cell_values = {}
+
+    assert ocr._read_shortcut_slot_counts(
+        image,
+        {"8"},
+        {"8"},
+        slot_images={"8": image},
+        previous_counts={"8": 520},
+    ) == {}
+
+
+def test_explicitly_empty_shortcut_configuration_performs_no_full_bar_ocr():
+    """An empty Settings selection must not scan all eight shortcut cells."""
+    from PIL import Image
+
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    calls = {"lines": 0}
+
+    def read_lines(_image):
+        calls["lines"] += 1
+        return [OcrLine("1830", y=20, x=20, left=10, right=30)]
+
+    ocr.read_lines = read_lines
+    assert ocr.read_shortcut_counts(Image.new("RGB", (147, 77)), set()) == {}
+    assert calls["lines"] == 0
