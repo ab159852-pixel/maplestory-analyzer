@@ -25,7 +25,7 @@ from numbers import Real
 import re
 import time
 from collections import Counter
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
@@ -37,8 +37,10 @@ from .regions import SHORTCUT_BOX, SHORTCUT_SLOT_BOXES
 # is much more expensive than reading the already-cropped configured cells.
 # Run it at the start of a session, after a fast value changes, and occasionally
 # as a quiet health check.  This keeps the 0.2s potion worker responsive without
-# allowing a clipped fast crop to become the permanent baseline.
-SHORTCUT_FULL_VALIDATION_INTERVAL_SECONDS = 5.0
+# allowing a clipped fast crop to become the permanent baseline.  The fast
+# per-cell path remains active between validations; a failed full detector must
+# not force another 2–3 second detector pass on every potion sample.
+SHORTCUT_FULL_VALIDATION_INTERVAL_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -192,13 +194,49 @@ class StatPanelOcr:
         return result
 
     def _read_numeric_field(self, image: Image.Image) -> str:
-        if self._numeric_engine is None:
+        numeric_engine = getattr(self, "_numeric_engine", None)
+        if numeric_engine is None:
             return ""
         try:
-            return self._numeric_engine.read_fields({"field": image}).get("field", "")
+            return numeric_engine.read_fields({"field": image}).get("field", "")
         except Exception:
             self._numeric_engine = None
             return ""
+
+    def _read_shortcut_once(self, image: Image.Image) -> tuple[str, list[OcrLine]]:
+        """Read a shortcut quantity with a layout-safe numeric fallback.
+
+        Shortcut quantities are the primary source for potion accounting. The
+        general RapidOCR recognizer is useful for Chinese UI text, but its
+        detector/recognition vocabulary is more likely to return a keyboard
+        label or a neighbouring cell. Use the bundled numeric recognizer for
+        the isolated quantity crop and retain RapidOCR only as a compatibility
+        fallback for development builds without the numeric model.
+        """
+        # The shortcut cell still contains the item icon and keyboard label.
+        # RapidOCR's recognition-only pass is therefore the proven primary
+        # read for this particular layout: the numeric model can otherwise
+        # turn icon strokes into letters (for example ``H87``).  Try it only
+        # when the text recognizer produced no numeric candidate, and accept a
+        # numeric-model result only when it contains digits/separators alone.
+        text, records = self._read_once(image)
+        if _extract_shortcut_count(text) is not None:
+            return text, records
+        numeric_text = self._read_numeric_field(image)
+        if _numeric_shortcut_text_is_usable(numeric_text):
+            return numeric_text, []
+        return text, records
+
+    def read_text_field(self, image: Image.Image) -> str:
+        """Read a non-numeric UI line with the general RapidOCR model.
+
+        Pickup messages contain the 楓幣 marker as well as digits.  The
+        numeric model is intentionally excellent at the latter but cannot
+        preserve the Chinese marker needed by the mesos parser, so notification
+        rows must explicitly stay on the text model.
+        """
+        text, _records = self._read_once(image)
+        return text
 
     def _read_typed_field(self, field: str, image: Image.Image) -> str:
         first_text, first_records = self._read_once(image)
@@ -309,7 +347,7 @@ class StatPanelOcr:
         # and the lower-right/contrast view suppresses the icon and label.
         candidates: list[int] = []
         for variant in (image, enlarged, lower_right_large, gray):
-            text, _records = self._read_once(variant)
+            text, _records = self._read_shortcut_once(variant)
             value = _extract_shortcut_count(text)
             if value is not None:
                 candidates.append(value)
@@ -339,7 +377,7 @@ class StatPanelOcr:
         )
         candidates: list[int] = []
         for variant in (image, enlarged):
-            text, _records = self._read_once(variant)
+            text, _records = self._read_shortcut_once(variant)
             value = _extract_shortcut_count(text)
             if value is not None:
                 candidates.append(value)
@@ -360,7 +398,7 @@ class StatPanelOcr:
             gray = ImageOps.autocontrast(ImageOps.grayscale(enlarged))
             gray = ImageEnhance.Contrast(gray).enhance(1.5)
             for variant in (lower_right_large, gray):
-                text, _records = self._read_once(variant)
+                text, _records = self._read_shortcut_once(variant)
                 value = _extract_shortcut_count(text)
                 if value is not None:
                     candidates.append(value)
@@ -371,6 +409,9 @@ class StatPanelOcr:
         image: Image.Image,
         required_slots: Iterable[str] | None = None,
         blue_slots: Iterable[str] | None = None,
+        *,
+        allow_full_validation: bool = True,
+        slot_images: Mapping[str, Image.Image] | None = None,
     ) -> dict[str, int]:
         """Read all visible shortcut quantities from the parent bar.
 
@@ -392,34 +433,63 @@ class StatPanelOcr:
             self._shortcut_last_cell_signatures = {}
             self._shortcut_last_cell_values = {}
         elapsed = now - last_validation_at
-
-        # A full-bar change is intentionally not triggered by every fast OCR
-        # change.  A bad frame must not make the expensive detector run again
-        # before the next auxiliary capture is available.
-        should_validate = (
+        full_validation_due = (
             not required
-            or configuration_changed
-            or not last_full_counts
-            or elapsed >= SHORTCUT_FULL_VALIDATION_INTERVAL_SECONDS
+            or (
+                allow_full_validation
+                and (
+                    configuration_changed
+                    or last_validation_at <= 0.0
+                    or elapsed >= SHORTCUT_FULL_VALIDATION_INTERVAL_SECONDS
+                )
+            )
         )
 
-        fast_counts: dict[str, int] = {}
-        if not should_validate:
-            fast_counts = self._read_shortcut_slot_counts(image, required, blue)
+        # Read configured cells on every auxiliary sample. These quantities
+        # are the primary real-time signal; waiting for a full-bar detector
+        # pass here can miss a 0.3-0.7s potion change. The general detector
+        # remains available to callers that explicitly request validation.
+        if required:
+            try:
+                fast_counts = self._read_shortcut_slot_counts(
+                    image,
+                    required,
+                    blue,
+                    slot_images=slot_images,
+                )
+            except TypeError:
+                # Keep test doubles and older plug-in OCR adapters that still
+                # implement the three-argument private helper working.
+                fast_counts = self._read_shortcut_slot_counts(image, required, blue)
+        else:
+            fast_counts = {}
+        if required and not full_validation_due:
+            # A temporary numeric miss must not trigger the expensive detector
+            # on every 0.1–0.2s sample. Keep the last trusted quantity for the
+            # missing cell and allow the next fast frame to recover it.
             counts = _merge_fast_shortcut_counts(last_full_counts, fast_counts, required)
             result = {slot: counts[slot] for slot in required if slot in counts}
             self._shortcut_last_fast_counts = dict(fast_counts)
+            # Fast-only callers still need a remembered configuration so a
+            # stable next frame can use the per-cell image cache. The full
+            # validation timestamp intentionally remains untouched: the next
+            # normal validation call must still be able to run its scheduled
+            # geometry-aware health check.
+            self._shortcut_validation_signature = validation_signature
             return result
 
-        # Validate the complete bar first.  A positioned full-bar run keeps
-        # its geometry and is authoritative over an isolated crop that can
-        # lose a leading digit at a cell edge.
+        # Validate the complete bar only when the numeric path is incomplete
+        # (or when no required slots were supplied).  A positioned full-bar run
+        # can still recover a crop that is temporarily unreadable without
+        # blocking the normal potion cadence.
         counts = self._shortcut_counts_from_records(image, self.read_lines(image))
-        missing = required - counts.keys()
-        if missing:
-            fast_counts = self._read_shortcut_slot_counts(image, missing, blue)
-            for slot, value in fast_counts.items():
-                counts.setdefault(slot, value)
+        for slot, value in fast_counts.items():
+            positioned = counts.get(slot)
+            counts[slot] = (
+                value
+                if positioned is None
+                else _prefer_shortcut_numeric_value(positioned, value)
+            )
         missing = required - counts.keys()
         if missing and last_signature == validation_signature:
             # A redraw can make both detection and the isolated crop blank.
@@ -466,6 +536,8 @@ class StatPanelOcr:
         image: Image.Image,
         required_slots: Iterable[str],
         blue_slots: Iterable[str] = (),
+        *,
+        slot_images: Mapping[str, Image.Image] | None = None,
     ) -> dict[str, int]:
         """Read configured cells without running full-bar text detection.
 
@@ -484,33 +556,31 @@ class StatPanelOcr:
         last_values = dict(getattr(self, "_shortcut_last_cell_values", {}) or {})
         current_signatures: dict[str, tuple] = {}
         current_values: dict[str, int | None] = {}
+        pending: dict[str, tuple[str, Image.Image]] = {}
         for slot_id in required_slots:
             box = SHORTCUT_SLOT_BOXES.get(str(slot_id))
             if box is None:
                 continue
-            try:
-                column = (int(slot_id) - 1) % 4
-            except (TypeError, ValueError):
-                column = 1
-            # The measured cell boxes already include the complete quantity.
-            # Keep both horizontal edges inside the current cell and let the
-            # multi-view consensus handle a one-pixel border variation. This
-            # prevents a legitimate value such as 2676/1875 from becoming a
-            # neighbouring-cell merge such as 26765/1875x.
-            left_pad = 0
-            right_pad = 0
-            crop = image.crop((
-                max(0, round((box[0] - SHORTCUT_BOX[0] + left_pad) * scale_x)),
-                # The quantity glyphs begin around +10 in the reference cell.
-                # Starting lower (+14/+16) can still include the bottom of the
-                # keyboard label and produce a false leading digit (for
-                # example 1343 becomes 11349).  The +10 crop keeps the full
-                # quantity while excluding the label; read_slot_count also
-                # tolerates the small outlined-border zero at the left edge.
-                max(0, round((box[1] - SHORTCUT_BOX[1] + (9 if column == 1 else 10)) * scale_y)),
-                min(parent_w, round((box[2] - SHORTCUT_BOX[0] + right_pad) * scale_x)),
-                min(parent_h, round((box[3] - SHORTCUT_BOX[1] + 2) * scale_y)),
-            ))
+            # The capture layer already returns the complete measured cell.
+            # Keep the keyboard label in this first recognition view: on the
+            # real client it gives RapidOCR enough glyph height to read the
+            # outlined quantity in one pass, while the cell boundary prevents
+            # a neighbouring quantity from being joined to this slot.
+            direct_crop = (slot_images or {}).get(str(slot_id))
+            if direct_crop is not None:
+                # GameWindowCapture/StaticImageCapture calculate each box
+                # from the same absolute transform and then subtract the
+                # parent origin. Preserve that exact rounding. Re-scaling a
+                # parent crop independently can shift a one-pixel outlined
+                # digit and turn 1180 into 80.
+                crop = direct_crop
+            else:
+                crop = image.crop((
+                    max(0, round((box[0] - SHORTCUT_BOX[0]) * scale_x)),
+                    max(0, round((box[1] - SHORTCUT_BOX[1]) * scale_y)),
+                    min(parent_w, round((box[2] - SHORTCUT_BOX[0]) * scale_x)),
+                    min(parent_h, round((box[3] - SHORTCUT_BOX[1]) * scale_y)),
+                ))
             slot_key = f"{slot_id}:{str(slot_id) in blue_slot_ids}"
             signature = _shortcut_crop_signature(crop)
             current_signatures[slot_key] = signature
@@ -523,33 +593,76 @@ class StatPanelOcr:
                 if cached_count is not None:
                     counts[str(slot_id)] = cached_count
                 continue
-            # A configured, isolated cell may produce one clean numeric OCR
-            # candidate while the other preprocessed views are blank.  Allow
-            # that candidate here so the temporal baseline/quantity validator
-            # can keep the display alive; callers that use read_slot_count()
-            # directly retain the stricter two-view default.
-            count = self.read_slot_count(crop, allow_singleton=True, fast=True)
-            # The blue potion icon can overlap the left side of the quantity
-            # strip.  RapidOCR then either drops the leading digit (91 -> 9)
-            # or joins it with the neighboring cell (91 -> 915).  A targeted
-            # colour-neutralized pass is more trustworthy for that cell than
-            # either ambiguous result.  White HP counts keep the cheap path.
-            if str(slot_id) in blue_slot_ids or _looks_like_blue_shortcut_cell(crop):
-                blue_count = _read_blue_shortcut_count(
-                    self,
-                    image,
-                    box,
-                    scale_x,
-                    scale_y,
-                )
-                if blue_count is not None:
-                    count = blue_count
+            pending[slot_key] = (str(slot_id), crop)
+
+        # Recognition-only RapidOCR supports a list of crops and batches the
+        # ONNX inference.  Calling it once for all changed cells is both much
+        # faster and more consistent than running two views per cell.  The
+        # temporal economy validator remains the authority on whether a new
+        # number is a real inventory change.
+        primary_texts = self._read_shortcut_text_batch({
+            key: crop for key, (_slot_id, crop) in pending.items()
+        })
+        for slot_key, (slot_id, crop) in pending.items():
+            count = _extract_shortcut_count(primary_texts.get(slot_key, ""))
+            if count is None:
+                # A missing batch result is uncommon (usually a redraw).  Use
+                # the stricter two-view path only for that cell, not for every
+                # cell on every sample.
+                count = self.read_slot_count(crop, allow_singleton=True, fast=True)
+            if count is None and slot_key.endswith(":True"):
+                # The blue icon can cover a leading stroke.  Keep the colour
+                # recovery as a targeted fallback for blanks only; applying it
+                # to every blue cell was the source of slow and suffix-heavy
+                # reads such as 294 -> 2947.
+                box = SHORTCUT_SLOT_BOXES.get(slot_id)
+                if box is not None:
+                    count = _read_blue_shortcut_count(
+                        self,
+                        image,
+                        box,
+                        scale_x,
+                        scale_y,
+                    )
             if count is not None:
-                counts[str(slot_id)] = count
+                counts[slot_id] = count
             current_values[slot_key] = count
         self._shortcut_last_cell_signatures = current_signatures
         self._shortcut_last_cell_values = current_values
         return counts
+
+    def _read_shortcut_text_batch(
+        self,
+        images: dict[str, Image.Image],
+    ) -> dict[str, str]:
+        """Read changed shortcut cells without sharing OCR calls concurrently.
+
+        RapidOCR's internal recognition batch shares one maximum aspect ratio;
+        on MapleStory's tiny outlined font that changes the result (for
+        example, ``1180`` can collapse to ``1``).  The public wrapper's
+        detector also finds the quantity more reliably than direct full-cell
+        recognition.  Keep calls on one OCR worker: sharing the same ONNX
+        detector concurrently produced nondeterministic values such as
+        ``80``/``2893`` from a stable ``1180``/``2833`` frame.  The caller is
+        already on a background monitor thread, and the image/signature cache
+        means stable frames do not invoke this path again. The economy layer
+        still requires temporal confirmation before any decrease becomes a
+        drink event.
+        """
+        if not images:
+            return {}
+        values: dict[str, str] = {}
+        for name, image in images.items():
+            try:
+                text = self._read_shortcut_once(image)[0]
+            except Exception:
+                # A single redraw or an older OCR wrapper must not discard the
+                # other cells from this sample. The caller will use its
+                # targeted two-view fallback only for this blank result.
+                continue
+            if text:
+                values[name] = text
+        return values
 
     @staticmethod
     def _shortcut_counts_from_records(
@@ -758,7 +871,11 @@ def _read_blue_shortcut_count(
         )
         if view is None:
             continue
-        text, _records = ocr._read_once(view)
+        read_shortcut_once = getattr(ocr, "_read_shortcut_once", None)
+        if callable(read_shortcut_once):
+            text, _records = read_shortcut_once(view)
+        else:
+            text, _records = ocr._read_once(view)
         value = _extract_shortcut_count(text)
         if value is not None:
             candidates.append(value)
@@ -780,7 +897,11 @@ def _read_blue_shortcut_count(
         )
         if view is None:
             continue
-        text, _records = ocr._read_once(view)
+        read_shortcut_once = getattr(ocr, "_read_shortcut_once", None)
+        if callable(read_shortcut_once):
+            text, _records = read_shortcut_once(view)
+        else:
+            text, _records = ocr._read_once(view)
         value = _extract_shortcut_count(text)
         if value is not None:
             candidates.append(value)
@@ -822,6 +943,10 @@ def _extract_shortcut_count(text: str) -> int | None:
     """Extract the final bounded integer from a shortcut OCR result."""
     normalized = str.maketrans("０１２３４５６７８９", "0123456789")
     compact = str(text).translate(normalized).replace(" ", "")
+    # The numeric model may render a narrow digit separator as a dot/colon;
+    # shortcut quantities are integers, so ``118.0`` and ``3:03`` represent
+    # 1180 and 303 rather than decimal values.
+    compact = re.sub(r"(?<=\d)[.:](?=\d)", "", compact)
     matches = re.findall(r"\d[\d,]*", compact)
     if not matches:
         return None
@@ -830,6 +955,13 @@ def _extract_shortcut_count(text: str) -> int | None:
     except ValueError:
         return None
     return value if 0 <= value <= 999_999 else None
+
+
+def _numeric_shortcut_text_is_usable(text: str) -> bool:
+    """Accept numeric-model output only when icon strokes are absent."""
+    compact = str(text).translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    compact = re.sub(r"[\s,.:]+", "", compact)
+    return bool(compact) and compact.isdigit() and _extract_shortcut_count(text) is not None
 
 
 def _select_blue_shortcut_candidate(
@@ -920,6 +1052,30 @@ def _merge_stable_shortcut_counts(
         if new_value is None or not _is_probable_shortcut_ocr_change(old_value, new_value):
             result[slot] = old_value
     return result
+
+
+def _prefer_shortcut_numeric_value(positioned: int, numeric: int) -> int:
+    """Prefer numeric-cell OCR unless the full-bar value explains a crop edge.
+
+    The full-bar detector retains x/y geometry but uses the general text model;
+    the isolated cell uses the numeric model but can clip one edge.  If one
+    value is an obvious prefix/suffix of the other, the positioned run repairs
+    that edge.  For unrelated values, keep the numeric model's result because
+    it is the source intended for potion accounting.
+    """
+    positioned_text = str(positioned)
+    numeric_text = str(numeric)
+    if (
+        len(positioned_text) > len(numeric_text)
+        and (
+            positioned_text.endswith(numeric_text)
+            or positioned_text.startswith(numeric_text)
+        )
+    ):
+        return positioned
+    if len(numeric_text) > len(positioned_text) and numeric_text.startswith(positioned_text):
+        return positioned
+    return numeric
 
 
 def _as_iterable(value: Any) -> Iterable[Any]:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from io import BytesIO
 import zipfile
 
-from maple_analyzer.updates import _safe_archive_members, parse_latest_release
+from maple_analyzer.updates import _POWERSHELL_UPDATER, _safe_archive_members, parse_latest_release
 
 
 def _release_payload(*, tag: str = "v1.0.5") -> dict:
@@ -62,3 +62,11 @@ def test_archive_members_reject_zip_slip_and_require_app_executable():
         archive.writestr("../MapleStoryAnalyzer.exe", b"exe")
     with zipfile.ZipFile(BytesIO(unsafe_buffer.getvalue())) as archive:
         assert not _safe_archive_members(archive)
+
+
+def test_updater_handles_renamed_exe_and_records_transaction_progress():
+    assert "$PackageExeName" in _POWERSHELL_UPDATER
+    assert "SetCurrentDirectory($helperWorkingDir)" in _POWERSHELL_UPDATER
+    assert "Start-Process -FilePath $targetExe -WorkingDirectory $InstallDir -PassThru" in _POWERSHELL_UPDATER
+    assert "$StatusPath" in _POWERSHELL_UPDATER
+    assert "update-success" in _POWERSHELL_UPDATER

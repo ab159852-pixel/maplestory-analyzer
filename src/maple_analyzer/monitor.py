@@ -17,6 +17,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from PIL import Image
+
 from .economy import mesos_text_needs_full_detection, parse_mesos_amount, parse_slot_count
 from .bar_flash import BarFlashDetector
 from .parser import StatSnapshot, parse_fields
@@ -116,6 +118,25 @@ def _line_text(line: object) -> str:
     if isinstance(value, (list, tuple)) and len(value) > 1:
         value = value[1]
     return str(value).strip() if value is not None else ""
+
+
+def _image_signature(image: Any) -> tuple | None:
+    """Build a cheap visual signature for an auxiliary crop.
+
+    Recognition-only OCR is still expensive when it is repeated for twelve
+    pickup rows whose pixels did not change. A small grayscale signature lets
+    the worker reuse the previous text and reserve OCR for a newly drawn or
+    cleared notification.
+    """
+    try:
+        gray = image.convert("L")
+        reduced = gray.resize(
+            (max(8, min(48, gray.width // 2)), max(6, min(24, gray.height // 2))),
+            getattr(Image, "Resampling", Image).BILINEAR,
+        )
+        return reduced.size, hash(reduced.tobytes())
+    except Exception:
+        return None
 
 
 def _pickup_lines_need_detection(lines: list[tuple[str, float]]) -> bool:
@@ -297,19 +318,43 @@ def extract_context(ocr: Any, regions: dict[str, Any]) -> ContextReading:
     job_lines: list[object] = []
     if regions.get("job") is not None:
         image = regions["job"]
-        # The job label is also a known single-line field.  Try a cheap
-        # recognition-only enlarged crop before the slower detector pass.
+        # The job crop also contains the orange LV badge on its left.  The
+        # numeric model naturally wins that larger badge and returns ``68``
+        # instead of the small class label.  Focus on the right-hand text and
+        # use the general text reader, which keeps this correction proportional
+        # across client sizes and does not hard-code a class name.
+        job_reader = getattr(ocr, "read_text_field", None)
+        if not callable(job_reader):
+            job_reader = ocr.read_field
+        job_focus = image.crop((
+            max(0, round(image.width * 0.22)),
+            0,
+            image.width,
+            image.height,
+        ))
         try:
             from PIL import Image
             resampling = getattr(getattr(Image, "Resampling", Image), "BICUBIC", 3)
-            enlarged = image.resize((image.width * 8, image.height * 8), resampling)
-            job_lines.append(ocr.read_field(enlarged))
+            enlarged = job_focus.resize(
+                (job_focus.width * 8, job_focus.height * 8),
+                resampling,
+            )
+            job_lines.append(job_reader(enlarged))
         except Exception:
             pass
         try:
-            job_lines.extend(ocr.read_lines(image))
+            job_lines.append(job_reader(job_focus))
         except Exception:
             pass
+        # Do not pay for detection when the focused recognition crop already
+        # produced a usable class.  This keeps background context available
+        # quickly after startup; detection remains the fallback for clients
+        # whose tiny class label is not readable in the focused view.
+        if not _context_candidates(job_lines, kind="job"):
+            try:
+                job_lines.extend(ocr.read_lines(image))
+            except Exception:
+                pass
     if regions.get("job") is not None and not _context_candidates(job_lines, kind="job"):
         # The job label is small gray text beside LV.  A contrast-enhanced
         # retry is cheap at the 3s context cadence and avoids adding a second
@@ -353,10 +398,20 @@ class BackgroundMonitor:
         self.auxiliary_queue: queue.Queue[AuxiliaryReading] = queue.Queue(maxsize=4)
         self.context_queue: queue.Queue[ContextReading] = queue.Queue(maxsize=2)
         self._stop = threading.Event()
+        self._status_enabled = threading.Event()
         self._aux_enabled = threading.Event()
-        self._aux_request = threading.Event()
+        # Potion and pickup scans have separate cadences. Sharing one event
+        # lets either worker clear the other's wake-up request, which makes a
+        # Start/Resume refresh nondeterministic.
+        self._potion_request = threading.Event()
+        self._pickup_request = threading.Event()
         self._context_request = threading.Event()
         self._lock = threading.Lock()
+        # RapidOCR/ONNX objects are shared by status, pickup and context
+        # workers. Their public wrapper is not safe for concurrent inference;
+        # serialize only the OCR section while keeping screen capture and Tk
+        # queue delivery off the UI thread.
+        self._ocr_lock = threading.RLock()
         self._sample_interval_ms = max(200, min(1000, sample_interval_ms))
         self._aux_scan_ms = max(AUX_SCAN_MIN_MS, aux_scan_ms)
         self._pickup_interval_ms = max(PICKUP_SCAN_MIN_MS, min(1000, pickup_interval_ms))
@@ -367,6 +422,11 @@ class BackgroundMonitor:
         self._potion_slots: tuple[PotionSlotConfig, ...] = ()
         self._threads: list[threading.Thread] = []
         self._next_pickup_detection = 0.0
+        self._pickup_feed_signature: tuple | None = None
+        self._pickup_detection_signature: tuple | None = None
+        self._pickup_detected_lines: list[tuple[str, float]] = []
+        self._pickup_line_signatures: dict[str, tuple | None] = {}
+        self._pickup_line_values: dict[str, str] = {}
         self._bar_flash_detector = BarFlashDetector()
 
     def start(self) -> None:
@@ -375,6 +435,7 @@ class BackgroundMonitor:
         self._threads = [
             threading.Thread(target=self._status_loop, name="maple-status-monitor", daemon=True),
             threading.Thread(target=self._auxiliary_loop, name="maple-economy-monitor", daemon=True),
+            threading.Thread(target=self._pickup_loop, name="maple-pickup-monitor", daemon=True),
             threading.Thread(target=self._context_loop, name="maple-context-monitor", daemon=True),
         ]
         for thread in self._threads:
@@ -382,6 +443,7 @@ class BackgroundMonitor:
 
     def stop(self) -> None:
         self._stop.set()
+        self._status_enabled.set()
         self._aux_enabled.set()
         for thread in self._threads:
             thread.join(timeout=0.8)
@@ -391,6 +453,19 @@ class BackgroundMonitor:
         with self._lock:
             self._sample_interval_ms = max(200, min(1000, int(value_ms)))
 
+    def set_status_enabled(self, enabled: bool) -> None:
+        """Run high-frequency status OCR only while a session is active.
+
+        Context OCR remains independent so map/job detection is available
+        before Start. Keeping LV/HP/MP/EXP idle until then removes a large
+        source of startup and idle CPU contention without changing the last
+        displayed snapshot.
+        """
+        if enabled:
+            self._status_enabled.set()
+        else:
+            self._status_enabled.clear()
+
     def set_pickup_interval(self, value_ms: int) -> None:
         with self._lock:
             self._pickup_interval_ms = max(PICKUP_SCAN_MIN_MS, min(1000, int(value_ms)))
@@ -398,14 +473,17 @@ class BackgroundMonitor:
     def set_aux_enabled(self, enabled: bool) -> None:
         if enabled:
             self._aux_enabled.set()
-            self._aux_request.set()
+            self._potion_request.set()
+            self._pickup_request.set()
         else:
             self._aux_enabled.clear()
-            self._aux_request.clear()
+            self._potion_request.clear()
+            self._pickup_request.clear()
 
     def request_auxiliary_scan(self) -> None:
         """Wake the economy worker for a fresh Start/Resume baseline."""
-        self._aux_request.set()
+        self._potion_request.set()
+        self._pickup_request.set()
 
     def request_context(self) -> None:
         self._context_request.set()
@@ -439,6 +517,8 @@ class BackgroundMonitor:
 
     def _status_loop(self) -> None:
         while not self._stop.is_set():
+            if not self._status_enabled.wait(0.1):
+                continue
             started = time.perf_counter()
             bar_flash: tuple[str, ...] = ()
             try:
@@ -459,14 +539,15 @@ class BackgroundMonitor:
                     if name.startswith("__bar_")
                 }
                 bar_flash = self._bar_flash_detector.update(bar_images)
-                read_fields = getattr(self.ocr, "read_fields", None)
-                if callable(read_fields):
-                    field_text = read_fields(ocr_images)
-                else:
-                    field_text = {
-                        name: self.ocr.read_field(image)
-                        for name, image in ocr_images.items()
-                    }
+                with self._ocr_lock:
+                    read_fields = getattr(self.ocr, "read_fields", None)
+                    if callable(read_fields):
+                        field_text = read_fields(ocr_images)
+                    else:
+                        field_text = {
+                            name: self.ocr.read_field(image)
+                            for name, image in ocr_images.items()
+                        }
                 snapshot = parse_fields(field_text)
                 error = None
             except RuntimeError as exc:
@@ -491,101 +572,163 @@ class BackgroundMonitor:
             self._stop.wait(remaining)
 
     def _auxiliary_loop(self) -> None:
-        next_pickup_scan = 0.0
         next_potion_scan = 0.0
         while not self._stop.is_set():
             if not self._aux_enabled.wait(0.1):
                 continue
             now = time.monotonic()
-            requested = self._aux_request.is_set()
+            requested = self._potion_request.is_set()
             with self._lock:
-                track_pickup = self._track_pickup
                 track_potions = self._track_potions
-                pickup_interval = self._pickup_interval_ms / 1000
                 potion_interval = self._aux_scan_ms / 1000
-            next_due = min(
-                next_pickup_scan if track_pickup else float("inf"),
-                next_potion_scan if track_potions else float("inf"),
-            )
-            if not requested and now < next_due:
-                self._stop.wait(min(0.1, next_due - now))
+            if not track_potions:
+                self._stop.wait(0.1)
                 continue
-            self._aux_request.clear()
-            pickup_due = track_pickup and (requested or now >= next_pickup_scan)
-            potion_due = track_potions and (requested or now >= next_potion_scan)
-            if pickup_due:
-                next_pickup_scan = now + pickup_interval
-            if potion_due:
-                next_potion_scan = now + potion_interval
+            if not requested and now < next_potion_scan:
+                self._stop.wait(min(0.1, next_potion_scan - now))
+                continue
+            self._potion_request.clear()
+            next_potion_scan = now + potion_interval
             try:
                 with self._lock:
                     configured_slots = self._configured_potion_slots
                     slots = self._potion_slots
-                if not (track_pickup or track_potions):
-                    continue
                 regions = self.source.grab_auxiliary()
-                lines: list[tuple[str, float]] = []
-                if pickup_due:
-                    lines = self._read_pickup_lines(regions, now)
-                counts: dict[str, int] = {}
-                if potion_due:
-                    read_shortcut_counts = getattr(self.ocr, "read_shortcut_counts", None)
-                    if callable(read_shortcut_counts) and regions.get("shortcut") is not None:
-                        # With no explicit settings rows, ``slots`` contains
-                        # the all-eight fallback.  Pass those observed cells
-                        # as required too; otherwise the full-bar detector can
-                        # merge a neighbouring quantity and feed it into the
-                        # economy validator before the per-cell fast path ever
-                        # gets a chance to read it.
-                        observed_slots = configured_slots or slots
-                        configured_ids = {slot.slot for slot in observed_slots}
-                        blue_ids = {
-                            slot.slot
-                            for slot in observed_slots
-                            if slot.kind in ("mp", "both")
-                        }
-                        try:
-                            detected_counts = read_shortcut_counts(
-                                regions["shortcut"], configured_ids, blue_ids
-                            )
-                        except TypeError:
-                            # Compatibility with custom OCR adapters that still
-                            # expose the original one/two-argument method.
-                            try:
-                                detected_counts = read_shortcut_counts(
-                                    regions["shortcut"], configured_ids
-                                )
-                            except TypeError:
-                                # Compatibility with custom OCR adapters that
-                                # still expose the original one-argument method.
-                                detected_counts = read_shortcut_counts(regions["shortcut"])
-                        enabled_slots = {slot.slot for slot in slots if slot.enabled}
-                        counts = {
-                            slot_id: count
-                            for slot_id, count in detected_counts.items()
-                            if slot_id in enabled_slots
-                        }
-                    else:
-                        for slot in slots:
-                            if not slot.enabled:
-                                continue
-                            image = regions.get(f"shortcut:{slot.slot}")
-                            if image is None:
-                                continue
-                            read_slot_count = getattr(self.ocr, "read_slot_count", None)
-                            count = (
-                                read_slot_count(image)
-                                if callable(read_slot_count)
-                                else parse_slot_count(self.ocr.read_field(image))
-                            )
-                            if count is not None:
-                                counts[slot.slot] = count
+                # Quantity changes are the hard real-time signal: a potion
+                with self._ocr_lock:
+                    counts = self._read_potion_counts(regions, configured_slots, slots)
+                # Publish quantity OCR immediately. Pickup detection is
+                # intentionally handled by _pickup_loop because its full
+                # detector can take hundreds of milliseconds on CPU-only
+                # machines. A slow money retry must never delay a 0.2-0.3s
+                # shortcut sample or make the quantity appear stale.
                 _put_latest(
                     self.auxiliary_queue,
                     AuxiliaryReading(
-                        tuple(lines), counts,
+                        counts=counts,
                         timestamp=time.monotonic(),
-                        pickup_scanned=bool(pickup_due),
+                        pickup_scanned=False,
+                    ),
+                )
+            except RuntimeError as exc:
+                _put_latest(
+                    self.auxiliary_queue,
+                    AuxiliaryReading(error=str(exc), timestamp=time.monotonic()),
+                )
+            except Exception as exc:
+                _put_latest(
+                    self.auxiliary_queue,
+                    AuxiliaryReading(error=f"OCR: {exc}", timestamp=time.monotonic()),
+                )
+
+    def _read_potion_counts(
+        self,
+        regions: dict[str, Any],
+        configured_slots: tuple[PotionSlotConfig, ...],
+        slots: tuple[PotionSlotConfig, ...],
+    ) -> dict[str, int]:
+        """Read only shortcut quantities for the high-frequency worker."""
+        read_shortcut_counts = getattr(self.ocr, "read_shortcut_counts", None)
+        if callable(read_shortcut_counts) and regions.get("shortcut") is not None:
+            # With no explicit settings rows, ``slots`` contains the all-eight
+            # fallback. Pass those observed cells as required too; otherwise
+            # full-bar detection can merge a neighbouring quantity into a
+            # configured potion slot.
+            observed_slots = configured_slots or slots
+            configured_ids = {slot.slot for slot in observed_slots}
+            blue_ids = {
+                slot.slot
+                for slot in observed_slots
+                if slot.kind in ("mp", "both")
+            }
+            slot_images = {
+                slot.slot: regions[f"shortcut:{slot.slot}"]
+                for slot in observed_slots
+                if regions.get(f"shortcut:{slot.slot}") is not None
+            }
+            try:
+                try:
+                    detected_counts = read_shortcut_counts(
+                        regions["shortcut"], configured_ids, blue_ids,
+                        allow_full_validation=False,
+                        slot_images=slot_images,
+                    )
+                except TypeError:
+                    try:
+                        # Compatibility with adapters that have the newer
+                        # slot arguments but not the direct-cell keyword.
+                        detected_counts = read_shortcut_counts(
+                            regions["shortcut"], configured_ids, blue_ids,
+                            allow_full_validation=False,
+                        )
+                    except TypeError:
+                        # Compatibility with older adapters that expose only
+                        # the positional slot arguments.
+                        detected_counts = read_shortcut_counts(
+                            regions["shortcut"], configured_ids, blue_ids
+                        )
+            except TypeError:
+                # Compatibility with custom OCR adapters that still expose
+                # the original one/two-argument method.
+                try:
+                    detected_counts = read_shortcut_counts(
+                        regions["shortcut"], configured_ids
+                    )
+                except TypeError:
+                    detected_counts = read_shortcut_counts(regions["shortcut"])
+            enabled_slots = {slot.slot for slot in slots if slot.enabled}
+            return {
+                slot_id: count
+                for slot_id, count in detected_counts.items()
+                if slot_id in enabled_slots
+            }
+
+        counts: dict[str, int] = {}
+        for slot in slots:
+            if not slot.enabled:
+                continue
+            image = regions.get(f"shortcut:{slot.slot}")
+            if image is None:
+                continue
+            read_slot_count = getattr(self.ocr, "read_slot_count", None)
+            count = (
+                read_slot_count(image)
+                if callable(read_slot_count)
+                else parse_slot_count(self.ocr.read_field(image))
+            )
+            if count is not None:
+                counts[slot.slot] = count
+        return counts
+
+    def _pickup_loop(self) -> None:
+        """Track the pickup feed independently from high-frequency potions."""
+        next_pickup_scan = 0.0
+        while not self._stop.is_set():
+            if not self._aux_enabled.wait(0.1):
+                continue
+            now = time.monotonic()
+            requested = self._pickup_request.is_set()
+            with self._lock:
+                track_pickup = self._track_pickup
+                pickup_interval = self._pickup_interval_ms / 1000
+            if not track_pickup:
+                self._stop.wait(0.1)
+                continue
+            if not requested and now < next_pickup_scan:
+                self._stop.wait(min(0.1, next_pickup_scan - now))
+                continue
+            self._pickup_request.clear()
+            next_pickup_scan = now + pickup_interval
+            try:
+                regions = self.source.grab_auxiliary()
+                with self._ocr_lock:
+                    lines = self._read_pickup_lines(regions, now)
+                _put_latest(
+                    self.auxiliary_queue,
+                    AuxiliaryReading(
+                        lines=tuple(lines),
+                        timestamp=time.monotonic(),
+                        pickup_scanned=True,
                     ),
                 )
             except RuntimeError as exc:
@@ -600,6 +743,20 @@ class BackgroundMonitor:
                 )
 
     def _read_pickup_lines(self, regions: dict[str, Any], now: float) -> list[tuple[str, float]]:
+        feed_signature = _image_signature(regions.get("pickup"))
+        feed_changed = feed_signature != self._pickup_feed_signature
+        self._pickup_feed_signature = feed_signature
+
+        # A full notification detector is the expensive fallback. Reuse its
+        # result while the same toast stack remains on screen instead of
+        # rerunning detection every 350ms and starving shortcut OCR.
+        if (
+            not feed_changed
+            and feed_signature is not None
+            and self._pickup_detection_signature == feed_signature
+        ):
+            return list(self._pickup_detected_lines)
+
         line_images = [
             (line_id, regions.get(f"pickup:{line_id}"))
             for line_id in PICKUP_LINE_BOXES
@@ -610,16 +767,51 @@ class BackgroundMonitor:
             for line_id, image in line_images
             if self._image_has_content(image)
         ]
-        lines = [
-            (
-                self.ocr.read_field(image),
-                int(line_id) * PICKUP_LINE_HEIGHT
-                + PICKUP_LINE_TOP_OFFSET
-                + PICKUP_LINE_HEIGHT / 2,
-            )
+        read_text_field = getattr(self.ocr, "read_text_field", None)
+        current_line_signatures = {
+            line_id: _image_signature(image)
             for line_id, image in line_images
-        ]
-        if _pickup_lines_need_detection(lines) and now >= self._next_pickup_detection:
+        }
+        lines: list[tuple[str, float]] = []
+        for line_id, image in line_images:
+            signature = current_line_signatures.get(line_id)
+            if (
+                self._pickup_line_signatures.get(line_id) == signature
+                and line_id in self._pickup_line_values
+            ):
+                text = self._pickup_line_values[line_id]
+            else:
+                text = (
+                    read_text_field(image)
+                    if callable(read_text_field)
+                    else self.ocr.read_field(image)
+                )
+                self._pickup_line_values[line_id] = text
+            lines.append(
+                (
+                    text,
+                    int(line_id) * PICKUP_LINE_HEIGHT
+                    + PICKUP_LINE_TOP_OFFSET
+                    + PICKUP_LINE_HEIGHT / 2,
+                )
+            )
+        self._pickup_line_signatures = current_line_signatures
+        self._pickup_line_values = {
+            line_id: self._pickup_line_values.get(line_id, "")
+            for line_id in current_line_signatures
+        }
+
+        needs_detection = _pickup_lines_need_detection(lines)
+        detection_already_attempted = (
+            feed_signature is not None
+            and self._pickup_detection_signature == feed_signature
+        )
+        if (
+            needs_detection
+            and feed_signature is not None
+            and not detection_already_attempted
+            and now >= self._next_pickup_detection
+        ):
             self._next_pickup_detection = now + PICKUP_DETECTION_INTERVAL_S
             detected: list[Any] = []
             for key in ("pickup", "pickup_wide"):
@@ -630,7 +822,16 @@ class BackgroundMonitor:
                 if any(parse_mesos_amount(_line_text(line)) is not None for line in detected):
                     break
             lines = [(_line_text(line), float(getattr(line, "y", 0) or 0)) for line in detected]
-        elif not line_images and regions.get("pickup") is not None:
+            self._pickup_detection_signature = feed_signature
+            self._pickup_detected_lines = list(lines)
+        elif (
+            not line_images
+            and regions.get("pickup") is not None
+            and self._image_has_content(regions["pickup"])
+            and feed_signature is not None
+            and not detection_already_attempted
+            and now >= self._next_pickup_detection
+        ):
             detected: list[Any] = []
             for key in ("pickup", "pickup_wide"):
                 image = regions.get(key)
@@ -640,6 +841,13 @@ class BackgroundMonitor:
                 if any(parse_mesos_amount(_line_text(line)) is not None for line in detected):
                     break
             lines = [(_line_text(line), float(getattr(line, "y", 0) or 0)) for line in detected]
+            self._pickup_detection_signature = feed_signature
+            self._pickup_detected_lines = list(lines)
+        elif feed_changed:
+            # A new frame without a completed detector retry is intentionally
+            # represented by the cheap row reads. Never expose a stale full
+            # detector result from the previous toast stack.
+            self._pickup_detected_lines = []
         return lines
 
     def _context_loop(self) -> None:
@@ -649,7 +857,9 @@ class BackgroundMonitor:
         while not self._stop.is_set():
             try:
                 regions = grab_context()
-                _put_latest(self.context_queue, extract_context(self.ocr, regions))
+                with self._ocr_lock:
+                    reading = extract_context(self.ocr, regions)
+                _put_latest(self.context_queue, reading)
             except RuntimeError as exc:
                 _put_latest(self.context_queue, ContextReading(error=str(exc)))
             except Exception as exc:

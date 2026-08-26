@@ -48,6 +48,15 @@ MAX_IN_SESSION_RESTOCK_DELTA = 5
 # a real inventory event, even when the OCR value looks numeric.
 POTION_MIN_INTERVAL_SECONDS = 0.5
 POTION_RATE_TOLERANCE_SECONDS = 0.06
+# HP/MP OCR can briefly lose a leading digit or read a visual effect as part
+# of the status value. Small changes are useful recovery evidence immediately,
+# but a large jump must be seen twice before it affects natural-recovery
+# savings. Configured potion heals are accepted immediately when their exact
+# pending amount matches.
+RECOVERY_OUTLIER_FRACTION = 0.35
+RECOVERY_MIN_OUTLIER_THRESHOLD = 120
+RECOVERY_CANDIDATE_MAX_GAP_SECONDS = 2.0
+RESOURCE_MAX_CHANGE_FACTOR = 2.0
 # HP/MP bar flashes are an optional third signal.  They are intentionally not
 # used as a standalone cost source: a shortcut quantity decrease is still
 # required.  A flash may, however, confirm a one-frame quantity drop when the
@@ -394,6 +403,13 @@ class EconomyTracker:
         self._shortcut_observed.clear()
         self._slot_candidates.clear()
         self._pending_potions.clear()
+        # Auxiliary monitoring is disabled while paused/stopped, but the
+        # status worker keeps producing frames. Re-anchor HP/MP when it is
+        # enabled again so time spent outside the session is never counted as
+        # natural recovery on the first resumed frame.
+        self._last_hp = None
+        self._last_mp = None
+        self._recovery_candidates.clear()
         # A flash captured before Start/Resume belongs to the old visual
         # baseline.  Carrying it over could confirm an unrelated OCR drop in
         # the new interval, so the evidence must have the same boundary as
@@ -434,6 +450,8 @@ class EconomyTracker:
         self._mp_recovery_savings = 0.0
         self._last_hp: int | None = None
         self._last_mp: int | None = None
+        self._resource_max: dict[str, int] = {}
+        self._recovery_candidates: dict[str, tuple[int, float]] = {}
         self._slot_counts: dict[str, int] = {}
         self._slot_charged = {}
         self._slot_last_accepted_at: dict[str, float] = {}
@@ -533,7 +551,11 @@ class EconomyTracker:
             return 0
         uses = 0
         for slot_id, current in valid_counts.items():
-            previous_sample_at = self._slot_last_sample_at.get(slot_id)
+            # Keep the latest OCR timestamp for diagnostics/reconciliation,
+            # but do not use it as the consumption-rate origin. OCR may see
+            # the same pending quantity every 0.2-0.3s while the game only
+            # changed the stack once; measuring from that last frame made a
+            # real 0.3-0.7s potion change stay blocked forever.
             self._slot_last_sample_at[slot_id] = timestamp
             previous = self._slot_counts.get(slot_id)
             if previous is None:
@@ -612,10 +634,11 @@ class EconomyTracker:
                 candidate is not None
                 and timestamp - candidate[2] <= SLOT_CANDIDATE_MAX_GAP_SECONDS
             )
-            if candidate_is_recent and current <= candidate[0]:
-                # A held potion key can produce 1180 -> 1179 -> 1178 rather
-                # than repeating 1179.  A monotonic lower sequence is still
-                # two-frame evidence; count from the last trusted quantity.
+            if candidate_is_recent and candidate[0] == current:
+                # The same lower value in two frames is the safe confirmation
+                # signal. Do not treat 1180 -> 1179 -> 1178 as proof of two
+                # drinks: that sequence is also produced by joined cells or
+                # unstable digit OCR.
                 confirmations = candidate[1] + 1
             else:
                 confirmations = 1
@@ -628,9 +651,10 @@ class EconomyTracker:
             ) if slot is not None else False
             if confirmations >= SLOT_CONFIRMATIONS_REQUIRED or flash_confirmed:
                 confirmed_drop = previous - current
-                allowed_drop = self._allowed_drop_for_slot(
-                    slot_id, timestamp, reference_at=previous_sample_at
-                )
+                # Rate-limit against the last trusted quantity, not the last
+                # OCR frame. This is essential when the quantity changes
+                # between two fast auxiliary samples.
+                allowed_drop = self._allowed_drop_for_slot(slot_id, timestamp)
                 if allowed_drop <= 0:
                     # The candidate may be real but it arrived before the
                     # game's minimum drink interval.  Keep it pending until a
@@ -657,8 +681,20 @@ class EconomyTracker:
         *,
         reference_at: float | None = None,
     ) -> int:
-        """Return the maximum believable consumption since the last sample."""
-        last = reference_at if reference_at is not None else self._slot_last_sample_at.get(slot_id)
+        """Return believable consumption since the last trusted quantity.
+
+        ``_slot_last_sample_at`` advances on every OCR frame, including a
+        repeated pending candidate. It is therefore not a valid rate-limit
+        origin. ``reference_at`` remains available for compatibility with
+        older callers, while normal live accounting uses the accepted time.
+        """
+        last = (
+            reference_at
+            if reference_at is not None
+            else self._slot_last_accepted_at.get(slot_id)
+        )
+        if last is None:
+            last = self._slot_last_sample_at.get(slot_id)
         if last is None or timestamp < last:
             # Keep deterministic/unit-test callers that use synthetic times
             # before a real monotonic baseline backwards compatible.  Live
@@ -752,32 +788,149 @@ class EconomyTracker:
             self._pending_potions.append(_PendingPotion(slot, expires_at))
 
     def record_stats(
-        self, hp_cur: int | None, mp_cur: int | None, now: float | None = None
+        self,
+        hp_cur: int | None,
+        mp_cur: int | None,
+        now: float | None = None,
+        *,
+        hp_max: int | None = None,
+        mp_max: int | None = None,
     ) -> tuple[int, int]:
-        """Record current HP/MP and return the observed upward deltas.
+        """Record current HP/MP and return only trusted upward deltas.
 
-        The live session uses these deltas as recovery evidence as well.  A
-        large damage read can be held by the OCR noise guard while a later
-        potion heal is still visible; returning the evidence lets the rate
-        tracker account for that otherwise hidden damage.
+        A raw OCR sequence such as ``1000 -> 100 -> 1000`` used to become a
+        false 900 HP natural recovery. Keep a trusted resource baseline and
+        hold large moves until the new value is corroborated. A configured
+        potion heal with an exact pending recovery amount remains immediate,
+        so this guard does not make potion statistics feel delayed.
         """
         timestamp = time.monotonic() if now is None else now
-        self._pending_potions = [item for item in self._pending_potions if item.expires_at >= timestamp]
-        hp_recovery = 0
-        mp_recovery = 0
-        if hp_cur is not None and self._last_hp is not None and hp_cur > self._last_hp:
-            hp_recovery = hp_cur - self._last_hp
-            self._confirm_candidate_from_recovery("hp", hp_recovery, timestamp)
-            self._record_recovery("hp", hp_recovery, timestamp)
-        if mp_cur is not None and self._last_mp is not None and mp_cur > self._last_mp:
-            mp_recovery = mp_cur - self._last_mp
-            self._confirm_candidate_from_recovery("mp", mp_recovery, timestamp)
-            self._record_recovery("mp", mp_recovery, timestamp)
-        if hp_cur is not None:
-            self._last_hp = hp_cur
-        if mp_cur is not None:
-            self._last_mp = mp_cur
+        self._pending_potions = [
+            item for item in self._pending_potions
+            if item.expires_at >= timestamp
+        ]
+        hp_recovery = self._record_resource_stat("hp", hp_cur, hp_max, timestamp)
+        mp_recovery = self._record_resource_stat("mp", mp_cur, mp_max, timestamp)
         return hp_recovery, mp_recovery
+
+    def _record_resource_stat(
+        self,
+        kind: str,
+        current: int | None,
+        maximum: int | None,
+        timestamp: float,
+    ) -> int:
+        """Accept one HP/MP sample and return a trusted recovery delta."""
+        if current is None or current < 0:
+            return 0
+
+        effective_max = self._update_resource_max(kind, maximum, current)
+        if effective_max is not None and current > effective_max:
+            # Never move the trusted baseline to an impossible value. This is
+            # the stateful accounting boundary, so it remains protected even
+            # if a compatibility OCR adapter bypasses parser.py's check.
+            self._recovery_candidates.pop(kind, None)
+            return 0
+
+        previous = self._last_hp if kind == "hp" else self._last_mp
+        if previous is None:
+            self._set_last_resource(kind, current)
+            self._recovery_candidates.pop(kind, None)
+            return 0
+
+        if current == previous:
+            # Returning to the trusted value cancels a one-frame OCR outlier.
+            self._recovery_candidates.pop(kind, None)
+            return 0
+
+        difference = current - previous
+        threshold = self._recovery_outlier_threshold(previous, effective_max)
+
+        candidate = self._recovery_candidates.get(kind)
+        if (
+            candidate is not None
+            and timestamp - candidate[1] <= RECOVERY_CANDIDATE_MAX_GAP_SECONDS
+            and abs(candidate[0] - previous) > threshold
+            and abs(difference) <= threshold
+        ):
+            # A common OCR failure is ``1000 -> 100 -> 900`` (or the mirrored
+            # high spike). The third value is close enough to the trusted
+            # baseline to prove that the middle value was an outlier, not a
+            # real damage event. Do not commit the small rebound as a fake
+            # natural heal; keep the original baseline intact.
+            self._recovery_candidates.pop(kind, None)
+            return 0
+
+        # An exact configured potion recovery can confirm a one-frame
+        # shortcut drop even when it is larger than the natural-recovery band.
+        if difference > 0:
+            self._confirm_candidate_from_recovery(kind, difference, timestamp)
+            if self._matching_pending(kind, difference) is not None:
+                self._recovery_candidates.pop(kind, None)
+                self._set_last_resource(kind, current)
+                self._record_recovery(kind, difference, timestamp)
+                return difference
+
+        if abs(difference) <= threshold:
+            self._recovery_candidates.pop(kind, None)
+            self._set_last_resource(kind, current)
+            if difference > 0:
+                self._record_recovery(kind, difference, timestamp)
+                return difference
+            return 0
+
+        candidate = self._recovery_candidates.get(kind)
+        if (
+            candidate is not None
+            and timestamp - candidate[1] <= RECOVERY_CANDIDATE_MAX_GAP_SECONDS
+            and abs(current - candidate[0]) <= threshold
+        ):
+            # The same large move survived a second sample. Accept the current
+            # value; only an upward move contributes to recovery/savings.
+            self._recovery_candidates.pop(kind, None)
+            self._set_last_resource(kind, current)
+            if difference > 0:
+                self._record_recovery(kind, difference, timestamp)
+                return difference
+            return 0
+
+        # Hold the first large move. If the next frame returns to the old
+        # value, the equality branch above clears it and emits nothing. If it
+        # persists, the next sample corroborates it.
+        self._recovery_candidates[kind] = (current, timestamp)
+        return 0
+
+    def _update_resource_max(
+        self, kind: str, maximum: int | None, current: int
+    ) -> int | None:
+        """Keep a plausible HP/MP maximum for stateful OCR validation."""
+        known = self._resource_max.get(kind)
+        if isinstance(maximum, int) and maximum > 0:
+            if known is None or (
+                known / RESOURCE_MAX_CHANGE_FACTOR <= maximum
+                <= known * RESOURCE_MAX_CHANGE_FACTOR
+            ):
+                known = maximum
+                self._resource_max[kind] = maximum
+        # No max is available for a few compatibility callers/tests. Their
+        # relative baseline still receives the outlier guard below; a future
+        # structured HP/MP pair will add the stronger physical ceiling.
+        return known
+
+    def _recovery_outlier_threshold(
+        self, previous: int, maximum: int | None
+    ) -> int:
+        reference = maximum if maximum is not None else max(previous, 1)
+        return max(
+            RECOVERY_MIN_OUTLIER_THRESHOLD,
+            int(reference * RECOVERY_OUTLIER_FRACTION),
+        )
+
+    def _set_last_resource(self, kind: str, value: int) -> None:
+        if kind == "hp":
+            self._last_hp = value
+        else:
+            self._last_mp = value
 
     def _confirm_candidate_from_recovery(self, kind: str, amount: int, now: float) -> None:
         """Confirm a one-frame slot drop when the matching heal is visible.
@@ -817,6 +970,9 @@ class EconomyTracker:
         slot_id, drop, current = exact[0]
         self._slot_candidates.pop(slot_id, None)
         self._slot_counts[slot_id] = current
+        self._shortcut_observed[slot_id] = current
+        self._slot_last_accepted_at[slot_id] = now
+        self._slot_last_sample_at[slot_id] = now
         self._commit_slot_drop(slot_id, drop, now)
 
     def _record_recovery(self, kind: str, amount: int, now: float) -> None:

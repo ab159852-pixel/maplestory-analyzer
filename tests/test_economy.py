@@ -70,6 +70,22 @@ def test_shortcut_drop_is_the_only_source_of_cost_and_classifies_recovery():
     assert snapshot.hp_recovery_savings == 0
 
 
+def test_fast_auxiliary_samples_confirm_a_real_quantity_change_after_rate_window():
+    tracker = EconomyTracker([
+        PotionSlotConfig(slot="1", name="Red Potion", kind="hp", cost=25),
+    ])
+    tracker.prime_quick_slot_counts({"1": 1000}, now=0)
+
+    # The overlay can sample the same shortcut every 0.3s. The first lower
+    # frame is a candidate; the repeated value at 0.6s is the confirmation.
+    tracker.record_quick_slot_counts({"1": 999}, now=0.30)
+    assert tracker.snapshot.hp_potion_uses == 0
+    tracker.record_quick_slot_counts({"1": 999}, now=0.60)
+
+    assert tracker.snapshot.hp_potion_uses == 1
+    assert tracker.snapshot.hp_potion_cost == 25
+
+
 def test_bar_flash_can_confirm_one_frame_drop_but_never_creates_cost_alone():
     tracker = EconomyTracker([
         PotionSlotConfig(slot="6", name="HP Potion", kind="hp", cost=25),
@@ -171,6 +187,83 @@ def test_recovery_without_slot_drop_never_creates_potion_cost_and_estimates_savi
     assert snapshot.mp_recovery_potion == 0
     assert snapshot.mp_recovery_natural == 40
     assert snapshot.mp_recovery_savings == 84.0
+
+
+def test_one_frame_status_ocr_outlier_is_not_counted_as_natural_recovery():
+    tracker = EconomyTracker([])
+
+    tracker.record_stats(1000, 800, now=0, hp_max=2210, mp_max=1407)
+    # A lost leading digit is a common OCR failure. The next correct frame
+    # must return to the trusted baseline without creating fake savings.
+    tracker.record_stats(100, 80, now=0.3, hp_max=2210, mp_max=1407)
+    tracker.record_stats(1000, 800, now=0.6, hp_max=2210, mp_max=1407)
+
+    snapshot = tracker.snapshot
+    assert snapshot.hp_recovery_natural == 0
+    assert snapshot.mp_recovery_natural == 0
+    assert snapshot.hp_recovery_savings == 0
+    assert snapshot.mp_recovery_savings == 0
+
+
+def test_large_natural_recovery_requires_a_second_consistent_frame():
+    tracker = EconomyTracker([])
+
+    tracker.record_stats(200, 100, now=0, hp_max=2210, mp_max=1407)
+    assert tracker.record_stats(1100, 700, now=0.3, hp_max=2210, mp_max=1407) == (0, 0)
+    assert tracker.snapshot.hp_recovery_natural == 0
+    assert tracker.snapshot.mp_recovery_natural == 0
+
+    assert tracker.record_stats(1100, 700, now=0.6, hp_max=2210, mp_max=1407) == (900, 600)
+    snapshot = tracker.snapshot
+    assert snapshot.hp_recovery_natural == 900
+    assert snapshot.mp_recovery_natural == 600
+    assert snapshot.hp_recovery_savings == 1080.0
+    assert snapshot.mp_recovery_savings == 1260.0
+
+
+def test_impossible_status_value_does_not_poison_recovery_baseline():
+    tracker = EconomyTracker([])
+
+    tracker.record_stats(1000, 700, now=0, hp_max=2210, mp_max=1407)
+    tracker.record_stats(9999, 9999, now=0.3, hp_max=2210, mp_max=1407)
+    assert tracker.snapshot.hp_recovery_natural == 0
+    assert tracker.snapshot.mp_recovery_natural == 0
+
+    tracker.record_stats(1010, 710, now=0.6, hp_max=2210, mp_max=1407)
+    assert tracker.snapshot.hp_recovery_natural == 10
+    assert tracker.snapshot.mp_recovery_natural == 10
+
+
+def test_rebound_after_one_frame_low_ocr_outlier_is_not_natural_recovery():
+    tracker = EconomyTracker([])
+
+    tracker.record_stats(1000, 700, now=0, hp_max=2210, mp_max=1407)
+    tracker.record_stats(100, 70, now=0.3, hp_max=2210, mp_max=1407)
+    # A slightly damaged but otherwise valid next frame is still close to the
+    # trusted baseline; it corroborates that 100/70 was a bad OCR frame.
+    tracker.record_stats(900, 650, now=0.6, hp_max=2210, mp_max=1407)
+    tracker.record_stats(1000, 700, now=0.9, hp_max=2210, mp_max=1407)
+
+    snapshot = tracker.snapshot
+    assert snapshot.hp_recovery_natural == 0
+    assert snapshot.mp_recovery_natural == 0
+    assert snapshot.hp_recovery_savings == 0
+    assert snapshot.mp_recovery_savings == 0
+
+
+def test_rebound_after_one_frame_high_ocr_outlier_is_not_natural_recovery():
+    tracker = EconomyTracker([])
+
+    tracker.record_stats(1000, 700, now=0, hp_max=2210, mp_max=1407)
+    tracker.record_stats(2000, 1300, now=0.3, hp_max=2210, mp_max=1407)
+    tracker.record_stats(1100, 750, now=0.6, hp_max=2210, mp_max=1407)
+    tracker.record_stats(1000, 700, now=0.9, hp_max=2210, mp_max=1407)
+
+    snapshot = tracker.snapshot
+    assert snapshot.hp_recovery_natural == 0
+    assert snapshot.mp_recovery_natural == 0
+    assert snapshot.hp_recovery_savings == 0
+    assert snapshot.mp_recovery_savings == 0
 
 
 def test_quantity_increase_only_resets_baseline_and_a_later_drop_counts():

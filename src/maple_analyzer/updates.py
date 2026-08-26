@@ -166,12 +166,21 @@ _POWERSHELL_UPDATER = r'''param(
     [Parameter(Mandatory = $true)][string] $ExeName,
     [Parameter(Mandatory = $true)][string] $PackageExeName,
     [Parameter(Mandatory = $true)][int] $ProcessId,
-    [Parameter(Mandatory = $true)][string] $ScriptPath
+    [Parameter(Mandatory = $true)][string] $ScriptPath,
+    [Parameter(Mandatory = $true)][string] $StatusPath
 )
 $ErrorActionPreference = "Stop"
 $success = $false
 $stage = Join-Path ([System.IO.Path]::GetTempPath()) ("MapleStoryAnalyzer-update-" + [guid]::NewGuid().ToString("N"))
 $backup = "$InstallDir.previous-" + [guid]::NewGuid().ToString("N")
+$newProcess = $null
+function Write-UpdateStatus([string] $Message) {
+    try {
+        (Get-Date -Format o) + " " + $Message | Add-Content -LiteralPath $StatusPath -Encoding UTF8
+    } catch {
+        # A status file must never prevent the actual update transaction.
+    }
+}
 try {
     # The app is normally launched with its own install directory as the
     # process working directory. Windows refuses to move a directory that a
@@ -180,6 +189,10 @@ try {
     $helperWorkingDir = [System.IO.Path]::GetTempPath()
     [System.IO.Directory]::SetCurrentDirectory($helperWorkingDir)
     Set-Location -LiteralPath $helperWorkingDir
+    Write-UpdateStatus ("helper-start install=" + $InstallDir + " exe=" + $ExeName)
+    if (-not (Test-Path -LiteralPath $ZipPath)) {
+        throw "update archive does not exist: $ZipPath"
+    }
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
     Expand-Archive -LiteralPath $ZipPath -DestinationPath $stage -Force
     $package = Join-Path $stage "MapleStoryAnalyzer"
@@ -201,6 +214,7 @@ try {
     if (-not (Test-Path -LiteralPath $targetExe)) {
         throw "updated package does not contain $ExeName"
     }
+    Write-UpdateStatus ("package-ready path=" + $targetExe)
 
     for ($attempt = 0; $attempt -lt 60; $attempt++) {
         if ($null -eq (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) { break }
@@ -209,21 +223,45 @@ try {
     if ($null -ne (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
         throw "the old application did not exit"
     }
+    Write-UpdateStatus "old-process-exited"
 
     Move-Item -LiteralPath $InstallDir -Destination $backup
+    Write-UpdateStatus ("old-install-backed-up path=" + $backup)
     try {
         Move-Item -LiteralPath $package -Destination $InstallDir
     } catch {
         Move-Item -LiteralPath $backup -Destination $InstallDir
         throw
     }
-    Start-Process -FilePath (Join-Path $InstallDir $ExeName) -WorkingDirectory $InstallDir
+    $targetExe = Join-Path $InstallDir $ExeName
+    if (-not (Test-Path -LiteralPath $targetExe)) {
+        throw "installed package does not contain $targetExe"
+    }
+    Write-UpdateStatus ("new-install-ready path=" + $targetExe)
+    $newProcess = Start-Process -FilePath $targetExe -WorkingDirectory $InstallDir -PassThru
+    # Starting a process is not proof that the one-folder package is usable.
+    # Keep the old folder until the new process survives its import/theme/Tk
+    # startup window; otherwise a missing asset would look like a successful
+    # update and leave the user with no working application.
+    for ($attempt = 0; $attempt -lt 40; $attempt++) {
+        if ($newProcess.HasExited) {
+            throw "updated application exited during startup (code $($newProcess.ExitCode))"
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    Write-UpdateStatus ("new-process-started pid=" + $newProcess.Id)
     $success = $true
     Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
+    Write-UpdateStatus "update-success"
 } catch {
+    $message = $_.Exception.Message
+    Write-UpdateStatus ("update-error " + $message)
     $log = Join-Path ([System.IO.Path]::GetTempPath()) "MapleStoryAnalyzer-update-error.txt"
-    (Get-Date -Format o) + " " + $_.Exception.Message + " [InstallDir=$InstallDir]" |
+    (Get-Date -Format o) + " " + $message + " [InstallDir=$InstallDir]" |
         Set-Content -LiteralPath $log -Encoding UTF8
+    if ($null -ne $newProcess -and -not $newProcess.HasExited) {
+        Stop-Process -Id $newProcess.Id -Force -ErrorAction SilentlyContinue
+    }
     if ((Test-Path $backup) -and (Test-Path $InstallDir)) {
         Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -236,6 +274,9 @@ try {
         Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue
     }
     Remove-Item -LiteralPath $ScriptPath -Force -ErrorAction SilentlyContinue
+    if ($success) {
+        Write-UpdateStatus "helper-finished"
+    }
 }
 '''
 
@@ -250,8 +291,14 @@ def schedule_update(zip_path: Path) -> None:
     os.close(script_fd)
     script_path = Path(script_name)
     script_path.write_text(_POWERSHELL_UPDATER, encoding="utf-8")
+    status_path = Path(tempfile.gettempdir()) / f"{APP_NAME}-update-status.txt"
+    status_path.unlink(missing_ok=True)
+    powershell = Path(os.environ.get("WINDIR", r"C:\Windows")) / (
+        "System32" / Path("WindowsPowerShell") / Path("v1.0") / Path("powershell.exe")
+    )
+    powershell_command = str(powershell) if powershell.is_file() else "powershell.exe"
     command = [
-        "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        powershell_command, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
         "-File", str(script_path),
         "-ZipPath", str(zip_path),
         "-InstallDir", str(install_dir),
@@ -259,6 +306,7 @@ def schedule_update(zip_path: Path) -> None:
         "-PackageExeName", f"{APP_NAME}.exe",
         "-ProcessId", str(os.getpid()),
         "-ScriptPath", str(script_path),
+        "-StatusPath", str(status_path),
     ]
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
     try:

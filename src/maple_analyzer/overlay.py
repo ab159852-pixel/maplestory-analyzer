@@ -126,6 +126,12 @@ TARGET_MS = 300  # target full status/OCR cycle -- 3.33Hz
 AUX_SCAN_MS = 200
 PICKUP_DETECTION_MS = 200
 POTION_PROJECTION_MIN_SECONDS = 60.0  # avoid a first-drink spike in a short sample
+# Shortcut quantities are sampled independently from status OCR. Two matching
+# frames at the normal 0.2-0.3s cadence are enough to establish a baseline;
+# waiting for three of four frames made the first real potion disappear before
+# accounting even began.
+POTION_BASELINE_SAMPLE_WINDOW = 3
+POTION_BASELINE_CONFIRMATIONS = 2
 SCALE_STEP_PCT = 10
 SCALE_MIN_PCT = 50
 SCALE_MAX_PCT = 150
@@ -863,6 +869,7 @@ class OverlayApp:
                 self._ocr,
                 sample_interval_ms=self._settings.sample_interval_ms,
                 pickup_interval_ms=self._settings.pickup_interval_ms,
+                context_scan_ms=2000,
             )
             self._monitor.configure_auxiliary(
                 track_pickup=self._settings.track_pickup_messages,
@@ -871,11 +878,11 @@ class OverlayApp:
             )
             self._set_monitor_aux_enabled(self._run_state == "running")
             self._monitor.start()
-            if self._context_refresh_pending:
-                # The context worker performs an initial scan on startup, but
-                # explicitly wake it as well so a click made during OCR
-                # loading is honored as soon as the worker is ready.
-                self._monitor.request_context()
+            # Context is deliberately independent of the run state. Request a
+            # scan as soon as OCR is ready so job/map and drop lookup work
+            # before Start; the context worker never waits for the economy
+            # worker or a running session.
+            self._monitor.request_context()
         elif self._context_refresh_pending:
             # Do not leave the button in a permanent "detecting" state when
             # model initialization failed and no worker can service it.
@@ -2290,6 +2297,9 @@ class OverlayApp:
             self._potion_baseline_samples.clear()
             self._last_logged_shortcut_counts = None
         if monitor is not None:
+            set_status = getattr(monitor, "set_status_enabled", None)
+            if callable(set_status):
+                set_status(enabled)
             monitor.set_aux_enabled(enabled)
             if enabled:
                 request_scan = getattr(monitor, "request_auxiliary_scan", None)
@@ -2303,22 +2313,22 @@ class OverlayApp:
         if self._potion_baseline_pending:
             if not counts:
                 return
-            # The first read is calibration, not accounting.  Require each
-            # slot to repeat the same value in three of the latest four
-            # auxiliary frames before making it the session baseline.  This
-            # prevents a single adjacent-cell OCR merge (e.g. 89 -> 895) or a
-            # stale frame arriving from the worker queue from defining the
-            # starting inventory for the entire session.
+            # The first read is calibration, not accounting. Require each
+            # slot to repeat the same value in two of the latest three
+            # auxiliary frames before making it the session baseline. This
+            # keeps one adjacent-cell OCR merge (e.g. 89 -> 895) or one stale
+            # worker frame from defining the starting inventory, without
+            # delaying the first real quantity change for a full second.
             self._potion_baseline_samples.append(dict(counts))
-            if len(self._potion_baseline_samples) > 4:
-                del self._potion_baseline_samples[:-4]
+            if len(self._potion_baseline_samples) > POTION_BASELINE_SAMPLE_WINDOW:
+                del self._potion_baseline_samples[:-POTION_BASELINE_SAMPLE_WINDOW]
             stable: dict[str, int] = {}
             for slot_id, count in counts.items():
                 confirmations = sum(
                     sample.get(slot_id) == count
                     for sample in self._potion_baseline_samples
                 )
-                if confirmations >= 3:
+                if confirmations >= POTION_BASELINE_CONFIRMATIONS:
                     stable[slot_id] = count
             if not stable:
                 return
@@ -2637,7 +2647,11 @@ class OverlayApp:
                     )
                     if economy is not None:
                         hp_recovery, mp_recovery = economy.record_stats(
-                            merged.hp_cur, merged.mp_cur, event_now
+                            merged.hp_cur,
+                            merged.mp_cur,
+                            event_now,
+                            hp_max=merged.hp_max,
+                            mp_max=merged.mp_max,
                         )
                         self._session.add_recovery_evidence("hp", hp_recovery)
                         self._session.add_recovery_evidence("mp", mp_recovery)
@@ -2804,7 +2818,12 @@ class OverlayApp:
             economy = getattr(self, "_economy", None)
             if economy is not None:
                 self._scan_auxiliary()
-                hp_recovery, mp_recovery = economy.record_stats(merged.hp_cur, merged.mp_cur)
+                hp_recovery, mp_recovery = economy.record_stats(
+                    merged.hp_cur,
+                    merged.mp_cur,
+                    hp_max=merged.hp_max,
+                    mp_max=merged.mp_max,
+                )
                 self._session.add_recovery_evidence("hp", hp_recovery)
                 self._session.add_recovery_evidence("mp", mp_recovery)
 
@@ -2861,10 +2880,15 @@ class OverlayApp:
                     for line_id, image in line_images
                     if self._image_has_content(image)
                 ]
+                read_text_field = getattr(self._ocr, "read_text_field", None)
                 if line_images:
                     lines = [
                         (
-                            self._ocr.read_field(image),
+                            (
+                                read_text_field(image)
+                                if callable(read_text_field)
+                                else self._ocr.read_field(image)
+                            ),
                             int(line_id) * PICKUP_LINE_HEIGHT
                             + PICKUP_LINE_TOP_OFFSET
                             + PICKUP_LINE_HEIGHT / 2,
@@ -2930,10 +2954,28 @@ class OverlayApp:
                         for slot in observed_slots
                         if slot.enabled and slot.kind in ("mp", "both")
                     }
+                    slot_images = {
+                        slot.slot: regions[f"shortcut:{slot.slot}"]
+                        for slot in observed_slots
+                        if regions.get(f"shortcut:{slot.slot}") is not None
+                    }
                     try:
-                        detected_counts = read_shortcut_counts(
-                            regions["shortcut"], configured_ids, blue_ids
-                        )
+                        try:
+                            detected_counts = read_shortcut_counts(
+                                regions["shortcut"], configured_ids, blue_ids,
+                                allow_full_validation=False,
+                                slot_images=slot_images,
+                            )
+                        except TypeError:
+                            try:
+                                detected_counts = read_shortcut_counts(
+                                    regions["shortcut"], configured_ids, blue_ids,
+                                    allow_full_validation=False,
+                                )
+                            except TypeError:
+                                detected_counts = read_shortcut_counts(
+                                    regions["shortcut"], configured_ids, blue_ids
+                                )
                     except TypeError:
                         try:
                             detected_counts = read_shortcut_counts(
