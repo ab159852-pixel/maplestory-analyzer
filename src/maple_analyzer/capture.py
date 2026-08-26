@@ -248,24 +248,28 @@ class StaticImageCapture:
         return fields
 
     def grab_auxiliary(self) -> dict[str, Image.Image]:
+        capture_boxes = _pickup_boxes_for_client(self._image.size)
         regions = {
             name: self._image.crop(
                 (scale_shortcut_box if name == "shortcut" else scale_box)(
-                    box, self._image.size
+                    capture_boxes[name], self._image.size
                 ).as_tuple()
             )
-            for name, box in AUXILIARY_BOXES.items()
+            for name in capture_boxes
         }
         pickup = regions["pickup"]
+        pickup_parent = scale_box(capture_boxes["pickup"], self._image.size)
         reference_width = AUXILIARY_BOXES["pickup"][2] - AUXILIARY_BOXES["pickup"][0]
         reference_height = AUXILIARY_BOXES["pickup"][3] - AUXILIARY_BOXES["pickup"][1]
+        actual_width = pickup_parent.right - pickup_parent.left
+        actual_height = pickup_parent.bottom - pickup_parent.top
         for line, raw_box in PICKUP_LINE_BOXES.items():
             left_box, top_box, right_box, bottom_box = raw_box
             regions[f"pickup:{line}"] = pickup.crop((
-                round(left_box * pickup.width / reference_width),
-                round(top_box * pickup.height / reference_height),
-                round(right_box * pickup.width / reference_width),
-                round(bottom_box * pickup.height / reference_height),
+                round(left_box * actual_width / reference_width),
+                round(top_box * actual_height / reference_height),
+                round(right_box * actual_width / reference_width),
+                round(bottom_box * actual_height / reference_height),
             ))
         regions.update({
             f"shortcut:{slot}": self._image.crop(

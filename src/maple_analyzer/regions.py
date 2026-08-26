@@ -69,16 +69,23 @@ PICKUP_WIDE_BOX = (760, 380, 1351, 720)
 # duplicate-event filtering.
 PICKUP_LINE_HEIGHT = 16
 PICKUP_LINE_TOP_OFFSET = 8
+PICKUP_LINE_PADDING = 3
 PICKUP_LINE_BOXES = {
     str(index): (
         0,
         min(
-            index * PICKUP_LINE_HEIGHT + PICKUP_LINE_TOP_OFFSET,
+            max(
+                0,
+                index * PICKUP_LINE_HEIGHT + PICKUP_LINE_TOP_OFFSET - PICKUP_LINE_PADDING,
+            ),
             PICKUP_FEED_BOX[3] - PICKUP_FEED_BOX[1] - 1,
         ),
         PICKUP_FEED_BOX[2] - PICKUP_FEED_BOX[0],
         min(
-            index * PICKUP_LINE_HEIGHT + PICKUP_LINE_TOP_OFFSET + PICKUP_LINE_HEIGHT,
+            index * PICKUP_LINE_HEIGHT
+            + PICKUP_LINE_TOP_OFFSET
+            + PICKUP_LINE_HEIGHT
+            + PICKUP_LINE_PADDING,
             PICKUP_FEED_BOX[3] - PICKUP_FEED_BOX[1],
         ),
     )

@@ -164,20 +164,41 @@ _POWERSHELL_UPDATER = r'''param(
     [Parameter(Mandatory = $true)][string] $ZipPath,
     [Parameter(Mandatory = $true)][string] $InstallDir,
     [Parameter(Mandatory = $true)][string] $ExeName,
+    [Parameter(Mandatory = $true)][string] $PackageExeName,
     [Parameter(Mandatory = $true)][int] $ProcessId,
     [Parameter(Mandatory = $true)][string] $ScriptPath
 )
 $ErrorActionPreference = "Stop"
+$success = $false
 $stage = Join-Path ([System.IO.Path]::GetTempPath()) ("MapleStoryAnalyzer-update-" + [guid]::NewGuid().ToString("N"))
-$backup = "$InstallDir.previous"
+$backup = "$InstallDir.previous-" + [guid]::NewGuid().ToString("N")
 try {
+    # The app is normally launched with its own install directory as the
+    # process working directory. Windows refuses to move a directory that a
+    # PowerShell process currently has as its working directory, so release
+    # that handle before swapping the one-folder installation.
+    $helperWorkingDir = [System.IO.Path]::GetTempPath()
+    [System.IO.Directory]::SetCurrentDirectory($helperWorkingDir)
+    Set-Location -LiteralPath $helperWorkingDir
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
     Expand-Archive -LiteralPath $ZipPath -DestinationPath $stage -Force
     $package = Join-Path $stage "MapleStoryAnalyzer"
-    if (-not (Test-Path (Join-Path $package $ExeName))) {
+    if (-not (Test-Path -LiteralPath $package)) {
         $package = $stage
     }
-    if (-not (Test-Path (Join-Path $package $ExeName))) {
+    $packageExe = Join-Path $package $PackageExeName
+    if (-not (Test-Path -LiteralPath $packageExe)) {
+        $packageExe = Get-ChildItem -LiteralPath $package -Filter "*.exe" -File |
+            Select-Object -First 1 -ExpandProperty FullName
+    }
+    if (-not $packageExe) {
+        throw "updated package does not contain a Windows executable"
+    }
+    $targetExe = Join-Path $package $ExeName
+    if (-not [string]::Equals($packageExe, $targetExe, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Move-Item -LiteralPath $packageExe -Destination $targetExe
+    }
+    if (-not (Test-Path -LiteralPath $targetExe)) {
         throw "updated package does not contain $ExeName"
     }
 
@@ -189,7 +210,6 @@ try {
         throw "the old application did not exit"
     }
 
-    if (Test-Path $backup) { Remove-Item -LiteralPath $backup -Recurse -Force }
     Move-Item -LiteralPath $InstallDir -Destination $backup
     try {
         Move-Item -LiteralPath $package -Destination $InstallDir
@@ -197,17 +217,24 @@ try {
         Move-Item -LiteralPath $backup -Destination $InstallDir
         throw
     }
-    Start-Process -FilePath (Join-Path $InstallDir $ExeName)
+    Start-Process -FilePath (Join-Path $InstallDir $ExeName) -WorkingDirectory $InstallDir
+    $success = $true
     Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
 } catch {
     $log = Join-Path ([System.IO.Path]::GetTempPath()) "MapleStoryAnalyzer-update-error.txt"
-    (Get-Date -Format o) + " " + $_.Exception.Message | Set-Content -LiteralPath $log -Encoding UTF8
+    (Get-Date -Format o) + " " + $_.Exception.Message + " [InstallDir=$InstallDir]" |
+        Set-Content -LiteralPath $log -Encoding UTF8
+    if ((Test-Path $backup) -and (Test-Path $InstallDir)) {
+        Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
     if ((Test-Path $backup) -and -not (Test-Path $InstallDir)) {
         Move-Item -LiteralPath $backup -Destination $InstallDir -ErrorAction SilentlyContinue
     }
 } finally {
     Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue
+    if ($success) {
+        Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue
+    }
     Remove-Item -LiteralPath $ScriptPath -Force -ErrorAction SilentlyContinue
 }
 '''
@@ -229,12 +256,22 @@ def schedule_update(zip_path: Path) -> None:
         "-ZipPath", str(zip_path),
         "-InstallDir", str(install_dir),
         "-ExeName", executable.name,
+        "-PackageExeName", f"{APP_NAME}.exe",
         "-ProcessId", str(os.getpid()),
         "-ScriptPath", str(script_path),
     ]
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
     try:
-        subprocess.Popen(command, creationflags=creation_flags, close_fds=True)
+        # Do not inherit the app directory as the helper's current directory:
+        # Windows then treats that directory as in use and Move-Item cannot
+        # rename it after the old process exits. A temp working directory also
+        # keeps the detached helper independent of the soon-to-close app.
+        subprocess.Popen(
+            command,
+            cwd=tempfile.gettempdir(),
+            creationflags=creation_flags,
+            close_fds=True,
+        )
     except Exception as exc:
         script_path.unlink(missing_ok=True)
         raise UpdateError("could not start the update helper") from exc

@@ -1,6 +1,13 @@
 import pytest
 
-from maple_analyzer.economy import EconomyTracker, MesosFeedTracker, MesosObservation, parse_mesos_amount, parse_slot_count
+from maple_analyzer.economy import (
+    EconomyTracker,
+    MesosFeedTracker,
+    MesosObservation,
+    mesos_text_needs_full_detection,
+    parse_mesos_amount,
+    parse_slot_count,
+)
 from maple_analyzer.settings import PotionSlotConfig
 
 
@@ -21,6 +28,12 @@ def test_mesos_parser_handles_fullwidth_digits_and_common_ocr_money_glyphs():
     assert parse_mesos_amount("獲取椋略。(＋１，２３４)") == 1234
     assert parse_mesos_amount("取楓略。(+275)") == 275
     assert parse_slot_count("Ctrl ２，６７６") == 2676
+
+
+def test_weak_mesos_fallback_is_confirmed_by_full_feed_detection():
+    assert mesos_text_needs_full_detection("獲取。(+144)") is True
+    assert mesos_text_needs_full_detection("獲取楓幣。(+144)") is False
+    assert mesos_text_needs_full_detection("高級楓之谷通行證Bonus經驗值。(+5)") is True
 
 
 def test_mesos_feed_counts_new_lines_once_while_they_remain_visible():

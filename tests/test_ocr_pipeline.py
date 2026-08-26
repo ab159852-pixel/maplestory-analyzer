@@ -156,6 +156,20 @@ def test_shortcut_full_validation_is_cached_when_fast_value_is_stable():
     assert calls["full"] == 1
 
 
+def test_shortcut_fast_read_uses_recovery_views_only_after_disagreement():
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    readings = iter([
+        ("2893", []),  # raw view has a thin outlined digit ambiguity
+        ("2833", []),  # enlarged view
+        ("2833", []),  # lower-right recovery
+        ("2833", []),  # contrast recovery
+    ])
+    ocr._read_once = lambda _image: next(readings)
+
+    from PIL import Image
+    assert ocr.read_slot_count(Image.new("RGB", (38, 29)), allow_singleton=True, fast=True) == 2833
+
+
 def test_shortcut_positioned_value_wins_over_neighbour_cell_merge():
     ocr = StatPanelOcr.__new__(StatPanelOcr)
     ocr._read_shortcut_slot_counts = lambda *_args: {"6": 26765}

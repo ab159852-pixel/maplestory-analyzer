@@ -155,6 +155,34 @@ def parse_mesos_amount(text: str) -> int | None:
     return value if value >= 0 else None
 
 
+def mesos_text_needs_full_detection(text: str) -> bool:
+    """Return whether a parsed mesos candidate needs a wider OCR check.
+
+    Recognition-only row OCR is intentionally cheap, but it can return a
+    plausible amount after losing the distinctive ``楓幣`` marker (for
+    example ``獲取。(+14)`` when the actual toast says ``+144``).  Treat that
+    fallback as a candidate only: the caller should confirm it with the full
+    notification-feed detector before handing it to the event tracker.  A
+    candidate with a normalized 楓幣 marker is structurally stronger and can
+    stay on the fast path.
+    """
+    if parse_mesos_amount(text) is None:
+        return True
+    compact = re.sub(r"\s+", "", str(text))
+    compact = (
+        compact.replace("楓币", "楓幣")
+        .replace("枫幣", "楓幣")
+        .replace("枫币", "楓幣")
+        .replace("椋幣", "楓幣")
+        .replace("椋币", "楓幣")
+        .replace("楓略", "楓幣")
+        .replace("椋略", "楓幣")
+        .replace("楓弊", "楓幣")
+        .replace("椋弊", "楓幣")
+    )
+    return "楓幣" not in compact
+
+
 def parse_slot_count(text: str) -> int | None:
     """Read the last integer in one configured shortcut-slot crop."""
     normalized = str(text).translate(str.maketrans("０１２３４５６７８９，", "0123456789,"))

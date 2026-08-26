@@ -1,13 +1,15 @@
 """scale_box scaling math -- pure, no images/OCR."""
 from maple_analyzer.regions import (
+    AUXILIARY_BOXES,
     FIELD_BOXES,
     REFERENCE_CLIENT_SIZE,
     STAT_PANEL_BOX,
-    region_transform,
     scale_box,
+    region_transform,
     scale_shortcut_box,
     scale_top_left_box,
 )
+from maple_analyzer.capture import _pickup_boxes_for_client
 
 
 def test_identity_scale_at_reference_size():
@@ -72,3 +74,13 @@ def test_shortcut_grid_is_width_scaled_and_bottom_anchored():
     assert parent.as_tuple() == (927, 617, 1094, 710)
     assert parent.left <= slot.left < slot.right <= parent.right
     assert parent.top <= slot.top < slot.bottom <= parent.bottom
+
+
+def test_wide_client_extends_pickup_feed_to_the_actual_client_edge():
+    client = (1368, 768)
+    boxes = _pickup_boxes_for_client(client)
+    pickup = scale_box(boxes["pickup"], client)
+    reference = scale_box(AUXILIARY_BOXES["pickup"], client)
+
+    assert pickup.right == client[0]
+    assert pickup.right > reference.right

@@ -17,7 +17,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from .economy import parse_mesos_amount, parse_slot_count
+from .economy import mesos_text_needs_full_detection, parse_mesos_amount, parse_slot_count
 from .bar_flash import BarFlashDetector
 from .parser import StatSnapshot, parse_fields
 from .regions import (
@@ -116,6 +116,12 @@ def _line_text(line: object) -> str:
     if isinstance(value, (list, tuple)) and len(value) > 1:
         value = value[1]
     return str(value).strip() if value is not None else ""
+
+
+def _pickup_lines_need_detection(lines: list[tuple[str, float]]) -> bool:
+    """Require feed detection for missing or structurally weak money text."""
+    parsed = [text for text, _ in lines if parse_mesos_amount(text) is not None]
+    return not parsed or any(mesos_text_needs_full_detection(text) for text in parsed)
 
 
 def _clean_context_text(value: str) -> str:
@@ -613,10 +619,7 @@ class BackgroundMonitor:
             )
             for line_id, image in line_images
         ]
-        if (
-            not any(parse_mesos_amount(text) is not None for text, _ in lines)
-            and now >= self._next_pickup_detection
-        ):
+        if _pickup_lines_need_detection(lines) and now >= self._next_pickup_detection:
             self._next_pickup_detection = now + PICKUP_DETECTION_INTERVAL_S
             detected: list[Any] = []
             for key in ("pickup", "pickup_wide"):

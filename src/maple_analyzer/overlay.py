@@ -64,7 +64,12 @@ from .drop_lookup import (
     monster_page_url,
     normalize_map_name,
 )
-from .economy import EconomyTracker, parse_mesos_amount, parse_slot_count
+from .economy import (
+    EconomyTracker,
+    mesos_text_needs_full_detection,
+    parse_mesos_amount,
+    parse_slot_count,
+)
 from .i18n import Lang, t
 from .monitor import BackgroundMonitor
 from .ocr import StatPanelOcr
@@ -1121,11 +1126,16 @@ class OverlayApp:
             self._tabview.set(self._tab_names["live"])
             self._tabview._segmented_button.grid_remove()
         with contextlib.suppress(Exception):
+            # The full app titlebar is useful in the control center, but it is
+            # redundant in the in-game HUD.  Keeping it here made floating
+            # mode render as two stacked bars and wasted vertical space over
+            # the game window.
+            self._window_chrome.pack_forget()
             self._shell.pack_forget()
             self._floating_bar.pack(fill="x", padx=10, pady=10)
             self._window_maximized = False
-            self.root.geometry("1100x170+40+40")
-            self.root.minsize(700, 130)
+            self.root.geometry("1100x110+40+40")
+            self.root.minsize(700, 90)
         with contextlib.suppress(Exception):
             self.root.attributes("-topmost", True)
         self._set_alpha(self._settings.floating_opacity_pct)
@@ -1137,6 +1147,7 @@ class OverlayApp:
         self._floating_mode = False
         with contextlib.suppress(Exception):
             self._floating_bar.pack_forget()
+            self._window_chrome.pack(fill="x", padx=10, pady=(10, 0))
             self._shell.pack(fill="both", expand=True, padx=10, pady=(8, 10))
             self.root.geometry(self._full_geometry)
             self.root.minsize(420, 520)
@@ -2866,10 +2877,15 @@ class OverlayApp:
                     # at most once per second.  This keeps the normal 0.3s
                     # loop fast while making mesos collection resilient to a
                     # small DPI/font/layout offset.
-                    if (
-                        not any(parse_mesos_amount(text) is not None for text, _ in lines)
-                        and now >= self._next_pickup_detection
-                    ):
+                    parsed_mesos = [
+                        text for text, _ in lines
+                        if parse_mesos_amount(text) is not None
+                    ]
+                    needs_detection = (
+                        not parsed_mesos
+                        or any(mesos_text_needs_full_detection(text) for text in parsed_mesos)
+                    )
+                    if needs_detection and now >= self._next_pickup_detection:
                         self._next_pickup_detection = now + PICKUP_DETECTION_MS / 1000
                         detected = []
                         for key in ("pickup", "pickup_wide"):
