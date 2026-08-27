@@ -83,7 +83,9 @@ anything to the game.
   obsidian/sapphire card layout with a scrollable overview and a collapsible
   drop panel, while Start can still switch to the translucent horizontal HUD.
 - **Settings**:
-  - **Window scale** — shrink or grow the whole window with a +/− stepper.
+  - **Window scale** — adjust the whole-window scale live with a +/− stepper.
+    If the current CustomTkinter runtime cannot apply it safely, the UI marks
+    the value for the next launch instead.
   - **Always on top** — toggle whether the HUD stays above the game.
   - **Floating HUD** — optionally hide the tabs, stay on top, and become
     semi-transparent after Start. Opacity is adjustable from 45% to 100%; the
@@ -175,17 +177,17 @@ identically whether started via the .exe or this command.
 
 ## Publish a release (maintainers)
 
-This source currently contains `APP_VERSION = 1.0.19`. For each release, bump
+This source currently contains `APP_VERSION = 1.0.20`. For each release, bump
 `APP_VERSION` in `src/maple_analyzer/version.py`, commit the change, and push a
 matching tag, for example:
 
 ```powershell
-git tag v1.0.19
-git push origin v1.0.19
+git tag v1.0.20
+git push origin v1.0.20
 ```
 
 GitHub Actions installs dependencies, builds
-`MapleStoryAnalyzer-v1.0.19-win64.zip`, writes a SHA-256 checksum, and publishes
+`MapleStoryAnalyzer-v1.0.20-win64.zip`, writes a SHA-256 checksum, and publishes
 the Release automatically. Packaged users will be offered the update next time
 the app starts.
 
@@ -232,8 +234,9 @@ the app starts.
   haven't changed, that's genuinely idle (not a bug). If the pill shows an
   error instead, see the two bullets above.
 - **Text is too small/cramped, or the window is an awkward size.** Settings
-  → Window Scale, use the +/− stepper. There's also a scrollbar in Settings
-  if some options are cut off at very small scales.
+  → Window Scale, use the +/− stepper; it normally applies immediately. If the
+  UI says to restart, reopen the app to apply it safely. There's also a
+  scrollbar in Settings if some options are cut off at very small scales.
 - **Want it to stop covering the game.** Settings → turn off "Always on top,"
   or just move/resize the window like any other.
 - **EXP occasionally pauses for a second before updating.** This is by design:

@@ -1185,25 +1185,144 @@ def _shortcut_numeric_views(
     threshold views remove most coloured artwork and make thin white strokes
     repeatable across a redraw.  The red/green views are especially useful for
     blue MP items, but are also cheap enough to retain as a fallback for any
-    cell.  All views stay inside one measured slot, so no neighbouring quantity
-    can be joined to this number.
+    cell.  Before making those views, crop the detected right-anchored digit
+    run.  MapleStory uses proportional glyph widths: ``1830`` and ``2543``
+    have the same character count but different left edges.  Keeping the
+    complete cell as the primary OCR image makes that movement look like a
+    layout change; the dynamic crop removes only the variable left margin and
+    keeps the right edge stable.  All views stay inside one measured slot, so
+    no neighbouring quantity can be joined to this number.
     """
-    rgb = image.convert("RGB")
+    aligned = _right_aligned_quantity_crop(image)
+    if aligned is image:
+        source = image.convert("RGB")
+        prefix = ""
+    else:
+        source = aligned.convert("RGB")
+        prefix = "aligned-"
+
+    rgb = source
     gray = ImageOps.autocontrast(ImageOps.grayscale(rgb))
     gray_rgb = ImageEnhance.Contrast(gray).enhance(1.35).convert("RGB")
     views: list[tuple[str, Image.Image]] = [
-        ("rgb", rgb),
-        ("gray", gray_rgb),
+        (f"{prefix}rgb", rgb),
+        (f"{prefix}gray", gray_rgb),
     ]
     for threshold in (170, 180):
         white = gray.point(lambda pixel, threshold=threshold: 255 if pixel >= threshold else 0)
-        views.append((f"white{threshold}", white.convert("RGB")))
+        views.append((f"{prefix}white{threshold}", white.convert("RGB")))
     if blue:
         views.extend(
-            (channel.lower(), rgb.getchannel(channel).convert("RGB"))
+            (f"{prefix}{channel.lower()}", rgb.getchannel(channel).convert("RGB"))
             for channel in ("R", "G")
         )
     return views
+
+
+def _right_aligned_quantity_crop(image: Image.Image) -> Image.Image:
+    """Crop a proportional quantity by its actual right-anchored glyph run.
+
+    The game does not reserve four equal character cells for a quantity.  A
+    narrow leading ``1`` moves the left edge of the whole string while the
+    right edge remains at the same place.  This helper deliberately detects
+    only the horizontal extent of the bright, low-chroma glyph run and keeps
+    the complete vertical strip.  It is a geometry normalizer, not a number
+    guesser: if the evidence is too weak or too close to a cell border, the
+    original strip is returned unchanged and the existing multi-view guard
+    remains responsible for rejecting the frame.
+
+    The mask is intentionally conservative.  The quantity's white outline is
+    achromatic, while the item artwork is usually coloured; choosing the
+    rightmost plausible cluster also prevents a bright icon fragment on the
+    left from becoming part of the number.  A small pad protects the first and
+    last anti-aliased strokes without bringing the neighbouring cell into the
+    crop.
+    """
+    width, height = image.size
+    if width <= 4 or height <= 3:
+        return image
+
+    try:
+        import numpy as np
+
+        rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+        if rgb.ndim != 3 or rgb.shape[0] != height or rgb.shape[1] != width:
+            return image
+        # Luma and chroma are enough here; do not run a full connected
+        # component detector on every 0.2–0.3s frame.
+        luma = (
+            rgb[:, :, 0].astype("float32") * 0.299
+            + rgb[:, :, 1].astype("float32") * 0.587
+            + rgb[:, :, 2].astype("float32") * 0.114
+        )
+        chroma = rgb.max(axis=2).astype("int16") - rgb.min(axis=2).astype("int16")
+        y0 = max(0, round(height * 0.05))
+        y1 = min(height, max(y0 + 1, round(height * 0.91)))
+        if y1 - y0 < 3:
+            return image
+
+        masks = (
+            (luma >= 155) & (chroma <= 100),
+            (luma >= 185) & (chroma <= 135),
+        )
+        candidates: list[tuple[float, int, int]] = []
+        max_gap = max(2, round(width * 0.08))
+        for mask in masks:
+            active = mask[y0:y1].sum(axis=0) >= 1
+            # The measured cell boundary and separator are not glyphs.  Never
+            # use their two outer columns as the right anchor.
+            active[:2] = False
+            active[-2:] = False
+            indices = np.flatnonzero(active)
+            if not len(indices):
+                continue
+
+            start = int(indices[0])
+            previous = start
+            runs: list[tuple[int, int]] = []
+            for value in indices[1:]:
+                current = int(value)
+                if current - previous > max_gap:
+                    runs.append((start, previous + 1))
+                    start = current
+                previous = current
+            runs.append((start, previous + 1))
+
+            for left, right in runs:
+                run_width = right - left
+                if run_width < 3 or run_width > max(6, round(width * 0.92)):
+                    continue
+                # A quantity is rendered toward the right side of its cell.
+                # Reject isolated artwork at the far left, but allow a single
+                # narrow digit such as ``1``.
+                if right < round(width * 0.38):
+                    continue
+                area = int(mask[y0:y1, left:right].sum())
+                if area < max(3, round(height * 0.10)):
+                    continue
+                # Rightmost wins first; area is only a tie-breaker for the
+                # two threshold masks. This follows the game's alignment rule.
+                score = float(right) * 10.0 + min(area, 100) * 0.01
+                candidates.append((score, left, right))
+
+        if not candidates:
+            return image
+        _score, left, right = max(candidates)
+        left_pad = max(1, round(width * 0.04))
+        right_pad = max(1, round(width * 0.03))
+        crop_left = max(0, left - left_pad)
+        crop_right = min(width, right + right_pad)
+        if crop_right - crop_left < 3 or crop_right <= crop_left:
+            return image
+        # Do not normalize a candidate that nearly equals the entire cell;
+        # that is usually a border/transition frame, not a useful digit run.
+        if crop_right - crop_left >= round(width * 0.97):
+            return image
+        return image.crop((crop_left, 0, crop_right, height))
+    except Exception:
+        # Numeric OCR must remain available in minimal source environments and
+        # should never fail merely because this optional geometry hint failed.
+        return image
 
 
 def _select_shortcut_numeric_views(
@@ -1233,12 +1352,15 @@ def _select_shortcut_numeric_views(
         return None
 
     threshold_values = Counter(
-        value for value, view_name in values if view_name.startswith("white")
+        value
+        for value, view_name in values
+        if _numeric_view_base_name(view_name).startswith("white")
     )
     colour_values = Counter(
         value
         for value, view_name in values
-        if not view_name.startswith(("white", "soft-"))
+        if not str(view_name).startswith("soft-")
+        and not _numeric_view_base_name(view_name).startswith("white")
     )
     if threshold_values:
         # A threshold candidate is the protected white-glyph interpretation.
@@ -1267,6 +1389,24 @@ def _select_shortcut_numeric_views(
     if best_votes < 2 or len(winners) != 1:
         return None
     return winners[0]
+
+
+def _numeric_view_base_name(view_name: str) -> str:
+    """Remove preprocessing prefixes before classifying a numeric view.
+
+    Dynamic quantity normalization adds ``aligned-`` to the view name.  The
+    selector still needs to recognize ``aligned-white170`` as a protected
+    threshold view and ``aligned-rgb`` as an independent colour view.  Keep
+    this normalization local to the selector so existing cache/test names
+    (``white170``, ``soft-rgb``) remain valid.
+    """
+    name = str(view_name)
+    if name.startswith("soft-"):
+        name = name[5:]
+    for prefix in ("aligned-", "raw-"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+    return name
 
 
 def _select_shortcut_numeric_candidate(

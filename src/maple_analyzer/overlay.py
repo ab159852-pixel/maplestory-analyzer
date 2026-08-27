@@ -426,6 +426,15 @@ class OverlayApp:
         # then rescaled after the fact.
         ctk.set_widget_scaling(self._settings.scale_pct / 100)
         ctk.set_window_scaling(self._settings.scale_pct / 100)
+        # CustomTkinter applies its global scaling callbacks synchronously to
+        # every existing widget. The app uses a frameless root window and a
+        # scrollable settings tree, so changing those globals after the tree
+        # is built can race Tk geometry events and leave the shell clipped.
+        # Keep the applied value so the +/- controls can safely persist a
+        # restart-required preference without pretending to resize live.
+        self._applied_scale_pct = self._settings.scale_pct
+        self._scale_restart_required = False
+        self._scale_apply_job = None
 
         self.root = ctk.CTk()
         install_tk_exception_logging(self.root)
@@ -461,6 +470,7 @@ class OverlayApp:
         self._normal_geometry = self._full_geometry
         self._window_maximized = False
         self._drag_state: tuple[int, int, int, int] | None = None
+        self._borderless_restore_scheduled = False
         self.root.geometry(self._full_geometry)
         self.root.minsize(420, 520)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -585,7 +595,10 @@ class OverlayApp:
         return (family, size, "bold") if bold else (family, size)
 
     def _scale_header_text(self) -> str:
-        return self._t("settings_window_scale") + f" — {self._settings.scale_pct}%"
+        text = self._t("settings_window_scale") + f" — {self._settings.scale_pct}%"
+        if getattr(self, "_scale_restart_required", False):
+            text += f" · {self._t('settings_scale_restart_suffix')}"
+        return text
 
     def _interval_header_text(self) -> str:
         return self._t("settings_session_interval") + f" — {self._settings.window_min} {self._t('unit_min')}"
@@ -1013,10 +1026,22 @@ class OverlayApp:
             widget.bind("<Double-Button-1>", self._toggle_window_maximized, add="+")
 
     def _restore_borderless_window(self, _event=None) -> None:
-        # Windows can reapply decoration after a taskbar restore; asserting the
-        # style on Map keeps the custom frame stable without touching geometry.
+        # Windows can reapply decoration after taskbar restore. Reassert the
+        # style after the Map event has settled; doing it synchronously inside
+        # Map can make the frameless window paint a stale native titlebar
+        # rectangle over the custom chrome. Never touch geometry here.
+        if self._borderless_restore_scheduled:
+            return
+        self._borderless_restore_scheduled = True
+
+        def restore() -> None:
+            self._borderless_restore_scheduled = False
+            with contextlib.suppress(Exception):
+                if self.root.state() != "iconic":
+                    self.root.overrideredirect(True)
+
         with contextlib.suppress(Exception):
-            self.root.overrideredirect(True)
+            self.root.after_idle(restore)
 
     def _start_window_drag(self, event) -> None:
         self._drag_state = (
@@ -2211,19 +2236,84 @@ class OverlayApp:
 
     # ---- settings callbacks ------------------------------------------------
 
+    def _apply_scale_atomically(self, pct: int) -> bool:
+        """Apply both CustomTkinter scale dimensions in one tree walk.
+
+        ``ctk.set_widget_scaling()`` and ``ctk.set_window_scaling()`` each
+        synchronously walk the complete widget tree. Calling them one after
+        the other leaves the frameless root in an intermediate geometry and
+        was the source of the clipped/dead window after pressing the stepper.
+        CustomTkinter exposes the shared tracker in the bundled runtime; set
+        both values first and request one callback pass instead.
+        """
+        tracker = getattr(ctk, "ScalingTracker", None)
+        update_all = getattr(tracker, "update_scaling_callbacks_all", None)
+        if tracker is None or not callable(update_all):
+            return False
+
+        old_widget_scaling = getattr(tracker, "widget_scaling", None)
+        old_window_scaling = getattr(tracker, "window_scaling", None)
+        old_block_state = getattr(self.root, "_block_update_dimensions_event", None)
+        try:
+            # CTk's root normally updates its logical size from Configure
+            # events while callbacks are running. Hold that bookkeeping at
+            # its current logical dimensions until the one-pass update ends.
+            if old_block_state is not None:
+                self.root._block_update_dimensions_event = True
+            factor = pct / 100.0
+            tracker.widget_scaling = factor
+            tracker.window_scaling = factor
+            update_all()
+            with contextlib.suppress(Exception):
+                self.root.update_idletasks()
+            return True
+        except Exception as exc:
+            # If a third-party CustomTkinter build does not tolerate live
+            # scaling, leave the preference saved and let the next launch
+            # apply it before widgets exist. Restoring the tracker values is
+            # safer than leaving future dialogs at a half-updated scale.
+            if old_widget_scaling is not None:
+                tracker.widget_scaling = old_widget_scaling
+            if old_window_scaling is not None:
+                tracker.window_scaling = old_window_scaling
+            log_exception("live scale update failed", exc)
+            return False
+        finally:
+            if old_block_state is not None:
+                with contextlib.suppress(Exception):
+                    self.root._block_update_dimensions_event = old_block_state
+
+    def _apply_pending_scale(self) -> None:
+        self._scale_apply_job = None
+        if getattr(self, "_closing", False):
+            return
+        pct = self._settings.scale_pct
+        if pct == self._applied_scale_pct:
+            self._scale_restart_required = False
+        elif self._apply_scale_atomically(pct):
+            self._applied_scale_pct = pct
+            self._scale_restart_required = False
+        else:
+            self._scale_restart_required = True
+        with contextlib.suppress(Exception):
+            self._scale_header_label.configure(text=self._scale_header_text())
+
     def _on_scale_step(self, delta: int) -> None:
         pct = max(SCALE_MIN_PCT, min(SCALE_MAX_PCT, self._settings.scale_pct + delta))
         if pct == self._settings.scale_pct:
             return
         self._settings.scale_pct = pct
+        self._scale_restart_required = pct != self._applied_scale_pct
         self._scale_header_label.configure(text=self._scale_header_text())
-        # CTk's own scaling knobs: widget_scaling resizes fonts/padding/etc,
-        # window_scaling resizes the geometry set via .geometry() -- both are
-        # needed together, otherwise widgets end up mismatched against the
-        # window size. Both apply live to the already-open root window.
-        factor = pct / 100
-        ctk.set_widget_scaling(factor)
-        ctk.set_window_scaling(factor)
+        # Leave the button callback first, then collapse the two global
+        # changes into one tracker pass. Rapid taps coalesce to the final
+        # selected percentage instead of queueing several full redraws.
+        if self._scale_apply_job is None:
+            try:
+                self._scale_apply_job = self.root.after_idle(self._apply_pending_scale)
+            except Exception as exc:
+                log_exception("schedule live scale update failed", exc)
+                self._scale_restart_required = True
         _maybe_persist_settings(self)
 
     def _on_topmost_changed(self) -> None:

@@ -164,6 +164,10 @@ _STRINGS: dict[str, dict[Lang, str]] = {
     },
 
     "settings_window_scale": {"en": "WINDOW SCALE", "zh": "視窗縮放"},
+    "settings_scale_restart_suffix": {
+        "en": "restart to apply",
+        "zh": "重新啟動後套用",
+    },
     "settings_always_on_top": {"en": "Always on top", "zh": "永遠置頂"},
     "settings_session_interval": {"en": "SESSION INTERVAL", "zh": "紀錄區間"},
     "settings_context": {"en": "GAME CONTEXT", "zh": "遊戲資訊"},

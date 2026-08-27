@@ -210,6 +210,53 @@ def test_shortcut_numeric_views_prefer_clean_threshold_consensus_and_reject_conf
     ) is None
 
 
+def test_shortcut_numeric_views_keep_aligned_prefixes_in_the_same_vote_families():
+    """A dynamically cropped view must still count as threshold/colour OCR."""
+    assert ocr_module._select_shortcut_numeric_views(
+        [
+            (1830, "aligned-white170"),
+            (1830, "aligned-white180"),
+            (1830, "aligned-rgb"),
+        ],
+        previous=None,
+    ) == 1830
+
+
+def test_right_aligned_quantity_crop_follows_the_glyph_run_width():
+    """A leading 1 may be narrow, but both strings share the same right edge."""
+    from PIL import Image, ImageDraw
+
+    def make_quantity(glyph_ranges):
+        image = Image.new("RGB", (40, 20), (20, 20, 20))
+        draw = ImageDraw.Draw(image)
+        # White blocks stand in for the connected vertical strokes of the
+        # outlined game digits.  One coloured fragment on the left must not
+        # become the quantity's left anchor.
+        draw.rectangle((1, 4, 5, 13), fill=(255, 40, 40))
+        for left, right in glyph_ranges:
+            draw.rectangle((left, 4, right, 14), fill=(235, 235, 235))
+        return image
+
+    wide = make_quantity(((7, 11), (14, 18), (21, 25), (28, 33)))
+    narrow_leading_one = make_quantity(((16, 17), (20, 24), (26, 29), (31, 33)))
+
+    wide_crop = ocr_module._right_aligned_quantity_crop(wide)
+    narrow_crop = ocr_module._right_aligned_quantity_crop(narrow_leading_one)
+
+    assert wide_crop.width > narrow_crop.width
+    assert wide_crop.width < wide.width
+    assert narrow_crop.width < narrow_leading_one.width
+    # The right-anchored glyph remains near the same right edge after the
+    # variable left margin is removed.
+    for crop in (wide_crop, narrow_crop):
+        bright_columns = [
+            x for x in range(crop.width)
+            if any(crop.getpixel((x, y))[0] > 180 for y in range(crop.height))
+        ]
+        assert bright_columns
+        assert bright_columns[-1] >= crop.width - 4
+
+
 def test_shortcut_numeric_batch_accepts_clean_views_and_rejects_large_jump():
     class FakeNumeric:
         def __init__(self, values):
