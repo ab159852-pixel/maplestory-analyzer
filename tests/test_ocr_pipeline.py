@@ -187,11 +187,29 @@ def test_shortcut_numeric_model_wins_over_plausible_general_ocr_value():
     """A numeric cell read must not be overwritten by a whole-cell text read."""
     ocr = StatPanelOcr.__new__(StatPanelOcr)
     ocr._numeric_engine = object()
-    ocr._read_numeric_field = lambda _image: "1487"
+    ocr._read_shortcut_numeric_field = lambda _image: "1487"
     ocr._read_once = lambda _image: ("1467", [])
 
     from PIL import Image
     assert ocr._read_shortcut_once(Image.new("RGB", (38, 20)))[0] == "1487"
+
+
+def test_digit_only_ctc_decoder_keeps_a_four_digit_quantity_sequence():
+    import numpy as np
+
+    from maple_analyzer.numeric_ocr import _decode_digit_only
+
+    rows = []
+    blank = np.full(11, 0.001, dtype="float32")
+    blank[0] = 0.996
+    for class_index in (1, 2, 4, 10):  # 0, 1, 3, 9
+        row = np.full(11, 0.001, dtype="float32")
+        row[class_index] = 0.996
+        rows.extend((row, row, blank, blank))
+
+    text, confidence = _decode_digit_only(np.stack(rows), max_digits=4)
+    assert text == "0139"
+    assert confidence > 0.5
 
 
 def test_shortcut_numeric_views_prefer_clean_threshold_consensus_and_reject_conflict():
@@ -207,6 +225,26 @@ def test_shortcut_numeric_views_prefer_clean_threshold_consensus_and_reject_conf
             (3204, "white170"), (3204, "white180"),
         ],
         previous=None,
+    ) is None
+    # A matching threshold/colour majority is still unsafe when another
+    # same-width colour view sees a different digit string (920 vs 320).
+    assert ocr_module._select_shortcut_numeric_views(
+        [
+            (320, "gray"), (320, "r"), (920, "rgb"),
+            (320, "white170"), (320, "white180"),
+        ],
+        previous=None,
+    ) is None
+    assert ocr_module._select_shortcut_colour_recovery(
+        [(920, "rgb"), (920, "gray"), (920, "r"), (920, "g"),
+         (320, "white170")],
+        previous=None,
+        minimum_votes=3,
+    ) == 920
+    assert ocr_module._select_shortcut_colour_recovery(
+        [(920, "rgb"), (320, "gray"), (920, "r"), (920, "g")],
+        previous=None,
+        minimum_votes=3,
     ) is None
 
 
@@ -298,6 +336,38 @@ def test_shortcut_numeric_views_keep_aligned_prefixes_in_the_same_vote_families(
         ],
         previous=None,
     ) == 1830
+
+
+def test_shortcut_numeric_batch_uses_colour_recovery_for_a_three_digit_cell():
+    """A frame-border conflict may recover 920 without trusting threshold 320."""
+    from PIL import Image
+
+    class Numeric:
+        def read_digit_fields(self, images, *, max_digits=4):
+            result = {}
+            for name in images:
+                view = name.rsplit(":", 1)[-1]
+                if name.startswith("shortcut-recovery:"):
+                    result[name] = "920" if view in {
+                        "raw-rgb", "raw-gray", "raw-r", "raw-g"
+                    } else "320"
+                else:
+                    result[name] = {
+                        "raw-rgb": "920",
+                        "raw-gray": "320",
+                        "raw-white170": "3204",
+                        "raw-white180": "3204",
+                    }.get(view, "")
+            return result
+
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._numeric_engine = Numeric()
+    image = Image.new("RGB", (39, 36))
+    assert ocr._read_shortcut_numeric_batch(
+        {"8": ("8", image)},
+        blue_slot_ids={"8"},
+        previous_counts={},
+    ) == {"8": 920}
 
 
 def test_shortcut_layout_pattern_tracks_every_narrow_one_without_fixed_slots():

@@ -224,6 +224,21 @@ class StatPanelOcr:
             self._numeric_engine = None
             return ""
 
+    def _read_shortcut_numeric_field(self, image: Image.Image) -> str:
+        """Read one isolated shortcut quantity through the digit-only path."""
+        numeric_engine = getattr(self, "_numeric_engine", None)
+        if numeric_engine is None:
+            return ""
+        reader = getattr(numeric_engine, "read_digit_fields", None)
+        try:
+            if callable(reader):
+                return reader({"field": image}, max_digits=4).get("field", "")
+            # Compatibility for older portable builds and test doubles.
+            return numeric_engine.read_fields({"field": image}).get("field", "")
+        except Exception:
+            self._numeric_engine = None
+            return ""
+
     def reset_shortcut_cache(self) -> None:
         """Forget shortcut pixels when a new session or slot mapping starts.
 
@@ -251,7 +266,7 @@ class StatPanelOcr:
         model.  The previous order let a plausible but wrong RapidOCR value
         such as 1467 overwrite the numeric model's 1487.
         """
-        numeric_text = self._read_numeric_field(image)
+        numeric_text = self._read_shortcut_numeric_field(image)
         if _numeric_shortcut_text_is_usable(numeric_text):
             return numeric_text, []
         text, records = self._read_once(image)
@@ -781,7 +796,12 @@ class StatPanelOcr:
         if not batch:
             return {}
         try:
-            texts = numeric_engine.read_fields(batch)
+            digit_reader = getattr(numeric_engine, "read_digit_fields", None)
+            if callable(digit_reader):
+                texts = digit_reader(batch, max_digits=4)
+            else:
+                # Compatibility for older portable builds and test doubles.
+                texts = numeric_engine.read_fields(batch)
         except Exception:
             # Keep the instance usable with the RapidOCR fallback. The next
             # call will not attempt the broken ONNX session again.
@@ -813,6 +833,68 @@ class StatPanelOcr:
             )
             if selected is not None:
                 result[slot_id] = selected
+
+        # A three-digit quantity can leave the bottom-right frame stroke in
+        # the normal strip.  Do not pay for a second crop on healthy cells;
+        # only retry unresolved configured cells with a slightly taller view.
+        # The recovery path is intentionally colour-only and requires every
+        # independent colour view to agree, so it cannot turn a threshold
+        # majority into a guessed quantity.
+        recovery_pending = {
+            slot_id: item
+            for slot_id, item in pending.items()
+            if slot_id not in result
+        }
+        if recovery_pending:
+            recovery_batch: dict[str, Image.Image] = {}
+            recovery_owners: dict[str, str] = {}
+            for _slot_key, (slot_id, crop) in recovery_pending.items():
+                strip = _shortcut_quantity_recovery_strip(crop)
+                if strip.width <= 1 or strip.height <= 1:
+                    continue
+                for view_name, view in _shortcut_numeric_views(
+                    strip,
+                    blue=slot_id in blue_slot_ids,
+                ):
+                    key = f"shortcut-recovery:{slot_id}:{view_name}"
+                    recovery_batch[key] = view
+                    recovery_owners[key] = slot_id
+            if recovery_batch:
+                try:
+                    digit_reader = getattr(numeric_engine, "read_digit_fields", None)
+                    if callable(digit_reader):
+                        recovery_texts = digit_reader(
+                            recovery_batch,
+                            max_digits=4,
+                        )
+                    else:
+                        recovery_texts = numeric_engine.read_fields(recovery_batch)
+                except Exception:
+                    recovery_texts = {}
+                recovery_candidates: dict[str, list[tuple[int, str]]] = {}
+                for key, text in recovery_texts.items():
+                    if not _numeric_shortcut_text_is_usable(text):
+                        continue
+                    value = _extract_shortcut_count(text)
+                    if value is None:
+                        continue
+                    view_name = key.rsplit(":", 1)[-1]
+                    if not _numeric_shortcut_text_is_clean(text):
+                        view_name = f"soft-{view_name}"
+                    recovery_candidates.setdefault(
+                        recovery_owners.get(key, ""),
+                        [],
+                    ).append((value, view_name))
+                for slot_id, values in recovery_candidates.items():
+                    if not slot_id:
+                        continue
+                    selected = _select_shortcut_colour_recovery(
+                        values,
+                        previous=(previous_counts or {}).get(slot_id),
+                        minimum_votes=3 if slot_id in blue_slot_ids else 2,
+                    )
+                    if selected is not None:
+                        result[slot_id] = selected
         return result
 
     def _read_shortcut_quantity_strip(
@@ -847,7 +929,7 @@ class StatPanelOcr:
         numeric_available = getattr(self, "_numeric_engine", None) is not None
         for view_name, variant in numeric_views:
             try:
-                numeric_text = self._read_numeric_field(variant)
+                numeric_text = self._read_shortcut_numeric_field(variant)
             except Exception:
                 numeric_text = ""
             if _numeric_shortcut_text_is_usable(numeric_text):
@@ -862,15 +944,40 @@ class StatPanelOcr:
             # recognizer override it with a plausible keyboard-label read.
             # If the numeric views disagree, return no value and let the
             # temporal/economy layer wait for a clean frame.
-            return _select_shortcut_numeric_views(
+            selected = _select_shortcut_numeric_views(
                 numeric_candidates,
                 previous=previous,
             )
+            if selected is not None:
+                return selected
 
         # Once the numeric engine is loaded, a blank numeric frame must remain
         # blank.  Letting general RapidOCR fill it from a keyboard label or an
         # item-artifact number would defeat the cross-view guard above.
         if numeric_available:
+            recovery_strip = _shortcut_quantity_recovery_strip(image)
+            recovery_candidates: list[tuple[int, str]] = []
+            for view_name, variant in _shortcut_numeric_views(
+                recovery_strip,
+                blue=blue,
+            ):
+                try:
+                    numeric_text = self._read_shortcut_numeric_field(variant)
+                except Exception:
+                    numeric_text = ""
+                if _numeric_shortcut_text_is_usable(numeric_text):
+                    value = _extract_shortcut_count(numeric_text)
+                    if value is not None:
+                        if not _numeric_shortcut_text_is_clean(numeric_text):
+                            view_name = f"soft-{view_name}"
+                        recovery_candidates.append((value, view_name))
+            recovered = _select_shortcut_colour_recovery(
+                recovery_candidates,
+                previous=previous,
+                minimum_votes=3 if blue else 2,
+            )
+            if recovered is not None:
+                return recovered
             return None
 
         candidates: list[int] = []
@@ -1250,23 +1357,14 @@ def _shortcut_numeric_views(
     threshold views remove most coloured artwork and make thin white strokes
     repeatable across a redraw.  The red/green views are especially useful for
     blue MP items, but are also cheap enough to retain as a fallback for any
-    cell.  Before making those views, crop the detected right-anchored digit
-    run.  MapleStory uses proportional glyph widths: ``1830`` and ``2543``
-    have the same character count but different left edges.  Keeping the
-    complete cell as the primary OCR image makes that movement look like a
-    layout change; the dynamic crop removes only the variable left margin and
-    keeps the right edge stable.  All views stay inside one measured slot, so
-    no neighbouring quantity can be joined to this number.
+    cell.  Keep the complete measured strip as the live input: the game uses
+    proportional glyph widths, so the left edge moves when a quantity contains
+    a narrow ``1``.  The previous dynamic bright-pixel crop changed the aspect
+    ratio before OCR and made a small outlined ``3`` unstable; it remains
+    available as a diagnostic helper, but must not be the primary live view.
     """
-    aligned = _right_aligned_quantity_crop(image)
-    if aligned is image:
-        source = image.convert("RGB")
-        prefix = ""
-    else:
-        source = aligned.convert("RGB")
-        prefix = "aligned-"
-
-    rgb = source
+    rgb = image.convert("RGB")
+    prefix = "raw-"
     gray = ImageOps.autocontrast(ImageOps.grayscale(rgb))
     gray_rgb = ImageEnhance.Contrast(gray).enhance(1.35).convert("RGB")
     views: list[tuple[str, Image.Image]] = [
@@ -1282,25 +1380,6 @@ def _shortcut_numeric_views(
             for channel in ("R", "G")
         )
 
-    # A known four-digit quantity gives us a safe layout hypothesis.  Maple's
-    # digit ``1`` is narrower, but the string remains right aligned; the
-    # hypothesis therefore changes only the left safety margin and never the
-    # right edge. Keep it as an independent corroboration view instead of
-    # replacing the full/detected crop, so a bad previous OCR value cannot
-    # cut the real number out of every view.
-    pattern_crop = _shortcut_pattern_quantity_crop(image, layout_hint)
-    if pattern_crop is not None:
-        pattern_rgb = pattern_crop.convert("RGB")
-        pattern_gray = ImageOps.autocontrast(ImageOps.grayscale(pattern_rgb))
-        pattern_white = pattern_gray.point(
-            lambda pixel: 175 if pixel >= 175 else 0
-        ).convert("RGB")
-        views.extend(
-            (
-                ("layout-rgb", pattern_rgb),
-                ("layout-white175", pattern_white),
-            )
-        )
     return views
 
 
@@ -1534,6 +1613,19 @@ def _select_shortcut_numeric_views(
             # intentionally rejected rather than resolved by vote count.
             if colour_values.get(threshold_value, 0) <= 0:
                 return None
+            # Do not let a majority of colour preprocessings hide a
+            # same-width disagreement.  This is the failure mode behind a
+            # real 920 being promoted to 320: three views see 320 while the
+            # untouched RGB view sees 920.  Both are syntactically valid, so
+            # neither voting nor a magnitude heuristic is safe.  Returning
+            # None keeps the previous trusted quantity and avoids a false
+            # inventory change/cost event.
+            if any(
+                value != threshold_value
+                and len(str(value)) == len(str(threshold_value))
+                for value in colour_values
+            ):
+                return None
         elif best_threshold_votes < 2:
             return None
         return threshold_value
@@ -1545,6 +1637,44 @@ def _select_shortcut_numeric_views(
     if best_votes < 2 or len(winners) != 1:
         return None
     return winners[0]
+
+
+def _select_shortcut_colour_recovery(
+    candidates: Iterable[tuple[int, str]],
+    *,
+    previous: int | None,
+    minimum_votes: int,
+) -> int | None:
+    """Select a fallback quantity only when all hard colour views agree.
+
+    The fallback crop is used after the normal threshold/colour families
+    conflict.  It may recover a three-digit value whose last glyph is followed
+    by the frame border, but it must not resolve two equally plausible digit
+    strings by majority vote.  Soft punctuation results and white-threshold
+    views are deliberately excluded from this recovery family.
+    """
+    values = [
+        (value, str(view_name))
+        for value, view_name in candidates
+        if isinstance(value, int)
+        and 0 <= value <= MAX_SHORTCUT_QUANTITY
+        and not str(view_name).startswith("soft-")
+        and not _numeric_view_base_name(view_name).startswith("white")
+    ]
+    if not values:
+        return None
+    counts = Counter(value for value, _view_name in values)
+    if len(counts) != 1:
+        return None
+    value, votes = next(iter(counts.items()))
+    if votes < max(2, int(minimum_votes)):
+        return None
+    if previous is not None and not _shortcut_numeric_transition_is_usable(
+        previous,
+        value,
+    ):
+        return None
+    return value
 
 
 def _numeric_view_base_name(view_name: str) -> str:
@@ -1655,6 +1785,22 @@ def _shortcut_quantity_strip(image: Image.Image) -> Image.Image:
     # quantity can occupy those final pixels (the old proportional trim was
     # exactly why values such as ``1570`` could become ``157``/``57``).
     return image.crop((0, top, width, bottom))
+
+
+def _shortcut_quantity_recovery_strip(image: Image.Image) -> Image.Image:
+    """Return a taller retry strip for an unresolved quantity.
+
+    At the reference scale the normal 45%-95% strip is the best four-digit
+    envelope.  A three-digit value can nevertheless be classified more
+    cleanly when the crop includes the lower frame and starts a little higher;
+    this view is therefore only a conflict recovery, never the primary OCR
+    input.
+    """
+    width, height = image.size
+    if width <= 1 or height <= 1:
+        return image.crop((0, 0, max(1, width), max(1, height)))
+    top = max(0, min(height - 1, round(height * 0.40)))
+    return image.crop((0, top, width, height))
 
 
 def _shortcut_crop_signature(image: Image.Image) -> tuple:

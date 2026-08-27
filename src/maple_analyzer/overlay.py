@@ -859,7 +859,7 @@ class OverlayApp:
                         self._set_update_status("update_status_cancelled")
                         continue
                     try:
-                        schedule_update(path)
+                        schedule_update(path, expected_version=info.version)
                     except UpdateError as exc:
                         self._set_update_button_busy(False)
                         self._set_update_status("update_status_error", detail=str(exc), color=HP_COLOR)
@@ -2008,6 +2008,15 @@ class OverlayApp:
         )
         self._lang_button.set("中文" if self._settings.language == "zh" else "EN")
         self._lang_button.pack(side="right")
+
+        self._running_version_label = ctk.CTkLabel(
+            window_card, anchor="w", text_color=INK_FAINT,
+        )
+        self._running_version_label.pack(fill="x", padx=12, pady=(0, 5))
+        self._i18n(self._running_version_label, "settings_current_version", size=9)
+        self._running_version_label.configure(
+            text=self._t("settings_current_version", version=APP_VERSION)
+        )
 
         self._update_button = ctk.CTkButton(
             window_card, command=self._on_check_updates_clicked,

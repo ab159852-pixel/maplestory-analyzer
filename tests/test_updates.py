@@ -4,7 +4,12 @@ from io import BytesIO
 import inspect
 import zipfile
 
-from maple_analyzer.updates import _POWERSHELL_UPDATER, _safe_archive_members, parse_latest_release
+from maple_analyzer.updates import (
+    _POWERSHELL_UPDATER,
+    _archive_release_version,
+    _safe_archive_members,
+    parse_latest_release,
+)
 
 
 def _release_payload(*, tag: str = "v1.0.5") -> dict:
@@ -65,8 +70,20 @@ def test_archive_members_reject_zip_slip_and_require_app_executable():
         assert not _safe_archive_members(archive)
 
 
+def test_release_marker_must_be_read_from_a_single_archive_member():
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("MapleStoryAnalyzer/MapleStoryAnalyzer.exe", b"exe")
+        archive.writestr("MapleStoryAnalyzer/release-version.txt", "1.0.26")
+    with zipfile.ZipFile(BytesIO(buffer.getvalue())) as archive:
+        assert _archive_release_version(archive) == "1.0.26"
+
+
 def test_updater_handles_renamed_exe_and_records_transaction_progress():
     assert "$PackageExeName" in _POWERSHELL_UPDATER
+    assert "$ExpectedVersion" in _POWERSHELL_UPDATER
+    assert "package-version-verified" in _POWERSHELL_UPDATER
+    assert "new-install-ready" in _POWERSHELL_UPDATER
     assert "SetCurrentDirectory($helperWorkingDir)" in _POWERSHELL_UPDATER
     assert "Start-Process -FilePath $targetExe -WorkingDirectory $InstallDir -PassThru" in _POWERSHELL_UPDATER
     assert "$StatusPath" in _POWERSHELL_UPDATER

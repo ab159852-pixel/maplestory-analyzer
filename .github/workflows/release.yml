@@ -44,6 +44,14 @@ jobs:
       - name: Build one-folder executable
         run: python -m PyInstaller --noconfirm scripts/maple_analyzer.spec
 
+      - name: Stamp packaged release version
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = "src"
+          $version = (python -c "from maple_analyzer.version import APP_VERSION; print(APP_VERSION)").Trim()
+          $package = Join-Path "dist" "MapleStoryAnalyzer"
+          Set-Content -LiteralPath (Join-Path $package "release-version.txt") -Value $version -Encoding ascii
+
       - name: Verify packaged runtime assets
         shell: pwsh
         run: |
@@ -51,6 +59,15 @@ jobs:
           $exe = Join-Path $package "MapleStoryAnalyzer.exe"
           if (-not (Test-Path -LiteralPath $exe)) {
             throw "PyInstaller output is missing $exe"
+          }
+          $versionFile = Join-Path $package "release-version.txt"
+          $expected = "${env:GITHUB_REF_NAME}".TrimStart('v')
+          if (-not (Test-Path -LiteralPath $versionFile)) {
+            throw "Packaged release-version.txt is missing"
+          }
+          $actual = (Get-Content -LiteralPath $versionFile -Raw).Trim()
+          if ($actual -ne $expected) {
+            throw "Packaged version is $actual, expected $expected"
           }
           $themeCandidates = @(
             (Join-Path $package "_internal\customtkinter\assets\themes\blue.json"),

@@ -130,6 +130,23 @@ def _safe_archive_members(archive: zipfile.ZipFile) -> bool:
     return any(Path(name).name.casefold() == f"{APP_NAME.lower()}.exe" for name in names)
 
 
+def _archive_release_version(archive: zipfile.ZipFile) -> str | None:
+    """Read the release marker placed beside the packaged executable."""
+    candidates = [
+        member
+        for member in archive.infolist()
+        if not member.is_dir()
+        and Path(member.filename).name.casefold() == "release-version.txt"
+    ]
+    if len(candidates) != 1:
+        return None
+    try:
+        value = archive.read(candidates[0]).decode("ascii").strip()
+    except (UnicodeDecodeError, OSError, RuntimeError):
+        return None
+    return value if _VERSION_RE.fullmatch(value) else None
+
+
 def download_update(info: UpdateInfo, *, timeout: float = 60.0) -> Path:
     """Download and verify one release zip into the user's temporary folder."""
     safe_version = re.sub(r"[^0-9A-Za-z._-]+", "_", info.version)
@@ -156,6 +173,11 @@ def download_update(info: UpdateInfo, *, timeout: float = 60.0) -> Path:
         with zipfile.ZipFile(temporary_path) as archive:
             if not _safe_archive_members(archive) or archive.testzip() is not None:
                 raise UpdateError("update archive is invalid")
+            package_version = _archive_release_version(archive)
+            if package_version != info.version:
+                raise UpdateError(
+                    "update package version does not match the selected release"
+                )
     except Exception:
         temporary_path.unlink(missing_ok=True)
         raise
@@ -167,6 +189,7 @@ _POWERSHELL_UPDATER = r'''param(
     [Parameter(Mandatory = $true)][string] $InstallDir,
     [Parameter(Mandatory = $true)][string] $ExeName,
     [Parameter(Mandatory = $true)][string] $PackageExeName,
+    [Parameter(Mandatory = $true)][string] $ExpectedVersion,
     [Parameter(Mandatory = $true)][int] $ProcessId,
     [Parameter(Mandatory = $true)][string] $ScriptPath,
     [Parameter(Mandatory = $true)][string] $StatusPath
@@ -191,7 +214,7 @@ try {
     $helperWorkingDir = [System.IO.Path]::GetTempPath()
     [System.IO.Directory]::SetCurrentDirectory($helperWorkingDir)
     Set-Location -LiteralPath $helperWorkingDir
-    Write-UpdateStatus ("helper-start install=" + $InstallDir + " exe=" + $ExeName)
+    Write-UpdateStatus ("helper-start install=" + $InstallDir + " exe=" + $ExeName + " expected=" + $ExpectedVersion)
     if (-not (Test-Path -LiteralPath $ZipPath)) {
         throw "update archive does not exist: $ZipPath"
     }
@@ -209,6 +232,15 @@ try {
     if (-not $packageExe) {
         throw "updated package does not contain a Windows executable"
     }
+    $packageVersionFile = Join-Path $package "release-version.txt"
+    if (-not (Test-Path -LiteralPath $packageVersionFile)) {
+        throw "updated package is missing release-version.txt"
+    }
+    $packageVersion = (Get-Content -LiteralPath $packageVersionFile -Raw).Trim()
+    if (-not [string]::Equals($packageVersion, $ExpectedVersion, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "updated package version $packageVersion does not match expected $ExpectedVersion"
+    }
+    Write-UpdateStatus ("package-version-verified version=" + $packageVersion)
     $targetExe = Join-Path $package $ExeName
     if (-not [string]::Equals($packageExe, $targetExe, [System.StringComparison]::OrdinalIgnoreCase)) {
         Move-Item -LiteralPath $packageExe -Destination $targetExe
@@ -239,7 +271,15 @@ try {
     if (-not (Test-Path -LiteralPath $targetExe)) {
         throw "installed package does not contain $targetExe"
     }
-    Write-UpdateStatus ("new-install-ready path=" + $targetExe)
+    $installedVersionFile = Join-Path $InstallDir "release-version.txt"
+    if (-not (Test-Path -LiteralPath $installedVersionFile)) {
+        throw "installed package is missing release-version.txt"
+    }
+    $installedVersion = (Get-Content -LiteralPath $installedVersionFile -Raw).Trim()
+    if (-not [string]::Equals($installedVersion, $ExpectedVersion, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "installed package version $installedVersion does not match expected $ExpectedVersion"
+    }
+    Write-UpdateStatus ("new-install-ready path=" + $targetExe + " version=" + $installedVersion)
     $newProcess = Start-Process -FilePath $targetExe -WorkingDirectory $InstallDir -PassThru
     # Starting a process is not proof that the one-folder package is usable.
     # Keep the old folder until the new process survives its import/theme/Tk
@@ -251,7 +291,7 @@ try {
         }
         Start-Sleep -Milliseconds 250
     }
-    Write-UpdateStatus ("new-process-started pid=" + $newProcess.Id)
+    Write-UpdateStatus ("new-process-started pid=" + $newProcess.Id + " version=" + $ExpectedVersion)
     $success = $true
     Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
     Write-UpdateStatus "update-success"
@@ -283,7 +323,7 @@ try {
 '''
 
 
-def schedule_update(zip_path: Path) -> None:
+def schedule_update(zip_path: Path, *, expected_version: str) -> None:
     """Start the detached updater and return; caller should then exit."""
     if sys.platform != "win32" or not getattr(sys, "frozen", False):
         raise UpdateError("automatic installation is available only in the packaged Windows app")
@@ -306,6 +346,7 @@ def schedule_update(zip_path: Path) -> None:
         "-InstallDir", str(install_dir),
         "-ExeName", executable.name,
         "-PackageExeName", f"{APP_NAME}.exe",
+        "-ExpectedVersion", expected_version,
         "-ProcessId", str(os.getpid()),
         "-ScriptPath", str(script_path),
         "-StatusPath", str(status_path),

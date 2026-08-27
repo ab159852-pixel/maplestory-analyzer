@@ -231,6 +231,7 @@ _STRINGS: dict[str, dict[Lang, str]] = {
     "settings_both_short": {"en": "HP/MP", "zh": "HP/MP"},
 
     "update_title": {"en": "MapleStoryAnalyzer update", "zh": "MapleStoryAnalyzer 更新"},
+    "settings_current_version": {"en": "Running version {version}", "zh": "目前執行版本 {version}"},
     "update_available": {
         "en": "Version {version} is available (current {current}).\n\nRelease notes:\n{notes}\n\nDownload it now?",
         "zh": "發現新版本 {version}（目前版本 {current}）。\n\n更新內容：\n{notes}\n\n現在下載嗎？",
