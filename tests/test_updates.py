@@ -80,6 +80,16 @@ def test_updater_does_not_use_detached_process_for_powershell():
     from maple_analyzer import updates
 
     source = inspect.getsource(updates.schedule_update)
-    assert 'creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)' in source
+    assert 'getattr(subprocess, "CREATE_NO_WINDOW", 0)' in source
+    assert 'getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)' in source
     assert ' | getattr(subprocess, "DETACHED_PROCESS", 0)' not in source
     assert '"launcher-start\\n"' in source
+
+
+def test_updater_requires_helper_start_ack_before_app_exit():
+    from maple_analyzer import updates
+
+    source = inspect.getsource(updates.schedule_update)
+    assert '"helper-start" in status' in source
+    assert 'update helper did not acknowledge startup' in source
+    assert 'helper.terminate()' in source

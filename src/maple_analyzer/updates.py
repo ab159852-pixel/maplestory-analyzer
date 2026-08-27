@@ -8,6 +8,7 @@ swaps the application folder, and starts the new executable.
 """
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 import hashlib
 import json
@@ -17,6 +18,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, Mapping
 from urllib.request import Request, urlopen
 import zipfile
@@ -313,8 +315,13 @@ def schedule_update(zip_path: Path) -> None:
     # without executing ``-File`` at all; the app then closes while the ZIP
     # and updater script remain untouched.  CREATE_NO_WINDOW is sufficient
     # to keep the helper invisible and, unlike DETACHED_PROCESS, actually
-    # runs the script and survives the parent application's exit.
-    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    # runs the script and survives the parent application's exit.  A new
+    # process group also makes the helper independent of the app's console
+    # lifetime without detaching its standard process creation semantics.
+    creation_flags = (
+        getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    )
     try:
         # Do not inherit the app directory as the helper's current directory:
         # Windows then treats that directory as in use and Move-Item cannot
@@ -331,10 +338,28 @@ def schedule_update(zip_path: Path) -> None:
             close_fds=True,
         )
         # Popen returning only proves that CreateProcess accepted the
-        # command.  A fast failure is still useful to surface before the app
-        # exits, instead of leaving the user with a silent no-op.
-        if helper.poll() is not None:
-            raise UpdateError("update helper exited before installation started")
+        # command.  Wait briefly for the PowerShell helper to acknowledge
+        # that it actually entered the script.  This prevents the app from
+        # closing after a silent CreateProcess/PowerShell failure.  The
+        # helper keeps writing the detailed transaction log after this
+        # acknowledgement while the current process exits.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                status = status_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                status = ""
+            if "helper-start" in status:
+                return
+            exit_code = helper.poll()
+            if exit_code is not None:
+                raise UpdateError(
+                    f"update helper exited before installation started (code {exit_code})"
+                )
+            time.sleep(0.05)
+        with contextlib.suppress(Exception):
+            helper.terminate()
+        raise UpdateError("update helper did not acknowledge startup")
     except Exception as exc:
         script_path.unlink(missing_ok=True)
         if isinstance(exc, UpdateError):
