@@ -263,6 +263,31 @@ def test_shortcut_fast_path_uses_latest_fast_cache_as_previous_value():
     ) == {"7": 1359}
 
 
+def test_shortcut_full_validation_keeps_trusted_value_after_configuration_change():
+    # The first full pass after Settings changes the enabled-cell signature
+    # used to skip the stable-signature merge.  That allowed 1351 -> 1951 to
+    # become the new displayed quantity even though 1351 was already trusted.
+    from PIL import Image
+
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._numeric_engine = object()
+    ocr._shortcut_last_full_counts = {}
+    ocr._shortcut_last_fast_counts = {"7": 1351}
+    ocr._shortcut_last_validation_at = 1.0
+    ocr._shortcut_validation_signature = (("1",), ())
+    ocr._shortcut_last_cell_signatures = {}
+    ocr._shortcut_last_cell_values = {}
+    ocr._read_shortcut_slot_counts = lambda *_args, **_kwargs: {"7": 1951}
+    ocr._shortcut_counts_from_records = lambda *_args, **_kwargs: {}
+    ocr.read_lines = lambda _image: []
+
+    assert ocr.read_shortcut_counts(
+        Image.new("RGB", (147, 77)),
+        {"7"},
+        allow_full_validation=True,
+    ) == {"7": 1351}
+
+
 def test_shortcut_numeric_views_keep_aligned_prefixes_in_the_same_vote_families():
     """A dynamically cropped view must still count as threshold/colour OCR."""
     assert ocr_module._select_shortcut_numeric_views(

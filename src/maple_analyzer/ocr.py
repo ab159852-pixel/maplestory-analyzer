@@ -575,7 +575,13 @@ class StatPanelOcr:
                     # sharpened view recovers leading digits that the original
                     # missed.
                     counts[slot] = max(values, key=lambda value: (len(str(value)), value))
-        if last_signature == validation_signature:
+        # Apply the trusted-value guard on *every* full-validation pass,
+        # including the first pass after Settings changes the configured-cell
+        # signature.  The old conditional only protected a stable signature;
+        # changing the enabled slot set therefore let a same-length digit
+        # substitution such as 1351 -> 1951 escape directly into the HUD and
+        # potion ledger.
+        if previous_counts:
             counts = _merge_stable_shortcut_counts(previous_counts, counts)
         if required:
             # A full-bar recovery can see neighboring/blank shortcut cells.
@@ -591,6 +597,18 @@ class StatPanelOcr:
         # whenever the current frame was blank or rejected as an OCR jump.
         self._shortcut_last_fast_counts = dict(result)
         self._shortcut_last_full_counts = dict(counts)
+        # The per-cell pixel cache must contain the value that survived the
+        # trusted merge, not the raw candidate captured before full-bar
+        # validation.  Otherwise a rejected 1951 can be served from the same
+        # crop signature on the next fast tick and bypass the selector again.
+        cell_values = dict(getattr(self, "_shortcut_last_cell_values", {}) or {})
+        for slot in required:
+            slot_key = f"{slot}:{slot in blue}"
+            if slot in result:
+                cell_values[slot_key] = result[slot]
+            else:
+                cell_values.pop(slot_key, None)
+        self._shortcut_last_cell_values = cell_values
         self._shortcut_last_validation_at = now
         self._shortcut_validation_signature = validation_signature
         return result
@@ -1705,6 +1723,35 @@ _SHORTCUT_DIGIT_CONFUSIONS = frozenset({
 })
 
 
+def _shortcut_digit_substitution(
+    previous: int, current: int
+) -> tuple[int, int, int, int] | None:
+    """Describe a one-position substitution within one shortcut quantity.
+
+    Returning the changed index, old digit, new digit, and decimal place keeps
+    the guard tied to the same four-digit slot.  It deliberately does not
+    reject a normal decrease; callers decide whether the direction and size
+    make the substitution suspicious.
+    """
+    if not isinstance(previous, int) or not isinstance(current, int):
+        return None
+    previous_text = str(previous)
+    current_text = str(current)
+    if len(previous_text) != len(current_text):
+        return None
+    differences = [
+        index
+        for index, (old_digit, new_digit)
+        in enumerate(zip(previous_text, current_text))
+        if old_digit != new_digit
+    ]
+    if len(differences) != 1:
+        return None
+    index = differences[0]
+    place = 10 ** (len(previous_text) - index - 1)
+    return index, int(previous_text[index]), int(current_text[index]), place
+
+
 def _is_probable_shortcut_upward_artifact(previous: int, current: int) -> bool:
     """Return whether an upward quantity is likely a digit/cell OCR error.
 
@@ -1729,21 +1776,11 @@ def _is_probable_shortcut_upward_artifact(previous: int, current: int) -> bool:
     ):
         return True
 
-    if len(current_text) != len(previous_text):
-        return False
-    differences = [
-        index
-        for index, (old_digit, new_digit)
-        in enumerate(zip(previous_text, current_text))
-        if old_digit != new_digit
-    ]
-    if len(differences) != 1:
+    substitution = _shortcut_digit_substitution(previous, current)
+    if substitution is None:
         return False
 
-    index = differences[0]
-    old_digit = int(previous_text[index])
-    new_digit = int(current_text[index])
-    place = 10 ** (len(previous_text) - index - 1)
+    _index, old_digit, new_digit, place = substitution
     upward_delta = (new_digit - old_digit) * place
     if (old_digit, new_digit) in _SHORTCUT_DIGIT_CONFUSIONS and place >= 10:
         return True
