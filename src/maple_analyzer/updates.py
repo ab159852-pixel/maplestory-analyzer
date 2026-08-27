@@ -206,6 +206,38 @@ function Write-UpdateStatus([string] $Message) {
         # A status file must never prevent the actual update transaction.
     }
 }
+function Move-WithRetry([string] $Source, [string] $Destination, [int] $Attempts = 60) {
+    $lastError = ""
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            Move-Item -LiteralPath $Source -Destination $Destination -ErrorAction Stop
+            return
+        } catch {
+            $lastError = $_.Exception.Message
+            if ($attempt -lt $Attempts) {
+                Start-Sleep -Milliseconds 500
+            }
+        }
+    }
+    throw "could not move '$Source' to '$Destination' after $Attempts attempts: $lastError"
+}
+function Copy-WithRobocopy([string] $Source, [string] $Destination) {
+    # A directory rename is atomic but can be rejected while an antivirus or
+    # indexer briefly owns a handle on the folder.  Robocopy can update the
+    # existing one-folder install without requiring the parent directory to be
+    # renamed, and its retry/exit-code contract is more reliable than a large
+    # recursive Copy-Item operation on Windows.
+    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    $robocopy = Join-Path $env:SystemRoot "System32\robocopy.exe"
+    if (-not (Test-Path -LiteralPath $robocopy)) {
+        throw "Windows robocopy.exe is unavailable"
+    }
+    & $robocopy $Source $Destination /E /IS /IT /COPY:DAT /DCOPY:DAT /R:20 /W:1 /XJ /NFL /NDL /NJH /NJS /NP
+    $result = $LASTEXITCODE
+    if ($result -gt 7) {
+        throw "robocopy failed with exit code $result"
+    }
+}
 try {
     # The app is normally launched with its own install directory as the
     # process working directory. Windows refuses to move a directory that a
@@ -259,13 +291,29 @@ try {
     }
     Write-UpdateStatus "old-process-exited"
 
-    Move-Item -LiteralPath $InstallDir -Destination $backup
-    Write-UpdateStatus ("old-install-backed-up path=" + $backup)
+    $usedCopyFallback = $false
     try {
-        Move-Item -LiteralPath $package -Destination $InstallDir
+        Move-WithRetry $InstallDir $backup
+        Write-UpdateStatus ("old-install-backed-up path=" + $backup)
+        try {
+            Move-WithRetry $package $InstallDir
+        } catch {
+            if ((Test-Path -LiteralPath $backup) -and (-not (Test-Path -LiteralPath $InstallDir))) {
+                Move-WithRetry $backup $InstallDir 20
+            }
+            throw
+        }
     } catch {
-        Move-Item -LiteralPath $backup -Destination $InstallDir
-        throw
+        # The old install may still be held by a directory handle even after
+        # the app PID exits.  Restore the old directory when necessary, then
+        # use a retried in-place copy as a safe compatibility path.
+        if ((Test-Path -LiteralPath $backup) -and (-not (Test-Path -LiteralPath $InstallDir))) {
+            Move-WithRetry $backup $InstallDir 20
+        }
+        Write-UpdateStatus ("directory-swap-fallback reason=" + $_.Exception.Message)
+        Copy-WithRobocopy $package $InstallDir
+        $usedCopyFallback = $true
+        Write-UpdateStatus ("in-place-copy-complete path=" + $InstallDir)
     }
     $targetExe = Join-Path $InstallDir $ExeName
     if (-not (Test-Path -LiteralPath $targetExe)) {
@@ -293,7 +341,9 @@ try {
     }
     Write-UpdateStatus ("new-process-started pid=" + $newProcess.Id + " version=" + $ExpectedVersion)
     $success = $true
-    Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
+    if (-not $usedCopyFallback) {
+        Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
+    }
     Write-UpdateStatus "update-success"
 } catch {
     $message = $_.Exception.Message
@@ -309,6 +359,26 @@ try {
     }
     if ((Test-Path $backup) -and -not (Test-Path $InstallDir)) {
         Move-Item -LiteralPath $backup -Destination $InstallDir -ErrorAction SilentlyContinue
+    }
+    $oldExe = Join-Path $InstallDir $ExeName
+    if (Test-Path -LiteralPath $oldExe) {
+        try {
+            Start-Process -FilePath $oldExe -WorkingDirectory $InstallDir -ErrorAction Stop | Out-Null
+            Write-UpdateStatus ("old-process-restarted path=" + $oldExe)
+        } catch {
+            Write-UpdateStatus ("old-process-restart-failed " + $_.Exception.Message)
+        }
+    }
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        [System.Windows.Forms.MessageBox]::Show(
+            ("Maple Insight 更新失敗。`n`n" + $message + "`n`n詳細紀錄：" + $StatusPath),
+            "Maple Insight 更新",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+    } catch {
+        # A notification must never interfere with rollback or relaunch.
     }
 } finally {
     Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue

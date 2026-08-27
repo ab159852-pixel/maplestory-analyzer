@@ -78,7 +78,10 @@ anything to the game.
 - **Automatic updates** — the packaged Windows app checks GitHub Releases in the
   background, offers newer versions, verifies the downloaded ZIP with SHA-256,
   then uses a detached updater to restart and replace the app without touching
-  your settings or history. You can also use **Settings → Check for updates**.
+  your settings or history. The installer retries temporary Windows file locks,
+  falls back to an in-place copy when needed, verifies the installed version,
+  and restores/reopens the old app if installation fails. You can also use
+  **Settings → Check for updates**.
 - **Premium workspace UI** — the Live, History, and Settings tabs use a layered
   obsidian/sapphire card layout with a scrollable overview and a collapsible
   drop panel, while Start can still switch to the translucent horizontal HUD.
@@ -177,17 +180,17 @@ identically whether started via the .exe or this command.
 
 ## Publish a release (maintainers)
 
-This source currently contains `APP_VERSION = 1.0.27`. For each release, bump
+This source currently contains `APP_VERSION = 1.0.28`. For each release, bump
 `APP_VERSION` in `src/maple_analyzer/version.py`, commit the change, and push a
 matching tag, for example:
 
 ```powershell
-git tag v1.0.27
-git push origin v1.0.27
+git tag v1.0.28
+git push origin v1.0.28
 ```
 
 GitHub Actions installs dependencies, builds
-`MapleStoryAnalyzer-v1.0.27-win64.zip`, writes a SHA-256 checksum, and publishes
+`MapleStoryAnalyzer-v1.0.28-win64.zip`, writes a SHA-256 checksum, and publishes
 the Release automatically. Packaged users will be offered the update next time
 the app starts.
 

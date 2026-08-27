@@ -51,7 +51,8 @@
   對比恢復，避免每一幀都使用較慢的偵測 OCR。
 - **自動更新** — Windows 打包版啟動後會在背景檢查 GitHub Releases；發現新版本時可
   下載並驗證 SHA-256，確認後由獨立更新程序重新啟動並替換檔案，不會改動使用者的
-  設定與歷史紀錄。也可以在「設定」按「檢查更新」。
+  設定與歷史紀錄。更新會重試被 Windows 暫時鎖定的資料夾，必要時改用原資料夾
+  複製；安裝後會再次驗證版本，失敗則恢復舊版並重新開啟。也可以在「設定」按「檢查更新」。
 - **高階工作台介面** — 即時、紀錄、設定分頁改為深色 obsidian／sapphire 卡片層級，
   Live 分頁可捲動，開始後仍可進入半透明橫向 HUD；主畫面保留寬裕間距與可收合的
   掉落速查，不會把所有資訊擠成一面文字。
@@ -137,15 +138,15 @@ py -3.10 -m venv .venv
 
 ## 發佈新版（維護者）
 
-目前這份程式的 `APP_VERSION` 是 `1.0.27`。每次先把
+目前這份程式的 `APP_VERSION` 是 `1.0.28`。每次先把
 `src/maple_analyzer/version.py` 改成下一個版本，再提交並推送同名 tag，例如：
 
 ```powershell
-git tag v1.0.27
-git push origin v1.0.27
+git tag v1.0.28
+git push origin v1.0.28
 ```
 
-GitHub Actions 會自動安裝依賴、建立 `MapleStoryAnalyzer-v1.0.27-win64.zip`、產生
+GitHub Actions 會自動安裝依賴、建立 `MapleStoryAnalyzer-v1.0.28-win64.zip`、產生
 SHA-256 checksum 並發佈 Release。使用者的打包版下次啟動就能收到更新。
 
 ## 疑難排解

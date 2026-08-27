@@ -88,6 +88,11 @@ def test_updater_handles_renamed_exe_and_records_transaction_progress():
     assert "Start-Process -FilePath $targetExe -WorkingDirectory $InstallDir -PassThru" in _POWERSHELL_UPDATER
     assert "$StatusPath" in _POWERSHELL_UPDATER
     assert "update-success" in _POWERSHELL_UPDATER
+    assert "Move-WithRetry" in _POWERSHELL_UPDATER
+    assert "Copy-WithRobocopy" in _POWERSHELL_UPDATER
+    assert "in-place-copy-complete" in _POWERSHELL_UPDATER
+    assert "old-process-restarted" in _POWERSHELL_UPDATER
+    assert "System.Windows.Forms.MessageBox" in _POWERSHELL_UPDATER
 
 
 def test_updater_does_not_use_detached_process_for_powershell():
