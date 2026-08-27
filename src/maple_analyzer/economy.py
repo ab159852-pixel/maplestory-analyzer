@@ -594,11 +594,11 @@ class EconomyTracker:
     def record_quick_slot_counts(self, counts: dict[str, int], now: float | None = None) -> int:
         """Register potion use from observed shortcut quantity decreases.
 
-        In the live session, upward quantity changes are rejected because the
-        user does not refill shortcut slots while testing.  A decrease must be
-        visible in two consecutive OCR samples before it becomes a provisional
-        charge.  A later stable increase toward the session baseline can roll
-        that charge back when the lower value was an OCR error.
+    In the live session, upward quantity changes are not potion events.  A
+    decrease must be corroborated by a second nearby lower OCR sample (the
+    value may step down again during a rapid drink animation) before it
+    becomes a provisional charge.  A later stable increase toward the session
+    baseline can roll that charge back when the lower value was an OCR error.
         """
         timestamp = time.monotonic() if now is None else now
         valid_counts = {
@@ -734,10 +734,17 @@ class EconomyTracker:
                 and timestamp - candidate[2] <= SLOT_CANDIDATE_MAX_GAP_SECONDS
             )
             if candidate_is_recent and candidate[0] == current:
-                # The same lower value in two frames is the safe confirmation
-                # signal. Do not treat 1180 -> 1179 -> 1178 as proof of two
-                # drinks: that sequence is also produced by joined cells or
-                # unstable digit OCR.
+                # The same lower value in two frames is the strongest
+                # confirmation signal.
+                confirmations = candidate[1] + 1
+                candidate_started_at = candidate[2]
+            elif candidate_is_recent and current < candidate[0]:
+                # A fast drink animation can expose a monotonic sequence such
+                # as 1359 -> 1358 -> 1357 without ever repeating one number.
+                # Treat that as one corroborated aggregate transition and
+                # charge only the net drop from the last trusted quantity.
+                # The later upward-correction path remains able to reverse an
+                # OCR substitution if the sequence was not real.
                 confirmations = candidate[1] + 1
                 candidate_started_at = candidate[2]
             else:

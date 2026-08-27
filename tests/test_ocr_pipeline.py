@@ -210,6 +210,59 @@ def test_shortcut_numeric_views_prefer_clean_threshold_consensus_and_reject_conf
     ) is None
 
 
+def test_shortcut_numeric_views_reject_1359_to_1959_substitution_but_keep_correction():
+    # 3 -> 9 in the hundreds place is the reported same-length upward OCR
+    # substitution.  A correction such as 40 -> 80 must remain possible so a
+    # provisional false drop can be reversed by EconomyTracker.
+    assert ocr_module._select_shortcut_numeric_views(
+        [
+            (1959, "rgb"),
+            (1959, "gray"),
+            (1959, "white170"),
+            (1959, "white180"),
+        ],
+        previous=1359,
+    ) is None
+    assert ocr_module._select_shortcut_numeric_views(
+        [
+            (80, "rgb"),
+            (80, "gray"),
+            (80, "white170"),
+            (80, "white180"),
+        ],
+        previous=40,
+    ) == 80
+
+
+def test_shortcut_fast_path_uses_latest_fast_cache_as_previous_value():
+    # A full-bar cache for another slot must not hide the newest fast value for
+    # this slot.  Without this regression guard, 1359 -> 1959 could be
+    # returned as a fresh value instead of being held at 1359.
+    from PIL import Image
+
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._shortcut_last_full_counts = {"1": 2676}
+    ocr._shortcut_last_fast_counts = {"7": 1359}
+    ocr._shortcut_validation_signature = (("1", "7"), ())
+    ocr._shortcut_last_cell_signatures = {}
+    ocr._shortcut_last_cell_values = {}
+    ocr._read_shortcut_slot_counts = lambda *_args, **_kwargs: {"7": 1959}
+
+    expected = ocr.read_shortcut_counts(
+        Image.new("RGB", (147, 77)),
+        {"7"},
+        allow_full_validation=False,
+    )
+    assert expected == {"7": 1359}
+    # The rejected raw candidate must not erase the trusted cache and make the
+    # identical bad value pass on the following fast frame.
+    assert ocr.read_shortcut_counts(
+        Image.new("RGB", (147, 77)),
+        {"7"},
+        allow_full_validation=False,
+    ) == {"7": 1359}
+
+
 def test_shortcut_numeric_views_keep_aligned_prefixes_in_the_same_vote_families():
     """A dynamically cropped view must still count as threshold/colour OCR."""
     assert ocr_module._select_shortcut_numeric_views(

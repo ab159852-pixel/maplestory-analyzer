@@ -3280,8 +3280,17 @@ class OverlayApp:
         if not was_running:
             monitor.set_aux_enabled(False)
         snapshot = economy.snapshot
+        # ``shortcut_current`` is the last value that passed the live
+        # confirmation gate.  At a stop/pause boundary, however, the newest
+        # OCR frame may be the only frame that saw the final bottle change
+        # (for example 1359 -> 1358 immediately before the flush).  The
+        # observed value is the latest measured inventory and is exactly what
+        # final reconciliation is meant to settle against; the economy layer
+        # still subtracts already charged uses, so this cannot double-charge.
+        final_counts = dict(snapshot.shortcut_current)
+        final_counts.update(snapshot.shortcut_observed)
         uses = economy.reconcile_quick_slot_counts(
-            snapshot.shortcut_current,
+            final_counts,
             time.monotonic(),
         )
         if uses:

@@ -108,13 +108,14 @@ def test_monotonic_multi_potion_drop_counts_without_repeated_quantity_frame():
         PotionSlotConfig(slot="F1", name="Red Potion", kind="hp", cost=25),
     ])
     tracker.record_quick_slot_counts({"F1": 1180}, now=0)
-    # Without an intermediate trusted frame, the aggregate 1180 -> 1178
-    # transition is ambiguous and is rejected instead of charging two uses.
+    # A fast drink animation can expose a monotonic sequence without repeating
+    # one quantity.  Charge the net transition once the second lower frame
+    # corroborates it.
     tracker.record_quick_slot_counts({"F1": 1179}, now=1)
     tracker.record_quick_slot_counts({"F1": 1178}, now=1.75)
 
-    assert tracker.snapshot.potion_uses == 0
-    assert tracker.snapshot.potion_cost == 0
+    assert tracker.snapshot.potion_uses == 2
+    assert tracker.snapshot.potion_cost == 50
 
 
 def test_hp_and_mp_slots_are_classified_independently():
@@ -127,10 +128,10 @@ def test_hp_and_mp_slots_are_classified_independently():
     tracker.record_quick_slot_counts({"1": 1178, "2": 2035}, now=1.75)
 
     snapshot = tracker.snapshot
-    assert snapshot.hp_potion_uses == 0
-    assert snapshot.hp_potion_cost == 0
-    assert snapshot.mp_potion_uses == 0
-    assert snapshot.mp_potion_cost == 0
+    assert snapshot.hp_potion_uses == 2
+    assert snapshot.hp_potion_cost == 50
+    assert snapshot.mp_potion_uses == 2
+    assert snapshot.mp_potion_cost == 80
 
 
 def test_drop_candidate_survives_slow_enhanced_ocr_retry():

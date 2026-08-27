@@ -462,9 +462,16 @@ class StatPanelOcr:
         validation_signature = (tuple(sorted(required)), tuple(sorted(blue)))
         now = time.monotonic()
         last_full_counts = dict(getattr(self, "_shortcut_last_full_counts", {}) or {})
+        # The fast worker is the newest source of a quantity.  The old
+        # "prefer full, otherwise fast" selection meant that one verified
+        # full-bar value could hide newer fast values for the other configured
+        # cells.  That left a slot without a previous value, allowing an
+        # upward digit substitution such as 1359 -> 1959 to enter the live
+        # stream.  Merge both caches per slot, with the fast sample winning.
         previous_counts = dict(last_full_counts)
-        if not previous_counts:
-            previous_counts = dict(getattr(self, "_shortcut_last_fast_counts", {}) or {})
+        previous_counts.update(
+            dict(getattr(self, "_shortcut_last_fast_counts", {}) or {})
+        )
         last_validation_at = float(getattr(self, "_shortcut_last_validation_at", 0.0))
         last_signature = getattr(self, "_shortcut_validation_signature", None)
         configuration_changed = last_signature != validation_signature
@@ -507,9 +514,13 @@ class StatPanelOcr:
             # A temporary numeric miss must not trigger the expensive detector
             # on every 0.1–0.2s sample. Keep the last trusted quantity for the
             # missing cell and allow the next fast frame to recover it.
-            counts = _merge_fast_shortcut_counts(last_full_counts, fast_counts, required)
+            counts = _merge_fast_shortcut_counts(previous_counts, fast_counts, required)
             result = {slot: counts[slot] for slot in required if slot in counts}
-            self._shortcut_last_fast_counts = dict(fast_counts)
+            # Cache the merged/trusted result, not the raw candidate map.  If
+            # a frame is rejected (for example 1359 -> 1959), caching the
+            # empty raw map would erase 1359 and let the same bad OCR value
+            # through on the next frame as if it were a new baseline.
+            self._shortcut_last_fast_counts = dict(result)
             # Fast-only callers still need a remembered configuration so a
             # stable next frame can use the per-cell image cache. The full
             # validation timestamp intentionally remains untouched: the next
@@ -529,8 +540,8 @@ class StatPanelOcr:
         if required and numeric_engine_available:
             counts = dict(fast_counts)
             for slot in required - counts.keys():
-                if slot in last_full_counts:
-                    counts[slot] = last_full_counts[slot]
+                if slot in previous_counts:
+                    counts[slot] = previous_counts[slot]
         else:
             counts = self._shortcut_counts_from_records(image, self.read_lines(image))
         for slot, value in fast_counts.items():
@@ -545,8 +556,8 @@ class StatPanelOcr:
             # A redraw can make both detection and the isolated crop blank.
             # Never publish that transient blank over a known quantity.
             for slot in missing:
-                if slot in last_full_counts:
-                    counts[slot] = last_full_counts[slot]
+                if slot in previous_counts:
+                    counts[slot] = previous_counts[slot]
         missing = required - counts.keys()
         if missing and not numeric_engine_available:
             # Detection occasionally loses only the small glyph run for one
@@ -565,7 +576,7 @@ class StatPanelOcr:
                     # missed.
                     counts[slot] = max(values, key=lambda value: (len(str(value)), value))
         if last_signature == validation_signature:
-            counts = _merge_stable_shortcut_counts(last_full_counts, counts)
+            counts = _merge_stable_shortcut_counts(previous_counts, counts)
         if required:
             # A full-bar recovery can see neighboring/blank shortcut cells.
             # When the caller names configured slots, never leak those other
@@ -575,7 +586,10 @@ class StatPanelOcr:
             result = counts
 
         # Keep the verified result separately from the latest fast result.
-        self._shortcut_last_fast_counts = dict(fast_counts)
+        # Keep the value that survived the merge as the next frame's previous
+        # quantity.  Storing only ``fast_counts`` would erase a trusted value
+        # whenever the current frame was blank or rejected as an OCR jump.
+        self._shortcut_last_fast_counts = dict(result)
         self._shortcut_last_full_counts = dict(counts)
         self._shortcut_last_validation_at = now
         self._shortcut_validation_signature = validation_signature
@@ -1470,8 +1484,7 @@ def _select_shortcut_numeric_views(
         values = [
             (value, view_name)
             for value, view_name in values
-            if value <= previous
-            and not _is_shortcut_numeric_truncation(previous, value)
+            if _shortcut_numeric_transition_is_usable(previous, value)
         ]
     if not values:
         return None
@@ -1564,8 +1577,7 @@ def _select_shortcut_numeric_candidate(
         plausible = [
             value
             for value in values
-            if value <= previous
-            and not _is_shortcut_numeric_truncation(previous, value)
+            if _shortcut_numeric_transition_is_usable(previous, value)
         ]
         if not plausible:
             return None
@@ -1643,16 +1655,23 @@ def _shortcut_crop_signature(image: Image.Image) -> tuple:
 
 
 def _is_probable_shortcut_ocr_change(previous: int, current: int) -> bool:
-    """Accept a non-truncated decrease from a cached quantity.
+    """Accept a non-truncated quantity transition from a cached value.
 
     The economy layer performs the temporal/multi-frame decision.  The OCR
-    layer must not discard a real multi-bottle decrease before that layer can
-    see it; its job here is only to remove clear suffix/truncation reads.
+    layer must not discard a real multi-bottle decrease or a correction after
+    a provisional drop before that layer can see it; its job here is to remove
+    clear suffix/truncation reads and the known upward digit-substitution
+    pattern.
     """
     if current == previous:
         return True
     if current > previous:
-        return False
+        # Upward values are needed for a correction such as 40 -> 80 after a
+        # provisional false drop.  Only block the characteristic same-length
+        # substitution/neighbor merge here; EconomyTracker applies the
+        # stronger temporal gate before treating any upward value as a real
+        # restock or correction.
+        return not _is_probable_shortcut_upward_artifact(previous, current)
     if current == 0 and previous <= 10:
         return True
     if _is_shortcut_numeric_truncation(previous, current):
@@ -1673,6 +1692,72 @@ def _is_shortcut_numeric_truncation(previous: int, current: int) -> bool:
     # Preserve the narrow one-digit transition used for a real 10 -> 9
     # decrease; larger changes are almost always a clipped leading glyph.
     return previous >= 10 and current < 10 and previous - current > 1
+
+
+_SHORTCUT_DIGIT_CONFUSIONS = frozenset({
+    # Common outlined-font substitutions seen in the bundled numeric model.
+    # Keep the list deliberately small: a normal quantity decrease must still
+    # be allowed through to the reversible economy layer.
+    (3, 9), (9, 3),
+    (3, 5), (5, 3),
+    (6, 8), (8, 6),
+    (0, 8), (8, 0),
+})
+
+
+def _is_probable_shortcut_upward_artifact(previous: int, current: int) -> bool:
+    """Return whether an upward quantity is likely a digit/cell OCR error.
+
+    A real correction after a provisional drop must remain possible, so this
+    is intentionally narrower than a blanket ``current > previous`` check.
+    The reported ``1359 -> 1959`` case is a same-length, one-digit upward
+    substitution (3 -> 9) and is rejected before it reaches accounting.
+    Values that add a neighboring cell's suffix/prefix are rejected as well.
+    """
+    if not isinstance(previous, int) or not isinstance(current, int):
+        return False
+    if current <= previous:
+        return False
+    previous_text = str(previous)
+    current_text = str(current)
+
+    # A longer value containing the complete old value is the usual symptom
+    # of a neighboring cell being joined to this one (86 -> 865, 118 -> 1180).
+    if len(current_text) > len(previous_text) and (
+        current_text.startswith(previous_text)
+        or current_text.endswith(previous_text)
+    ):
+        return True
+
+    if len(current_text) != len(previous_text):
+        return False
+    differences = [
+        index
+        for index, (old_digit, new_digit)
+        in enumerate(zip(previous_text, current_text))
+        if old_digit != new_digit
+    ]
+    if len(differences) != 1:
+        return False
+
+    index = differences[0]
+    old_digit = int(previous_text[index])
+    new_digit = int(current_text[index])
+    place = 10 ** (len(previous_text) - index - 1)
+    upward_delta = (new_digit - old_digit) * place
+    if (old_digit, new_digit) in _SHORTCUT_DIGIT_CONFUSIONS and place >= 10:
+        return True
+    # A one-character OCR mistake in a high-order position creates a large
+    # jump that is not a normal one-bottle pickup. Keep the threshold relative
+    # to the actual stack so it also works below 1000.
+    return upward_delta >= max(300, int(previous * 0.35))
+
+
+def _shortcut_numeric_transition_is_usable(previous: int, current: int) -> bool:
+    """Allow real decreases/corrections while rejecting obvious OCR jumps."""
+    if current <= previous:
+        return not _is_shortcut_numeric_truncation(previous, current)
+    return not _is_probable_shortcut_upward_artifact(previous, current)
 
 
 def _merge_fast_shortcut_counts(
