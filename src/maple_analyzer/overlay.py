@@ -1058,12 +1058,74 @@ class OverlayApp:
         self.root.geometry(f"+{x}+{y}")
 
     def _minimize_window(self) -> None:
-        with contextlib.suppress(Exception):
-            import ctypes
-            ctypes.windll.user32.ShowWindow(int(self.root.winfo_id()), 6)
+        """Minimize the frameless shell without leaving a dead paint surface.
+
+        ``overrideredirect`` windows do not participate in the normal Windows
+        frame protocol.  Calling ``ShowWindow`` on ``winfo_id()`` directly was
+        therefore unreliable: on some Tk/Windows combinations that id is an
+        owned child handle, not the top-level HWND.  The old code treated the
+        call as successful whenever ctypes did not raise, so the shell could
+        remain half-mapped and look like it had crashed.
+
+        Temporarily give the window back to the window manager, let Tk perform
+        the normal iconify operation, and let ``<Map>`` restore the frameless
+        style when the taskbar restores it.  The native path is retained only
+        as a last-resort fallback for Tk builds that reject iconify here.
+        """
+        if getattr(self, "_minimize_in_progress", False):
             return
-        with contextlib.suppress(Exception):
-            self.root.iconify()
+        self._minimize_in_progress = True
+        try:
+            with contextlib.suppress(tk.TclError):
+                if self.root.state() == "iconic":
+                    return
+
+            with contextlib.suppress(tk.TclError, OSError):
+                self._normal_geometry = self.root.geometry()
+
+            # A normal window-manager state is required for iconify on
+            # Windows.  This call is synchronous, so the native border is not
+            # left on screen while the user can interact with the shell.
+            self._borderless_restore_scheduled = False
+            self.root.overrideredirect(False)
+            with contextlib.suppress(tk.TclError, OSError):
+                self.root.update_idletasks()
+
+            try:
+                self.root.iconify()
+                with contextlib.suppress(tk.TclError):
+                    if self.root.state() == "iconic":
+                        return
+            except (tk.TclError, OSError):
+                pass
+
+            # Fallback for Tk builds whose ``iconify`` is unavailable.  Walk
+            # from Tk's handle to the real top-level HWND before minimizing;
+            # using the raw child handle was the unreliable part of the old
+            # implementation.
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            raw_hwnd = int(self.root.winfo_id())
+            get_ancestor = user32.GetAncestor
+            get_ancestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            get_ancestor.restype = ctypes.c_void_p
+            hwnd_value = int(get_ancestor(ctypes.c_void_p(raw_hwnd), 2) or 0)
+            if not hwnd_value:
+                hwnd_value = raw_hwnd
+            hwnd = ctypes.c_void_p(hwnd_value)
+            if not user32.IsWindow(hwnd):
+                raise OSError("Tk window handle is not a valid top-level window")
+            user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
+        except Exception as exc:
+            # Do not let a cosmetic window-control failure terminate the OCR
+            # process.  Re-enable the frameless shell if both minimize paths
+            # were rejected and leave a diagnostic for packaged builds.
+            with contextlib.suppress(Exception):
+                self.root.overrideredirect(True)
+            log_exception("window minimize failed", exc)
+        finally:
+            self._minimize_in_progress = False
 
     def _toggle_window_maximized(self, _event=None) -> None:
         if self._window_maximized:
