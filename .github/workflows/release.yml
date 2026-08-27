@@ -62,9 +62,15 @@ jobs:
           if (-not $theme) {
             throw "Packaged CustomTkinter themes are missing; refusing to publish a broken update"
           }
-          $appTheme = Join-Path $package "maple_insight_dark_blue.json"
-          if (-not (Test-Path -LiteralPath $appTheme)) {
-            throw "Packaged Maple Insight theme is missing: $appTheme"
+          $appThemeCandidates = @(
+            (Join-Path $package "_internal\maple_insight_dark_blue.json"),
+            (Join-Path $package "maple_insight_dark_blue.json")
+          )
+          $appTheme = $appThemeCandidates |
+            Where-Object { Test-Path -LiteralPath $_ } |
+            Select-Object -First 1
+          if (-not $appTheme) {
+            throw "Packaged Maple Insight theme is missing"
           }
 
       - name: Package and checksum release

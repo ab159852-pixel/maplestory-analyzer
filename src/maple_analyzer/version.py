@@ -6,6 +6,6 @@ from __future__ import annotations
 # product name is intentionally shorter and more polished.
 APP_NAME = "MapleStoryAnalyzer"
 APP_DISPLAY_NAME = "Maple Insight"
-APP_VERSION = "1.0.22"
+APP_VERSION = "1.0.23"
 GITHUB_REPOSITORY = "ab159852-pixel/maplestory-analyzer"
 RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
