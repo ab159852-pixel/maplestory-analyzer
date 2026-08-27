@@ -23,7 +23,12 @@ class _RecordingOcr:
 
     def read_shortcut_counts(self, image, required, blue, **kwargs):
         del image
-        self.calls.append((set(required), set(blue), set((kwargs.get("slot_images") or {}).keys())))
+        self.calls.append((
+            set(required),
+            set(blue),
+            set((kwargs.get("slot_images") or {}).keys()),
+            kwargs.get("live"),
+        ))
         return {"1": 2676, "8": 9999}
 
 
@@ -43,4 +48,4 @@ def test_background_ocr_receives_only_enabled_shortcut_cell():
     configured = (PotionSlotConfig(slot="1", kind="hp", cost=10, enabled=True),)
 
     assert monitor._read_potion_counts(_regions(), configured, configured) == {"1": 2676}
-    assert ocr.calls == [({"1"}, set(), {"1"})]
+    assert ocr.calls == [({"1"}, set(), {"1"}, True)]

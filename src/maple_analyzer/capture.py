@@ -404,8 +404,12 @@ class StaticImageCapture:
                 round(right_box * actual_width / reference_width),
                 round(bottom_box * actual_height / reference_height),
             ))
-        expected = scale_shortcut_box(SHORTCUT_BOX, self._image.size)
-        self.shortcut_frame = detect_shortcut_frame(self._image, expected)
+        # The demo image never changes.  Keep the same calibrated frame for
+        # subsequent auxiliary reads so the test path has the same timing
+        # characteristics as the live capture path.
+        if self.shortcut_frame is None:
+            expected = scale_shortcut_box(SHORTCUT_BOX, self._image.size)
+            self.shortcut_frame = detect_shortcut_frame(self._image, expected)
         regions.update(_shortcut_parent_regions(self._image, self.shortcut_frame))
         return regions
 
@@ -447,6 +451,11 @@ class GameWindowCapture:
         # -- and the one thing missing from every capture taken so far.
         self.client_size: tuple[int, int] | None = None
         self.shortcut_frame: Box | None = None
+        # The shortcut frame is UI geometry, not per-frame content.  Reuse the
+        # calibrated client-relative box until the game client size changes;
+        # detecting edges on every 150ms potion sample was unnecessary CPU work
+        # and made quantity updates fall behind the game's drink animation.
+        self._shortcut_frame_client_size: tuple[int, int] | None = None
         # Status, economy, and context workers share one mss desktop grabber.
         # Serialize only the short screen-capture sections; OCR remains fully
         # independent and can never block the Tk thread.
@@ -858,7 +867,17 @@ class GameWindowCapture:
                 if name != "shortcut"
             }
             expected = scale_shortcut_box(SHORTCUT_BOX, client_size)
-            self.shortcut_frame = detect_shortcut_frame(graphics, expected)
+            cached = self.shortcut_frame
+            cached_size = getattr(self, "_shortcut_frame_client_size", None)
+            cached_valid = (
+                isinstance(cached, Box)
+                and cached_size == client_size
+                and 0 <= cached.left < cached.right <= client_size[0]
+                and 0 <= cached.top < cached.bottom <= client_size[1]
+            )
+            if not cached_valid:
+                self.shortcut_frame = detect_shortcut_frame(graphics, expected)
+                self._shortcut_frame_client_size = client_size
             regions.update(_shortcut_parent_regions(graphics, self.shortcut_frame))
         else:
             left, top, right, bottom = client_rect
@@ -908,14 +927,31 @@ class GameWindowCapture:
                     expected.right - scan_box.left,
                     expected.bottom - scan_box.top,
                 )
-                frame_local = detect_shortcut_frame(scan_image, expected_local)
-                regions.update(_shortcut_parent_regions(scan_image, frame_local))
-                self.shortcut_frame = Box(
-                    frame_local.left + scan_box.left,
-                    frame_local.top + scan_box.top,
-                    frame_local.right + scan_box.left,
-                    frame_local.bottom + scan_box.top,
+                cached = self.shortcut_frame
+                cached_size = getattr(self, "_shortcut_frame_client_size", None)
+                cached_valid = (
+                    isinstance(cached, Box)
+                    and cached_size == client_size
+                    and scan_box.left <= cached.left < cached.right <= scan_box.right
+                    and scan_box.top <= cached.top < cached.bottom <= scan_box.bottom
                 )
+                if cached_valid:
+                    frame_local = Box(
+                        cached.left - scan_box.left,
+                        cached.top - scan_box.top,
+                        cached.right - scan_box.left,
+                        cached.bottom - scan_box.top,
+                    )
+                else:
+                    frame_local = detect_shortcut_frame(scan_image, expected_local)
+                    self.shortcut_frame = Box(
+                        frame_local.left + scan_box.left,
+                        frame_local.top + scan_box.top,
+                        frame_local.right + scan_box.left,
+                        frame_local.bottom + scan_box.top,
+                    )
+                    self._shortcut_frame_client_size = client_size
+                regions.update(_shortcut_parent_regions(scan_image, frame_local))
 
         pickup = regions["pickup"]
         pickup_parent = scale_box(_pickup_boxes_for_client(client_size)["pickup"], client_size)

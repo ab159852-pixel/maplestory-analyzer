@@ -23,6 +23,7 @@ def test_static_auxiliary_capture_returns_full_and_fast_subcrops():
     for slot in SHORTCUT_SLOT_BOXES:
         image = regions[f"shortcut:{slot}"]
         assert image.width > 0 and image.height > 0
+
     # The eight OCR crops must tile the measured parent frame.  This catches
     # both the old oversized parent and the old inner boxes that cut a digit.
     top_row = [regions[f"shortcut:{slot}"] for slot in ("1", "2", "3", "4")]
@@ -33,3 +34,21 @@ def test_static_auxiliary_capture_returns_full_and_fast_subcrops():
     for line in PICKUP_LINE_BOXES:
         image = regions[f"pickup:{line}"]
         assert image.width > 0 and image.height > 0
+
+
+def test_static_auxiliary_capture_reuses_calibrated_shortcut_frame(monkeypatch):
+    import maple_analyzer.capture as capture_module
+
+    calls = []
+    original = capture_module.detect_shortcut_frame
+
+    def counted(image, expected=None):
+        calls.append(image.size)
+        return original(image, expected)
+
+    monkeypatch.setattr(capture_module, "detect_shortcut_frame", counted)
+    capture = StaticImageCapture(SAMPLE_IMAGE)
+    capture.grab_auxiliary()
+    capture.grab_auxiliary()
+
+    assert calls == [capture._image.size]

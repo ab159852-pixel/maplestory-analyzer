@@ -128,7 +128,7 @@ set_process_dpi_awareness()
 TARGET_MS = 300  # target full status/OCR cycle -- 3.33Hz
 # Pickup toasts are brief lower-right notifications. Keep the fallback path
 # fast too; the threaded monitor uses Settings.pickup_interval_ms directly.
-AUX_SCAN_MS = 200
+AUX_SCAN_MS = 150
 PICKUP_DETECTION_MS = 200
 POTION_PROJECTION_MIN_SECONDS = 60.0  # avoid a first-drink spike in a short sample
 # Shortcut quantities are sampled independently from status OCR. Two matching
@@ -908,8 +908,15 @@ class OverlayApp:
                 track_potions=self._settings.track_potions,
                 potion_slots=self._settings.potion_slots,
             )
-            self._set_monitor_aux_enabled(self._run_state == "running")
             self._monitor.start()
+            if self._run_state == "running":
+                self._set_monitor_aux_enabled(True)
+            else:
+                # Context and the configured potion inventory are useful
+                # before a session starts.  Keep only that small auxiliary
+                # path alive in the stopped state; status/pickup accounting
+                # remains idle until Start.
+                self._set_monitor_idle_aux_enabled()
             # Context is deliberately independent of the run state. Request a
             # scan as soon as OCR is ready so job/map and drop lookup work
             # before Start; the context worker never waits for the economy
@@ -1177,7 +1184,8 @@ class OverlayApp:
         self._floating_context_label.pack(anchor="w")
 
         metric_strip = ctk.CTkFrame(self._floating_bar, fg_color="transparent")
-        metric_strip.grid(row=0, column=1, sticky="ew", pady=7)
+        metric_strip.grid(row=0, column=1, columnspan=3, sticky="ew", pady=7)
+        self._floating_metric_strip = metric_strip
         metric_specs = FLOATING_METRIC_SPECS
         self._floating_metric_specs = metric_specs
         self._floating_metric_frames: dict[str, ctk.CTkFrame] = {}
@@ -2476,10 +2484,25 @@ class OverlayApp:
         reset_shortcut_cache = getattr(getattr(self, "_ocr", None), "reset_shortcut_cache", None)
         if callable(reset_shortcut_cache):
             reset_shortcut_cache()
+        # Keep the lightweight configured-slot reader alive while the app is
+        # stopped.  This is only a display/baseline path; it never starts a
+        # session or charges a potion.  It also makes changing a slot in
+        # Settings take effect without requiring a Start click.
+        if getattr(self, "_run_state", "stopped") == "stopped":
+            self._set_monitor_idle_aux_enabled()
 
-    def _set_monitor_aux_enabled(self, enabled: bool) -> None:
+    def _set_monitor_aux_enabled(
+        self,
+        enabled: bool,
+        *,
+        reset_potion_baseline: bool = True,
+    ) -> None:
         monitor = getattr(self, "_monitor", None)
-        if enabled and getattr(self._settings, "track_potions", False):
+        if (
+            enabled
+            and reset_potion_baseline
+            and getattr(self._settings, "track_potions", False)
+        ):
             economy = getattr(self, "_economy", None)
             if economy is not None:
                 economy.begin_quick_slot_baseline()
@@ -2502,7 +2525,31 @@ class OverlayApp:
                 if callable(request_scan):
                     request_scan()
 
-    def _record_auxiliary_counts(self, counts: dict[str, int], now: float) -> None:
+    def _set_monitor_idle_aux_enabled(self) -> None:
+        """Sample configured potion slots before Start without accounting."""
+        monitor = getattr(self, "_monitor", None)
+        if monitor is None:
+            return
+        set_status = getattr(monitor, "set_status_enabled", None)
+        if callable(set_status):
+            set_status(False)
+        configured = bool(
+            getattr(self._settings, "track_potions", False)
+            and any(slot.enabled for slot in getattr(self._settings, "potion_slots", ()))
+        )
+        monitor.set_aux_enabled(configured)
+        if configured:
+            request_scan = getattr(monitor, "request_auxiliary_scan", None)
+            if callable(request_scan):
+                request_scan()
+
+    def _record_auxiliary_counts(
+        self,
+        counts: dict[str, int],
+        now: float,
+        *,
+        charge: bool = True,
+    ) -> None:
         economy = getattr(self, "_economy", None)
         if economy is None:
             return
@@ -2534,11 +2581,30 @@ class OverlayApp:
             visible = ", ".join(f"{slot}={count}" for slot, count in sorted(stable.items()))
             self._log(f"[{time.strftime('%H:%M:%S')}] potion baseline: {visible}")
             return
+        if not charge:
+            # While stopped, a changed quantity is a new display baseline, not
+            # a drink event. Re-anchoring the economy tracker here means the
+            # next Start never charges a quantity change that happened before
+            # the user began the test.
+            if counts != self._last_logged_shortcut_counts:
+                economy.prime_quick_slot_counts(counts, now=now)
+                visible = ", ".join(f"{slot}={count}" for slot, count in sorted(counts.items()))
+                self._log(f"[{time.strftime('%H:%M:%S')}] potion idle baseline: {visible}")
+                self._last_logged_shortcut_counts = dict(counts)
+            return
         if counts != self._last_logged_shortcut_counts:
             visible = ", ".join(f"{slot}={count}" for slot, count in sorted(counts.items()))
             self._log(f"[{time.strftime('%H:%M:%S')}] potion counts: {visible or 'unreadable'}")
             self._last_logged_shortcut_counts = dict(counts)
-        uses = economy.record_quick_slot_counts(counts, now)
+        try:
+            # The OCR path has already required independent colour and
+            # threshold agreement. Charge on the first valid lower frame so
+            # the cost column follows a real bottle change immediately; the
+            # reversible economy ledger still corrects a later OCR rebound.
+            uses = economy.record_quick_slot_counts(counts, now, immediate=True)
+        except TypeError:
+            # Compatibility with lightweight custom EconomyTracker adapters.
+            uses = economy.record_quick_slot_counts(counts, now)
         if uses:
             self._log(f"[{time.strftime('%H:%M:%S')}] potion use confirmed: {uses}")
 
@@ -2678,11 +2744,41 @@ class OverlayApp:
 
     def _apply_floating_visibility(self) -> None:
         selected = set(getattr(self._settings, "floating_fields", ()))
-        for key, frame in getattr(self, "_floating_metric_frames", {}).items():
-            if key in selected:
-                frame.grid()
-            else:
-                frame.grid_remove()
+        frames = getattr(self, "_floating_metric_frames", {})
+        metric_strip = getattr(self, "_floating_metric_strip", None)
+        for frame in frames.values():
+            frame.grid_remove()
+        if metric_strip is None:
+            for key, frame in frames.items():
+                if key in selected:
+                    frame.grid()
+            return
+
+        # The controls have their own row, but a long one-row metric strip can
+        # still push its requested width underneath the controls on narrow
+        # displays. Wrap optional fields into deterministic rows so a potion
+        # quantity can never be painted under Pause/Stop/Restore. The default
+        # four-field HUD remains one horizontal row.
+        ordered = [
+            key for key, _label_key, _color in getattr(
+                self, "_floating_metric_specs", FLOATING_METRIC_SPECS
+            ) if key in selected and key in frames
+        ]
+        columns = 8
+        for column in range(columns):
+            metric_strip.grid_columnconfigure(column, weight=0)
+        for index, key in enumerate(ordered):
+            frames[key].grid(
+                row=index // columns,
+                column=index % columns,
+                sticky="ns",
+                padx=(0 if index % columns == 0 else 4, 0),
+            )
+        if getattr(self, "_floating_mode", False):
+            rows = max(1, math.ceil(len(ordered) / columns))
+            height = 140 + max(0, rows - 1) * 52
+            with contextlib.suppress(Exception):
+                self.root.geometry(f"1100x{height}+40+40")
 
     def _refresh_floating_metric_labels(self) -> None:
         labels = getattr(self, "_floating_metric_labels", {})
@@ -2801,11 +2897,17 @@ class OverlayApp:
                 break
 
         auxiliary_readings = []
-        while True:
-            try:
-                auxiliary_readings.append(monitor.auxiliary_queue.get_nowait())
-            except queue.Empty:
-                break
+        for auxiliary_queue in (
+            getattr(monitor, "auxiliary_queue", None),
+            getattr(monitor, "potion_queue", None),
+        ):
+            if auxiliary_queue is None:
+                continue
+            while True:
+                try:
+                    auxiliary_readings.append(auxiliary_queue.get_nowait())
+                except queue.Empty:
+                    break
 
         # Status and shortcut workers run independently.  Apply their results
         # in capture order so a potion quantity drop is registered before the
@@ -2866,12 +2968,21 @@ class OverlayApp:
                     self._last_aux_error = reading.error
                 continue
             self._last_aux_error = None
-            if economy is not None and (
-                self._run_state == "running" or include_auxiliary_when_paused
-            ):
-                if getattr(reading, "pickup_scanned", True):
+            if economy is not None:
+                can_account = (
+                    self._run_state == "running" or include_auxiliary_when_paused
+                )
+                if can_account and getattr(reading, "pickup_scanned", True):
                     economy.record_pickup_lines(reading.lines, event_now)
-                self._record_auxiliary_counts(dict(reading.counts), event_now)
+                if reading.counts:
+                    if can_account:
+                        self._record_auxiliary_counts(dict(reading.counts), event_now)
+                    elif self._run_state == "stopped":
+                        # Startup inventory preview only.  Never turn a
+                        # quantity change made before Start into a charge.
+                        self._record_auxiliary_counts(
+                            dict(reading.counts), event_now, charge=False
+                        )
 
         while True:
             try:
@@ -3430,8 +3541,15 @@ class OverlayApp:
         else:  # "stopped" -- already committed to History by _finalize_and_maybe_stop
             getattr(self, "_start_new_session", self._session.start)()
             self._run_state = "running"
-            getattr(self, "_set_monitor_aux_enabled", lambda _enabled: None)(True)
             economy = getattr(self, "_economy", None)
+            idle_counts: dict[str, int] = {}
+            if (
+                economy is not None
+                and getattr(self, "_settings", None) is not None
+                and getattr(self, "_settings", None).track_potions
+                and not getattr(self, "_potion_baseline_pending", True)
+            ):
+                idle_counts = dict(economy.snapshot.shortcut_current)
             if economy is not None:
                 economy.reset()
                 economy.configure(
@@ -3439,6 +3557,18 @@ class OverlayApp:
                     self._settings.potion_recovery_hp_default,
                     self._settings.potion_recovery_mp_default,
                 )
+                if idle_counts:
+                    # The idle monitor has already established a current
+                    # inventory baseline. Carry it into the new session so a
+                    # Start click does not create another multi-frame blank
+                    # window before the first real drink can be billed.
+                    economy.prime_quick_slot_counts(idle_counts)
+            self._potion_baseline_pending = not bool(idle_counts)
+            self._potion_baseline_samples.clear()
+            getattr(self, "_set_monitor_aux_enabled", lambda _enabled, **_kwargs: None)(
+                True,
+                reset_potion_baseline=not bool(idle_counts),
+            )
             if self._settings.floating_on_start:
                 getattr(self, "_enter_floating_mode", lambda: None)()
         self._apply_run_state()

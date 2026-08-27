@@ -23,7 +23,7 @@ repo_root = Path(SPECPATH).resolve().parent
 # same as the source run at 100%, 125%, and 150% display scaling.
 DPI_MANIFEST = r'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="1.0.26.0" processorArchitecture="*" name="MapleStoryAnalyzer" type="win32"/>
+  <assemblyIdentity version="1.0.27.0" processorArchitecture="*" name="MapleStoryAnalyzer" type="win32"/>
   <description>Maple Insight live efficiency HUD</description>
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>

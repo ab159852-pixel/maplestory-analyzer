@@ -457,6 +457,7 @@ class StatPanelOcr:
         *,
         allow_full_validation: bool = True,
         slot_images: Mapping[str, Image.Image] | None = None,
+        live: bool = False,
     ) -> dict[str, int]:
         """Read shortcut quantities from the requested cells in the parent bar.
 
@@ -518,6 +519,7 @@ class StatPanelOcr:
                     blue,
                     slot_images=slot_images,
                     previous_counts=previous_counts,
+                    live=live,
                 )
             except TypeError:
                 # Keep test doubles and older plug-in OCR adapters that still
@@ -636,6 +638,7 @@ class StatPanelOcr:
         *,
         slot_images: Mapping[str, Image.Image] | None = None,
         previous_counts: Mapping[str, int] | None = None,
+        live: bool = False,
     ) -> dict[str, int]:
         """Read configured cells without running full-bar text detection.
 
@@ -704,6 +707,7 @@ class StatPanelOcr:
             pending,
             blue_slot_ids=blue_slot_ids,
             previous_counts=previous_counts,
+            live=live,
         )
         numeric_engine_available = getattr(self, "_numeric_engine", None) is not None
 
@@ -762,6 +766,7 @@ class StatPanelOcr:
         *,
         blue_slot_ids: set[str],
         previous_counts: Mapping[str, int] | None = None,
+        live: bool = False,
     ) -> dict[str, int]:
         """Read pending shortcut quantity strips in one numeric-model batch.
 
@@ -787,9 +792,18 @@ class StatPanelOcr:
                 strip,
                 blue=slot_id in blue_slot_ids,
                 layout_hint=(previous_counts or {}).get(slot_id),
+                live=live,
             )
             for view_name, view in views:
-                key = f"shortcut:{slot_id}:{view_name}"
+                key_view_name = view_name
+                # Older portable adapters expose only ``read_fields`` and
+                # historically received the short view names (``rgb`` /
+                # ``white170``) rather than the diagnostic ``raw-`` prefix.
+                # Keep that compatibility path without changing the keys
+                # used by the bundled digit-only recognizer.
+                if not callable(getattr(numeric_engine, "read_digit_fields", None)):
+                    key_view_name = view_name.removeprefix("raw-")
+                key = f"shortcut:{slot_id}:{key_view_name}"
                 batch[key] = view
                 owners[key] = slot_id
 
@@ -841,10 +855,29 @@ class StatPanelOcr:
         # independent colour view to agree, so it cannot turn a threshold
         # majority into a guessed quantity.
         recovery_pending = {
-            slot_id: item
-            for slot_id, item in pending.items()
-            if slot_id not in result
+            slot_key: item
+            for slot_key, item in pending.items()
+            # ``pending`` is keyed by ``slot_id:colour`` while ``result`` is
+            # keyed by the plain slot id. Comparing the former directly to
+            # the latter made every successful live read launch the expensive
+            # recovery batch as well, which was the main reason potion counts
+            # appeared several scans late.
+            # A completely blank primary batch is retried on the next live
+            # sample; only a conflicting/partial numeric candidate deserves
+            # the taller recovery crop in this same call.
+            if item[0] not in result and candidates.get(item[0])
         }
+        if live:
+            # The configured-cell worker has a hard 0.3-0.7s game-animation
+            # deadline. A conflicting primary read is not allowed to launch
+            # the much larger recovery batch in this call: that batch measured
+            # about 0.7s by itself on a CPU-only machine and made an otherwise
+            # healthy sample appear several bottles late. The cell signature
+            # remains uncached when unresolved, so the next live frame retries
+            # it naturally. Non-live callers retain the full diagnostic
+            # recovery below.
+            return result
+
         if recovery_pending:
             recovery_batch: dict[str, Image.Image] = {}
             recovery_owners: dict[str, str] = {}
@@ -856,7 +889,10 @@ class StatPanelOcr:
                     strip,
                     blue=slot_id in blue_slot_ids,
                 ):
-                    key = f"shortcut-recovery:{slot_id}:{view_name}"
+                    key_view_name = view_name
+                    if not callable(getattr(numeric_engine, "read_digit_fields", None)):
+                        key_view_name = view_name.removeprefix("raw-")
+                    key = f"shortcut-recovery:{slot_id}:{key_view_name}"
                     recovery_batch[key] = view
                     recovery_owners[key] = slot_id
             if recovery_batch:
@@ -1349,6 +1385,7 @@ def _shortcut_numeric_views(
     *,
     blue: bool,
     layout_hint: int | None = None,
+    live: bool = False,
 ) -> list[tuple[str, Image.Image]]:
     """Build small, independent views for the already isolated quantity strip.
 
@@ -1365,6 +1402,20 @@ def _shortcut_numeric_views(
     """
     rgb = image.convert("RGB")
     prefix = "raw-"
+    if live:
+        # The live monitor is a deadline-driven path.  The numeric model is
+        # already specialized for a pre-cropped digit strip, so one untouched
+        # colour view plus one white-glyph threshold is enough to require an
+        # independent agreement without running ten model images whenever two
+        # configured slots redraw.  The full family below remains available
+        # for non-live validation and the diagnostic recovery retry.
+        gray = ImageOps.autocontrast(ImageOps.grayscale(rgb))
+        white = gray.point(lambda pixel: 255 if pixel >= 170 else 0)
+        return [
+            (f"{prefix}rgb", rgb),
+            (f"{prefix}white170", white.convert("RGB")),
+        ]
+
     gray = ImageOps.autocontrast(ImageOps.grayscale(rgb))
     gray_rgb = ImageEnhance.Contrast(gray).enhance(1.35).convert("RGB")
     views: list[tuple[str, Image.Image]] = [
@@ -1490,7 +1541,11 @@ def _right_aligned_quantity_crop(image: Image.Image) -> Image.Image:
         # Right-align every candidate to the complete cell edge.  Do not
         # crop at the detected bright-pixel edge: anti-aliased strokes and a
         # narrow final digit can occupy the last one or two columns.
-        crop_right = width
+        # Keep a small right-side safety pad, but do not retain the whole
+        # cell. The pad preserves anti-aliased pixels on the final glyph
+        # while keeping the proportional crop right-aligned for the numeric
+        # recognizer and its cache signature.
+        crop_right = min(width, right + max(2, round(width * 0.05)))
         if crop_right - crop_left < 3 or crop_right <= crop_left:
             return image
         # Do not normalize a candidate that nearly equals the entire cell;

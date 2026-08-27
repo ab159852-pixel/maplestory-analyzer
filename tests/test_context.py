@@ -4,6 +4,14 @@ from __future__ import annotations
 from PIL import Image
 
 from maple_analyzer.monitor import extract_context
+from maple_analyzer.regions import CONTEXT_BOXES
+
+
+def test_reference_map_boxes_cover_the_second_mini_map_text_row():
+    # In the 1351x800 reference client, the first map text row ends before
+    # y=75 and the actual map title occupies the second row below it.
+    assert CONTEXT_BOXES["map"] == (0, 75, 145, 101)
+    assert CONTEXT_BOXES["map_wide"] == (0, 70, 200, 110)
 
 
 class _ContextOcr:

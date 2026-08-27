@@ -37,6 +37,10 @@ from .settings import PotionSlotConfig
 AUX_SCAN_MIN_MS = 150
 PICKUP_SCAN_MIN_MS = 100
 PICKUP_DETECTION_INTERVAL_S = 0.35
+# The potion and pickup workers share one screen grab.  A very small cache
+# prevents both workers from asking WGC/mss for the same frame when their
+# deadlines overlap, without making the quantity older than one redraw.
+AUX_CAPTURE_CACHE_SECONDS = 0.05
 # The EXP percentage is rounded to two decimals. Keep the display guard as
 # loose as Session.EXP_TOTAL_BAND, but prevent a structurally valid OCR frame
 # from replacing a good same-level value with an impossible total.
@@ -480,7 +484,7 @@ class BackgroundMonitor:
         ocr: Any,
         *,
         sample_interval_ms: int = 300,
-        aux_scan_ms: int = 200,
+        aux_scan_ms: int = 150,
         pickup_interval_ms: int = 200,
         context_scan_ms: int = 3000,
     ) -> None:
@@ -488,6 +492,9 @@ class BackgroundMonitor:
         self.ocr = ocr
         self.status_queue: queue.Queue[StatusReading] = queue.Queue(maxsize=24)
         self.auxiliary_queue: queue.Queue[AuxiliaryReading] = queue.Queue(maxsize=4)
+        # Potion readings must not be evicted by the much noisier pickup-feed
+        # stream.  The UI drains both queues in timestamp order.
+        self.potion_queue: queue.Queue[AuxiliaryReading] = queue.Queue(maxsize=8)
         self.context_queue: queue.Queue[ContextReading] = queue.Queue(maxsize=2)
         self._stop = threading.Event()
         self._status_enabled = threading.Event()
@@ -498,6 +505,9 @@ class BackgroundMonitor:
         self._potion_request = threading.Event()
         self._pickup_request = threading.Event()
         self._context_request = threading.Event()
+        self._potion_scan_active = threading.Event()
+        self._aux_capture_lock = threading.Lock()
+        self._aux_capture_cache: tuple[float, dict[str, Any]] | None = None
         self._lock = threading.Lock()
         # RapidOCR/ONNX objects are shared by status, pickup and context
         # workers. Their public wrapper is not safe for concurrent inference;
@@ -590,6 +600,7 @@ class BackgroundMonitor:
         self._stop.set()
         self._status_enabled.set()
         self._aux_enabled.set()
+        self._potion_scan_active.clear()
         for thread in self._threads:
             thread.join(timeout=0.8)
         self._threads.clear()
@@ -655,9 +666,34 @@ class BackgroundMonitor:
             # to fall back to all eight cells.
             self._potion_slots = configured
 
+    def _grab_auxiliary_cached(self) -> dict[str, Any]:
+        """Capture one short-lived auxiliary frame for both workers."""
+        now = time.monotonic()
+        with self._aux_capture_lock:
+            cached = self._aux_capture_cache
+            if cached is not None and now - cached[0] <= AUX_CAPTURE_CACHE_SECONDS:
+                return cached[1]
+            regions = self.source.grab_auxiliary()
+            self._aux_capture_cache = (time.monotonic(), regions)
+            return regions
+
     def _status_loop(self) -> None:
         while not self._stop.is_set():
             if not self._status_enabled.wait(0.1):
+                continue
+            # A configured shortcut change is the billing signal and has a
+            # shorter deadline than the status display.  Do not let a status
+            # frame begin while the potion worker has a requested/active
+            # sample; skipping one status frame is preferable to making a
+            # 0.3-0.7s drink update wait behind HP/MP/EXP OCR.
+            with self._lock:
+                potion_priority = (
+                    self._track_potions and bool(self._configured_potion_slots)
+                )
+            if potion_priority and (
+                self._potion_request.is_set() or self._potion_scan_active.is_set()
+            ):
+                self._stop.wait(0.01)
                 continue
             started = time.perf_counter()
             bar_flash: tuple[str, ...] = ()
@@ -679,7 +715,13 @@ class BackgroundMonitor:
                     if name.startswith("__bar_")
                 }
                 bar_flash = self._bar_flash_detector.update(bar_images)
-                with self._ocr_lock:
+                # A potion scan may have started while this frame was being
+                # captured.  It owns the lock priority; discard this status
+                # frame instead of waiting on the lock and delaying billing.
+                if not self._ocr_lock.acquire(blocking=False):
+                    self._stop.wait(0.01)
+                    continue
+                try:
                     read_fields = getattr(self.ocr, "read_fields", None)
                     if callable(read_fields):
                         field_text = read_fields(ocr_images)
@@ -688,6 +730,8 @@ class BackgroundMonitor:
                             name: self.ocr.read_field(image)
                             for name, image in ocr_images.items()
                         }
+                finally:
+                    self._ocr_lock.release()
                 snapshot = parse_fields(field_text)
                 error = None
             except RuntimeError as exc:
@@ -723,17 +767,18 @@ class BackgroundMonitor:
                 potion_interval = self._aux_scan_ms / 1000
                 configured_slots = self._configured_potion_slots
             if not track_potions or not configured_slots:
+                self._potion_request.clear()
                 self._stop.wait(0.1)
                 continue
             if not requested and now < next_potion_scan:
                 self._stop.wait(min(0.1, next_potion_scan - now))
                 continue
             self._potion_request.clear()
-            next_potion_scan = now + potion_interval
+            self._potion_scan_active.set()
             try:
                 with self._lock:
                     slots = self._potion_slots
-                regions = self.source.grab_auxiliary()
+                regions = self._grab_auxiliary_cached()
                 # Quantity changes are the hard real-time signal: a potion
                 with self._ocr_lock:
                     counts = self._read_potion_counts(regions, configured_slots, slots)
@@ -743,7 +788,7 @@ class BackgroundMonitor:
                 # machines. A slow money retry must never delay a 0.2-0.3s
                 # shortcut sample or make the quantity appear stale.
                 _put_latest(
-                    self.auxiliary_queue,
+                    self.potion_queue,
                     AuxiliaryReading(
                         counts=counts,
                         timestamp=time.monotonic(),
@@ -752,14 +797,17 @@ class BackgroundMonitor:
                 )
             except RuntimeError as exc:
                 _put_latest(
-                    self.auxiliary_queue,
+                    self.potion_queue,
                     AuxiliaryReading(error=str(exc), timestamp=time.monotonic()),
                 )
             except Exception as exc:
                 _put_latest(
-                    self.auxiliary_queue,
+                    self.potion_queue,
                     AuxiliaryReading(error=f"OCR: {exc}", timestamp=time.monotonic()),
                 )
+            finally:
+                self._potion_scan_active.clear()
+                next_potion_scan = time.monotonic() + potion_interval
 
     def _read_potion_counts(
         self,
@@ -797,6 +845,7 @@ class BackgroundMonitor:
                         regions["shortcut"], configured_ids, blue_ids,
                         allow_full_validation=False,
                         slot_images=slot_images,
+                        live=True,
                     )
                 except TypeError:
                     try:
@@ -863,11 +912,25 @@ class BackgroundMonitor:
                 self._stop.wait(min(0.1, next_pickup_scan - now))
                 continue
             self._pickup_request.clear()
-            next_pickup_scan = now + pickup_interval
+            # A potion quantity frame has priority over the optional full
+            # pickup detector.  The latter can invoke detector OCR and take
+            # hundreds of milliseconds; never let it hold the shared model
+            # lock in front of a configured shortcut cell.
+            if self._potion_scan_active.is_set():
+                self._stop.wait(0.01)
+                continue
             try:
-                regions = self.source.grab_auxiliary()
-                with self._ocr_lock:
+                regions = self._grab_auxiliary_cached()
+                if self._potion_scan_active.is_set():
+                    self._stop.wait(0.01)
+                    continue
+                if not self._ocr_lock.acquire(blocking=False):
+                    self._stop.wait(0.01)
+                    continue
+                try:
                     lines = self._read_pickup_lines(regions, now)
+                finally:
+                    self._ocr_lock.release()
                 _put_latest(
                     self.auxiliary_queue,
                     AuxiliaryReading(
@@ -886,6 +949,8 @@ class BackgroundMonitor:
                     self.auxiliary_queue,
                     AuxiliaryReading(error=f"OCR: {exc}", timestamp=time.monotonic()),
                 )
+            finally:
+                next_pickup_scan = time.monotonic() + pickup_interval
 
     def _read_pickup_lines(self, regions: dict[str, Any], now: float) -> list[tuple[str, float]]:
         feed_signature = _image_signature(regions.get("pickup"))
@@ -1002,8 +1067,17 @@ class BackgroundMonitor:
         while not self._stop.is_set():
             try:
                 regions = grab_context()
-                with self._ocr_lock:
+                # Context is useful before Start, but it is not a real-time
+                # signal.  Never make the potion worker wait for a full CJK
+                # detector pass just because a scheduled map refresh landed
+                # at the same instant.
+                if not self._ocr_lock.acquire(blocking=False):
+                    self._stop.wait(0.02)
+                    continue
+                try:
                     reading = extract_context(self.ocr, regions)
+                finally:
+                    self._ocr_lock.release()
                 _put_latest(self.context_queue, reading)
             except RuntimeError as exc:
                 _put_latest(self.context_queue, ContextReading(error=str(exc)))

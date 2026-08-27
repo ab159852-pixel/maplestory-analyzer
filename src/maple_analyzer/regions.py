@@ -137,14 +137,16 @@ AUXILIARY_BOXES = {
 # line below it.  The older crop included both and frequently published the
 # player name as the job.  Keep this crop on the class line only.
 CONTEXT_BOXES = {
-    # This is the second line under the mini-map header: the actual map name
-    # (e.g. 第3軍營), not the first-line world/region label (維多利亞).
-    "map": (0, 42, 130, 63),
-    # A wider retry for clients where the tiny text is shifted left or the
-    # recognition model drops the leading "第3" and returns only "軍/營".
-    # Keep the focused crop above for the cheap first pass; the monitor only
-    # uses this alternate crop when it needs to confirm the map.
-    "map_wide": (0, 39, 180, 67),
+    # The mini-map has two text rows below its tab strip.  The first row is
+    # the region/world (for example 維多利亞); the second row is the actual
+    # map (for example 魔法森林北部 or 第3軍營).  The previous y=42..63
+    # crop was still on the header/first row, which is why the live map name
+    # was either wrong or became a noisy partial fragment.
+    "map": (0, 75, 145, 101),
+    # Keep the second row plus a small horizontal/vertical safety margin for
+    # DPI rounding and longer map names.  This remains a separate retry, not
+    # part of the high-frequency status/potion OCR path.
+    "map_wide": (0, 70, 200, 110),
     "job": (335, 768, 500, 795),
 }
 

@@ -591,14 +591,24 @@ class EconomyTracker:
                 observations.append(MesosObservation(amount, y))
         return self._mesos.update(observations, now)
 
-    def record_quick_slot_counts(self, counts: dict[str, int], now: float | None = None) -> int:
+    def record_quick_slot_counts(
+        self,
+        counts: dict[str, int],
+        now: float | None = None,
+        *,
+        immediate: bool = False,
+    ) -> int:
         """Register potion use from observed shortcut quantity decreases.
 
     In the live session, upward quantity changes are not potion events.  A
-    decrease must be corroborated by a second nearby lower OCR sample (the
-    value may step down again during a rapid drink animation) before it
-    becomes a provisional charge.  A later stable increase toward the session
-    baseline can roll that charge back when the lower value was an OCR error.
+    decrease normally must be corroborated by a second nearby lower OCR sample
+    (the value may step down again during a rapid drink animation) before it
+    becomes a provisional charge.  The live monitor can opt into ``immediate``
+    mode after the numeric colour/threshold consensus has already passed: the
+    cost is then visible on the first valid lower frame, while the existing
+    stable upward-correction path can roll it back if that frame was OCR noise.
+    A later stable increase toward the session baseline can always reverse a
+    provisional charge when the lower value was an OCR error.
         """
         timestamp = time.monotonic() if now is None else now
         valid_counts = {
@@ -623,6 +633,19 @@ class EconomyTracker:
             # changed the stack once; measuring from that last frame made a
             # real 0.3-0.7s potion change stay blocked forever.
             self._slot_last_sample_at[slot_id] = timestamp
+            if slot_id not in self._shortcut_baseline:
+                # One configured cell can be temporarily unreadable while a
+                # neighbouring cell is already stable. Establish a baseline
+                # per slot when that cell first becomes visible; otherwise a
+                # later drop in that slot would have no reference quantity
+                # and could never be charged.
+                self._shortcut_baseline[slot_id] = current
+                self._slot_counts[slot_id] = current
+                self._shortcut_observed[slot_id] = current
+                self._slot_charged[slot_id] = 0
+                self._slot_last_accepted_at[slot_id] = timestamp
+                self._slot_candidates.pop(slot_id, None)
+                continue
             previous = self._slot_counts.get(slot_id)
             if previous is None:
                 self._slot_counts[slot_id] = current
@@ -776,7 +799,7 @@ class EconomyTracker:
             # two identical frames make the observation billable, while a
             # later stable increase toward the session baseline rolls back
             # the overcharge.
-            confirmations_required = SLOT_CONFIRMATIONS_REQUIRED
+            confirmations_required = 1 if immediate else SLOT_CONFIRMATIONS_REQUIRED
             if (
                 confirmations >= confirmations_required
                 or flash_confirmed
@@ -967,7 +990,7 @@ class EconomyTracker:
                 continue
             trusted = self._slot_counts.get(slot_id, baseline)
             if (
-                baseline >= current > trusted
+                baseline > current > trusted
                 and self._slot_charged.get(slot_id, 0) > 0
             ):
                 rollback = min(

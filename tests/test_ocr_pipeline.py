@@ -370,10 +370,37 @@ def test_shortcut_numeric_batch_uses_colour_recovery_for_a_three_digit_cell():
     ) == {"8": 920}
 
 
+def test_live_shortcut_numeric_batch_uses_two_views_per_configured_cell():
+    from PIL import Image
+
+    class CountingNumeric:
+        def __init__(self):
+            self.calls = []
+
+        def read_digit_fields(self, images, *, max_digits=4):
+            self.calls.append(tuple(images))
+            return {key: "1830" for key in images}
+
+    numeric = CountingNumeric()
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._numeric_engine = numeric
+    image = Image.new("RGB", (39, 36))
+    assert ocr._read_shortcut_numeric_batch(
+        {"6": ("6", image), "7": ("7", image)},
+        blue_slot_ids={"7"},
+        previous_counts={},
+        live=True,
+    ) == {"6": 1830, "7": 1830}
+    # Live tracking keeps the independent colour/threshold guard, but does
+    # not pay for the full diagnostic family or recovery batch on every redraw.
+    assert len(numeric.calls[0]) == 4
+    assert len(numeric.calls) == 1
+
+
 def test_shortcut_layout_pattern_tracks_every_narrow_one_without_fixed_slots():
     assert ocr_module._shortcut_layout_pattern(1105) == "11xx"
     assert ocr_module._shortcut_layout_pattern(1115) == "111x"
-    assert ocr_module._shortcut_layout_pattern(1005) == "1xx1"
+    assert ocr_module._shortcut_layout_pattern(1001) == "1xx1"
     assert ocr_module._shortcut_layout_pattern(2105) == "x1xx"
     assert ocr_module._shortcut_layout_pattern(2115) == "x11x"
 

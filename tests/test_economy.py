@@ -86,6 +86,42 @@ def test_fast_auxiliary_samples_confirm_a_real_quantity_change_after_rate_window
     assert tracker.snapshot.hp_potion_cost == 25
 
 
+def test_live_auxiliary_sample_charges_immediately_and_can_be_reversed():
+    tracker = EconomyTracker([
+        PotionSlotConfig(slot="7", name="Blue Potion", kind="mp", cost=40),
+    ])
+    tracker.prime_quick_slot_counts({"7": 1830}, now=0)
+
+    # The live OCR path has already required colour/threshold agreement, so
+    # the cost should follow the first valid lower frame rather than waiting
+    # for another identical frame.
+    assert tracker.record_quick_slot_counts(
+        {"7": 1630}, now=0.3, immediate=True
+    ) == 200
+    assert tracker.snapshot.mp_potion_cost == 8_000
+
+    # A later stable return to the real quantity removes the provisional
+    # charge instead of leaving the economy total permanently inflated.
+    tracker.record_quick_slot_counts({"7": 1830}, now=0.6, immediate=True)
+    tracker.record_quick_slot_counts({"7": 1830}, now=0.9, immediate=True)
+    assert tracker.snapshot.mp_potion_uses == 0
+    assert tracker.snapshot.mp_potion_cost == 0
+
+
+def test_late_first_read_for_a_slot_establishes_its_own_baseline():
+    tracker = EconomyTracker([
+        PotionSlotConfig(slot="6", name="HP Potion", kind="hp", cost=25),
+        PotionSlotConfig(slot="7", name="MP Potion", kind="mp", cost=40),
+    ])
+    tracker.prime_quick_slot_counts({"6": 2676}, now=0)
+    # Slot 7 was unreadable in the first frame; its first later value must be
+    # calibration, not a drop from an absent/zero quantity.
+    tracker.record_quick_slot_counts({"6": 2676, "7": 1875}, now=0.3)
+    tracker.record_quick_slot_counts({"7": 1874}, now=0.6, immediate=True)
+    assert tracker.snapshot.hp_potion_uses == 0
+    assert tracker.snapshot.mp_potion_uses == 1
+
+
 def test_bar_flash_can_confirm_one_frame_drop_but_never_creates_cost_alone():
     tracker = EconomyTracker([
         PotionSlotConfig(slot="6", name="HP Potion", kind="hp", cost=25),
