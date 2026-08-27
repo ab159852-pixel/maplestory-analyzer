@@ -32,7 +32,6 @@ from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from .numeric_ocr import OnnxNumericRecognizer, crop_level_badge
 from .regions import (
     MAX_SHORTCUT_QUANTITY,
-    MAX_SHORTCUT_SINGLE_SAMPLE_DROP,
     Box,
     SHORTCUT_BOX,
     SHORTCUT_SLOT_BOXES,
@@ -48,6 +47,12 @@ from .regions import (
 # per-cell path remains active between validations; a failed full detector must
 # not force another 2–3 second detector pass on every potion sample.
 SHORTCUT_FULL_VALIDATION_INTERVAL_SECONDS = 30.0
+# RapidOCR owns separate detector/classifier/recognizer ONNX sessions.  The
+# default package configuration uses all CPU cores in each session, which is
+# disproportionate for the small fixed crops used here and causes input lag
+# when the game is not the foreground window.
+RAPIDOCR_INTRA_OP_THREADS = 1
+RAPIDOCR_INTER_OP_THREADS = 1
 
 
 @dataclass(frozen=True)
@@ -76,7 +81,16 @@ class StatPanelOcr:
         # window.
         from rapidocr_onnxruntime import RapidOCR
 
-        self._engine = RapidOCR()
+        try:
+            self._engine = RapidOCR(
+                intra_op_num_threads=RAPIDOCR_INTRA_OP_THREADS,
+                inter_op_num_threads=RAPIDOCR_INTER_OP_THREADS,
+            )
+        except TypeError:
+            # Keep source builds with an older RapidOCR wrapper usable.  The
+            # pinned Windows package accepts these limits; this fallback is
+            # only for third-party/custom adapters with the old signature.
+            self._engine = RapidOCR()
         self._shortcut_last_fast_counts: dict[str, int] | None = None
         self._shortcut_last_full_counts: dict[str, int] = {}
         self._shortcut_last_validation_at = 0.0
@@ -620,12 +634,16 @@ class StatPanelOcr:
             if (
                 last_signatures.get(slot_key) == signature
                 and slot_key in last_values
+                and last_values[slot_key] is not None
             ):
                 cached_count = last_values[slot_key]
                 current_values[slot_key] = cached_count
-                if cached_count is not None:
-                    counts[str(slot_id)] = cached_count
+                counts[str(slot_id)] = cached_count
                 continue
+            # A failed OCR result is deliberately not reusable cache data.
+            # Reusing a cached None here made an unchanged quantity crop stay
+            # permanently unreadable after one ambiguous frame, exactly when
+            # a multi-bottle drop needed a fresh read.
             pending[slot_key] = (str(slot_id), crop)
 
         # The numeric recognizer is cheap when used as one ONNX batch, but
@@ -682,7 +700,11 @@ class StatPanelOcr:
                     )
             if count is not None:
                 counts[slot_id] = count
-            current_values[slot_key] = count
+                current_values[slot_key] = count
+            else:
+                # Do not persist a blank result as if it were a successful
+                # OCR decision.  The same crop must be retried next tick.
+                current_values.pop(slot_key, None)
         self._shortcut_last_cell_signatures = current_signatures
         self._shortcut_last_cell_values = current_values
         return counts
@@ -714,7 +736,11 @@ class StatPanelOcr:
             strip = _shortcut_quantity_strip(crop)
             if strip.width <= 1 or strip.height <= 1:
                 continue
-            views = _shortcut_numeric_views(strip, blue=slot_id in blue_slot_ids)
+            views = _shortcut_numeric_views(
+                strip,
+                blue=slot_id in blue_slot_ids,
+                layout_hint=(previous_counts or {}).get(slot_id),
+            )
             for view_name, view in views:
                 key = f"shortcut:{slot_id}:{view_name}"
                 batch[key] = view
@@ -780,7 +806,11 @@ class StatPanelOcr:
         if strip.width <= 1 or strip.height <= 1:
             return None
 
-        numeric_views = _shortcut_numeric_views(strip, blue=blue)
+        numeric_views = _shortcut_numeric_views(
+            strip,
+            blue=blue,
+            layout_hint=previous,
+        )
         numeric_candidates: list[tuple[int, str]] = []
         numeric_available = getattr(self, "_numeric_engine", None) is not None
         for view_name, variant in numeric_views:
@@ -1176,7 +1206,10 @@ def _numeric_shortcut_text_is_clean(text: str) -> bool:
 
 
 def _shortcut_numeric_views(
-    image: Image.Image, *, blue: bool
+    image: Image.Image,
+    *,
+    blue: bool,
+    layout_hint: int | None = None,
 ) -> list[tuple[str, Image.Image]]:
     """Build small, independent views for the already isolated quantity strip.
 
@@ -1215,6 +1248,26 @@ def _shortcut_numeric_views(
         views.extend(
             (f"{prefix}{channel.lower()}", rgb.getchannel(channel).convert("RGB"))
             for channel in ("R", "G")
+        )
+
+    # A known four-digit quantity gives us a safe layout hypothesis.  Maple's
+    # digit ``1`` is narrower, but the string remains right aligned; the
+    # hypothesis therefore changes only the left safety margin and never the
+    # right edge. Keep it as an independent corroboration view instead of
+    # replacing the full/detected crop, so a bad previous OCR value cannot
+    # cut the real number out of every view.
+    pattern_crop = _shortcut_pattern_quantity_crop(image, layout_hint)
+    if pattern_crop is not None:
+        pattern_rgb = pattern_crop.convert("RGB")
+        pattern_gray = ImageOps.autocontrast(ImageOps.grayscale(pattern_rgb))
+        pattern_white = pattern_gray.point(
+            lambda pixel: 175 if pixel >= 175 else 0
+        ).convert("RGB")
+        views.extend(
+            (
+                ("layout-rgb", pattern_rgb),
+                ("layout-white175", pattern_white),
+            )
         )
     return views
 
@@ -1269,10 +1322,11 @@ def _right_aligned_quantity_crop(image: Image.Image) -> Image.Image:
         max_gap = max(2, round(width * 0.08))
         for mask in masks:
             active = mask[y0:y1].sum(axis=0) >= 1
-            # The measured cell boundary and separator are not glyphs.  Never
-            # use their two outer columns as the right anchor.
+            # The measured cell boundary is not a glyph.  Keep the rightmost
+            # columns available: the final outlined digit may touch that edge
+            # after DPI scaling, and deleting them is how a complete value
+            # becomes 157/57.  Only the left border is excluded as an anchor.
             active[:2] = False
-            active[-2:] = False
             indices = np.flatnonzero(active)
             if not len(indices):
                 continue
@@ -1288,30 +1342,44 @@ def _right_aligned_quantity_crop(image: Image.Image) -> Image.Image:
                 previous = current
             runs.append((start, previous + 1))
 
-            for left, right in runs:
-                run_width = right - left
-                if run_width < 3 or run_width > max(6, round(width * 0.92)):
-                    continue
-                # A quantity is rendered toward the right side of its cell.
-                # Reject isolated artwork at the far left, but allow a single
-                # narrow digit such as ``1``.
-                if right < round(width * 0.38):
-                    continue
-                area = int(mask[y0:y1, left:right].sum())
-                if area < max(3, round(height * 0.10)):
-                    continue
-                # Rightmost wins first; area is only a tie-breaker for the
-                # two threshold masks. This follows the game's alignment rule.
-                score = float(right) * 10.0 + min(area, 100) * 0.01
-                candidates.append((score, left, right))
+            if not runs:
+                continue
+
+            # A proportional string is made of several narrow glyph runs.
+            # Join nearby runs from the right instead of selecting only the
+            # last connected component; the latter loses the leading 1 (or
+            # any digit separated by a wider anti-aliased gap).  The gap is
+            # relative to the measured cell so this remains DPI-safe.
+            right = runs[-1][1]
+            left = runs[-1][0]
+            join_gap = max(3, round(width * 0.14))
+            for previous_left, previous_right in reversed(runs[:-1]):
+                if left - previous_right > join_gap:
+                    break
+                left = previous_left
+            run_width = right - left
+            if run_width < 3 or run_width > max(6, round(width * 0.98)):
+                continue
+            # A quantity is rendered toward the right side of its cell.
+            # Reject isolated artwork at the far left, but allow a single
+            # narrow digit such as ``1``.
+            if right < round(width * 0.38):
+                continue
+            area = int(mask[y0:y1, left:right].sum())
+            if area < max(3, round(height * 0.10)):
+                continue
+            score = float(right) * 10.0 + min(area, 100) * 0.01
+            candidates.append((score, left, right))
 
         if not candidates:
             return image
         _score, left, right = max(candidates)
         left_pad = max(1, round(width * 0.04))
-        right_pad = max(1, round(width * 0.03))
         crop_left = max(0, left - left_pad)
-        crop_right = min(width, right + right_pad)
+        # Right-align every candidate to the complete cell edge.  Do not
+        # crop at the detected bright-pixel edge: anti-aliased strokes and a
+        # narrow final digit can occupy the last one or two columns.
+        crop_right = width
         if crop_right - crop_left < 3 or crop_right <= crop_left:
             return image
         # Do not normalize a candidate that nearly equals the entire cell;
@@ -1323,6 +1391,62 @@ def _right_aligned_quantity_crop(image: Image.Image) -> Image.Image:
         # Numeric OCR must remain available in minimal source environments and
         # should never fail merely because this optional geometry hint failed.
         return image
+
+
+def _shortcut_layout_pattern(value: int | None) -> str | None:
+    """Describe a four-digit quantity by the glyphs that change its width."""
+    if not isinstance(value, int) or not 1000 <= value <= MAX_SHORTCUT_QUANTITY:
+        return None
+    text = str(value)
+    if len(text) != 4:
+        return None
+    return "".join("1" if digit == "1" else "x" for digit in text)
+
+
+def _shortcut_pattern_quantity_crop(
+    image: Image.Image, layout_hint: int | None
+) -> Image.Image | None:
+    """Create a right-anchored safety crop for a known digit-width pattern.
+
+    The game does not use four equal character cells. This is deliberately a
+    *safety* crop: it may retain a little extra left-side background, but it
+    cannot remove the leading glyph. Each occurrence of the narrow ``1``
+    expands the left margin, so patterns such as ``11xx`` and ``111x`` get a
+    different range without a table of fragile absolute coordinates.
+    """
+    pattern = _shortcut_layout_pattern(layout_hint)
+    if pattern is None:
+        return None
+    width, height = image.size
+    if width <= 4 or height <= 3:
+        return None
+
+    detected = _right_aligned_quantity_crop(image)
+    # ``_right_aligned_quantity_crop`` returns the original image when the
+    # bright glyph mask is temporarily unavailable.  Treat that as "no
+    # detected left edge", not as a left edge at zero; otherwise the fallback
+    # pattern range would silently become the same full-cell crop for every
+    # layout hint.
+    detected_left = width if detected is image else max(0, width - detected.width)
+    narrow_count = pattern.count("1")
+    # Leave a generous base envelope for four ordinary glyphs, then widen it
+    # toward the left for every narrow 1.  Subtract the narrow-glyph margin:
+    # adding a ``1`` must move the left edge left, never right.  All ratios are
+    # based on the actual cell width, so the same module follows DPI/client
+    # scaling.
+    base_width = max(1, round(width * 0.78))
+    narrow_margin = max(1, round(width * 0.04))
+    safety_margin = max(1, round(width * 0.05))
+    pattern_left = max(
+        0,
+        width - base_width - narrow_count * narrow_margin - safety_margin,
+    )
+    # Never move right of the pixel-derived crop: a weak pattern hint must
+    # only enlarge the trusted envelope, not introduce a new clipping edge.
+    left = min(detected_left, pattern_left)
+    if left >= width - 2:
+        return None
+    return image.crop((left, 0, width, height))
 
 
 def _select_shortcut_numeric_views(
@@ -1346,7 +1470,8 @@ def _select_shortcut_numeric_views(
         values = [
             (value, view_name)
             for value, view_name in values
-            if value <= previous and previous - value <= MAX_SHORTCUT_SINGLE_SAMPLE_DROP
+            if value <= previous
+            and not _is_shortcut_numeric_truncation(previous, value)
         ]
     if not values:
         return None
@@ -1394,18 +1519,24 @@ def _select_shortcut_numeric_views(
 def _numeric_view_base_name(view_name: str) -> str:
     """Remove preprocessing prefixes before classifying a numeric view.
 
-    Dynamic quantity normalization adds ``aligned-`` to the view name.  The
-    selector still needs to recognize ``aligned-white170`` as a protected
-    threshold view and ``aligned-rgb`` as an independent colour view.  Keep
-    this normalization local to the selector so existing cache/test names
-    (``white170``, ``soft-rgb``) remain valid.
+    Dynamic/pattern quantity normalization adds prefixes to the view name.
+    The selector still needs to recognize ``aligned-white170`` and
+    ``layout-white175`` as protected threshold views while treating their RGB
+    partners as independent colour views. Keep this normalization local to
+    the selector so existing cache/test names (``white170``, ``soft-rgb``)
+    remain valid.
     """
     name = str(view_name)
     if name.startswith("soft-"):
         name = name[5:]
-    for prefix in ("aligned-", "raw-"):
-        if name.startswith(prefix):
-            name = name[len(prefix):]
+    changed = True
+    while changed:
+        changed = False
+        for prefix in ("aligned-", "layout-", "raw-"):
+            if name.startswith(prefix):
+                name = name[len(prefix):]
+                changed = True
+                break
     return name
 
 
@@ -1415,14 +1546,12 @@ def _select_shortcut_numeric_candidate(
     previous: int | None,
     blue: bool,
 ) -> int | None:
-    """Select numeric-model output without accepting a large one-frame jump.
+    """Select numeric-model output without deciding its cost immediately.
 
     The quantity font is small enough that two different digit shapes can
-    both be syntactically valid. When a previous value is available, only a
-    small downward movement is safe for a single live sample; an isolated
-    value such as ``1830 -> 1630`` is returned as unreadable and left for the
-    next frame/reconciliation. This is deliberately conservative: a wrong
-    cost is worse than a temporarily stale display.
+    both be syntactically valid. Keep clear truncations out of the OCR stream,
+    but pass a complete multi-bottle decrease to the economy layer, where two
+    frames and later upward correction can distinguish it from an OCR jump.
     """
     values = [
         value
@@ -1436,7 +1565,7 @@ def _select_shortcut_numeric_candidate(
             value
             for value in values
             if value <= previous
-            and previous - value <= MAX_SHORTCUT_SINGLE_SAMPLE_DROP
+            and not _is_shortcut_numeric_truncation(previous, value)
         ]
         if not plausible:
             return None
@@ -1514,11 +1643,11 @@ def _shortcut_crop_signature(image: Image.Image) -> tuple:
 
 
 def _is_probable_shortcut_ocr_change(previous: int, current: int) -> bool:
-    """Accept only a small non-suffix decrease from a cached quantity.
+    """Accept a non-truncated decrease from a cached quantity.
 
-    A one-frame value with a two-digit jump is not safe to publish as a live
-    inventory change. It can still be recovered by the next numeric frame or
-    by the final session reconciliation.
+    The economy layer performs the temporal/multi-frame decision.  The OCR
+    layer must not discard a real multi-bottle decrease before that layer can
+    see it; its job here is only to remove clear suffix/truncation reads.
     """
     if current == previous:
         return True
@@ -1526,11 +1655,24 @@ def _is_probable_shortcut_ocr_change(previous: int, current: int) -> bool:
         return False
     if current == 0 and previous <= 10:
         return True
+    if _is_shortcut_numeric_truncation(previous, current):
+        return False
+    return True
+
+
+def _is_shortcut_numeric_truncation(previous: int, current: int) -> bool:
+    """Reject a value that visibly lost one or more leading digits."""
     previous_text = str(previous)
     current_text = str(current)
-    if len(current_text) < len(previous_text) and previous_text.endswith(current_text):
-        return False
-    return previous - current <= MAX_SHORTCUT_SINGLE_SAMPLE_DROP
+    if (
+        len(current_text) < len(previous_text)
+        and bool(current_text)
+        and previous_text.endswith(current_text)
+    ):
+        return True
+    # Preserve the narrow one-digit transition used for a real 10 -> 9
+    # decrease; larger changes are almost always a clipped leading glyph.
+    return previous >= 10 and current < 10 and previous - current > 1
 
 
 def _merge_fast_shortcut_counts(

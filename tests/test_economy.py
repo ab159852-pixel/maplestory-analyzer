@@ -318,14 +318,22 @@ def test_one_frame_lower_ocr_is_not_a_potion_use():
     assert tracker.snapshot.potion_cost == 0
 
 
-def test_large_shortcut_jump_is_ignored_instead_of_counting_hundreds_of_potions():
+def test_large_shortcut_jump_is_provisional_and_reconciles_to_later_quantity():
     tracker = EconomyTracker([
         PotionSlotConfig(slot="F1", name="Red Potion", kind="hp", cost=25),
     ])
     tracker.record_quick_slot_counts({"F1": 1180}, now=0)
+    # A missed OCR interval can expose a large real-looking drop.  It is
+    # allowed into the provisional ledger instead of being discarded by an
+    # arbitrary four-bottle cap.
     tracker.record_quick_slot_counts({"F1": 180}, now=1)
     tracker.record_quick_slot_counts({"F1": 180}, now=1.75)
-    tracker.record_quick_slot_counts({"F1": 1179}, now=2.5)
+    assert tracker.snapshot.hp_potion_uses == 1000
+
+    # When the correct quantity returns, the provisional overcharge is
+    # reversed and the final cost follows the latest stable inventory.
+    tracker.record_quick_slot_counts({"F1": 1180}, now=2.5)
+    tracker.record_quick_slot_counts({"F1": 1180}, now=3.0)
 
     assert tracker.snapshot.potion_uses == 0
     assert tracker.snapshot.potion_cost == 0
@@ -374,20 +382,24 @@ def test_snapshot_exposes_initial_and_current_shortcut_quantities():
     assert snapshot.shortcut_observed == {"1": 1179, "2": 2037}
 
 
-def test_truncated_shortcut_ocr_never_jumps_inventory_to_a_suffix():
+def test_large_shortcut_drop_is_reversible_when_a_later_frame_restores_quantity():
     tracker = EconomyTracker([PotionSlotConfig(slot="7", kind="mp", cost=604)])
     tracker.prime_quick_slot_counts({"7": 116})
 
-    # 116 -> 6 is a missing-leading-digit OCR result, not 110 potion uses.
+    # The lower value is allowed to become a provisional charge.  If it was
+    # really a missing-leading-digit OCR result, the later stable quantity
+    # restores the ledger instead of leaving a permanent false cost.
     tracker.record_quick_slot_counts({"7": 6}, now=1)
     assert tracker.snapshot.shortcut_current == {"7": 116}
     assert tracker.snapshot.mp_potion_uses == 0
+    tracker.record_quick_slot_counts({"7": 6}, now=1.5)
+    assert tracker.snapshot.shortcut_current == {"7": 6}
+    assert tracker.snapshot.mp_potion_uses == 110
 
-    # A real one-item decrease must still be accepted after confirmation.
-    tracker.record_quick_slot_counts({"7": 115}, now=1.5)
-    tracker.record_quick_slot_counts({"7": 115}, now=2)
-    assert tracker.snapshot.shortcut_current == {"7": 115}
-    assert tracker.snapshot.mp_potion_uses == 1
+    tracker.record_quick_slot_counts({"7": 116}, now=2)
+    tracker.record_quick_slot_counts({"7": 116}, now=2.5)
+    assert tracker.snapshot.shortcut_current == {"7": 116}
+    assert tracker.snapshot.mp_potion_uses == 0
 
 
 def test_one_frame_neighbour_cell_merge_never_publishes_as_restock():
@@ -439,32 +451,112 @@ def test_final_reconciliation_commits_missed_quantity_drop_once():
     assert tracker.snapshot.hp_potion_cost == 10_560
 
 
-def test_fast_bulk_shortcut_drop_is_rejected_by_realistic_drink_rate():
+def test_large_shortcut_drop_is_billed_then_can_be_reversed():
     tracker = EconomyTracker([
         PotionSlotConfig(slot="7", name="Blue Potion", kind="mp", cost=604),
     ])
     tracker.prime_quick_slot_counts({"7": 1200}, now=0)
 
-    # 80 drinks in half a second cannot happen in the game and is an OCR
-    # suffix/crop error, not a real inventory event.
+    # Do not permanently discard a large lower reading.  It is provisional and
+    # can be corrected when a later frame returns toward the baseline.
     tracker.record_quick_slot_counts({"7": 1120}, now=0.5)
     tracker.record_quick_slot_counts({"7": 1120}, now=0.75)
+
+    assert tracker.snapshot.shortcut_current == {"7": 1120}
+    assert tracker.snapshot.mp_potion_uses == 80
+    assert tracker.snapshot.mp_potion_cost == 80 * 604
+
+    tracker.record_quick_slot_counts({"7": 1200}, now=1.0)
+    tracker.record_quick_slot_counts({"7": 1200}, now=1.5)
 
     assert tracker.snapshot.shortcut_current == {"7": 1200}
     assert tracker.snapshot.mp_potion_uses == 0
     assert tracker.snapshot.mp_potion_cost == 0
 
 
-def test_substituted_two_digit_quantity_is_rejected_without_a_cost_event():
+def test_bulk_shortcut_drop_is_accepted_after_stable_frames():
+    tracker = EconomyTracker([
+        PotionSlotConfig(slot="7", name="Blue Potion", kind="mp", cost=604),
+    ])
+    tracker.prime_quick_slot_counts({"7": 1850}, now=0)
+
+    # A missed interval can expose five consumed bottles at once. Two
+    # identical frames accept the complete drop instead of applying the old
+    # hard four-bottle cap.
+    tracker.record_quick_slot_counts({"7": 1845}, now=0.3)
+    tracker.record_quick_slot_counts({"7": 1845}, now=0.6)
+
+    assert tracker.snapshot.shortcut_current == {"7": 1845}
+    assert tracker.snapshot.mp_potion_uses == 5
+    assert tracker.snapshot.mp_potion_cost == 5 * 604
+
+
+def test_provisional_overcharge_converges_to_later_correct_quantity():
+    tracker = EconomyTracker([
+        PotionSlotConfig(slot="7", name="Blue Potion", kind="mp", cost=604),
+    ])
+    tracker.prime_quick_slot_counts({"7": 100}, now=0)
+
+    # OCR temporarily reads 40, then later recovers the actual 80. The ledger
+    # must settle at the baseline-to-corrected difference: 20 bottles.
+    tracker.record_quick_slot_counts({"7": 40}, now=1)
+    tracker.record_quick_slot_counts({"7": 40}, now=1.5)
+    assert tracker.snapshot.mp_potion_uses == 60
+
+    tracker.record_quick_slot_counts({"7": 80}, now=2)
+    tracker.record_quick_slot_counts({"7": 80}, now=2.5)
+
+    assert tracker.snapshot.shortcut_current == {"7": 80}
+    assert tracker.snapshot.mp_potion_uses == 20
+    assert tracker.snapshot.mp_potion_cost == 20 * 604
+
+
+def test_correcting_a_potion_drop_also_reverses_its_recovery_attribution():
+    tracker = EconomyTracker([
+        PotionSlotConfig(
+            slot="F1", name="Red Potion", kind="hp", cost=25, recovery=50
+        ),
+    ])
+    tracker.prime_quick_slot_counts({"F1": 10}, now=0)
+    tracker.record_quick_slot_counts({"F1": 9}, now=1)
+    tracker.record_quick_slot_counts({"F1": 9}, now=1.5)
+    tracker.record_stats(100, 200, now=2)
+    tracker.record_stats(150, 200, now=2.2)
+
+    assert tracker.snapshot.hp_recovery_potion == 50
+    assert tracker.snapshot.hp_recovery_natural == 0
+
+    # The entire drink was an OCR false positive.  Its cost and the recovery
+    # classification must be rolled back together.
+    tracker.record_quick_slot_counts({"F1": 10}, now=3)
+    tracker.record_quick_slot_counts({"F1": 10}, now=3.5)
+
+    snapshot = tracker.snapshot
+    assert snapshot.potion_uses == 0
+    assert snapshot.potion_cost == 0
+    assert snapshot.hp_recovery_potion == 0
+    assert snapshot.hp_recovery_natural == 50
+    assert snapshot.hp_recovery_savings == 60.0
+
+
+def test_substituted_two_digit_quantity_is_reversed_by_a_stable_correction():
     tracker = EconomyTracker([
         PotionSlotConfig(slot="7", name="Blue Potion", kind="mp", cost=604),
     ])
     tracker.prime_quick_slot_counts({"7": 1487}, now=0)
 
-    # 1487 -> 1467 is a plausible four-digit string to OCR, but it is not a
-    # plausible single live sample. It must not become 20 bottles of cost.
+    # 1487 -> 1467 is a plausible four-digit OCR substitution.  It may be
+    # charged provisionally, but a later stable 1487 must reverse the 20-bottle
+    # difference.
     tracker.record_quick_slot_counts({"7": 1467}, now=10)
     tracker.record_quick_slot_counts({"7": 1467}, now=10.5)
+
+    assert tracker.snapshot.shortcut_current == {"7": 1467}
+    assert tracker.snapshot.mp_potion_uses == 20
+    assert tracker.snapshot.mp_potion_cost == 20 * 604
+
+    tracker.record_quick_slot_counts({"7": 1487}, now=11)
+    tracker.record_quick_slot_counts({"7": 1487}, now=11.5)
 
     assert tracker.snapshot.shortcut_current == {"7": 1487}
     assert tracker.snapshot.mp_potion_uses == 0
@@ -524,7 +616,7 @@ def test_unconfigured_recovery_is_not_attributed_to_a_pending_potion():
 
 
 @pytest.mark.parametrize("kind", ["hp", "mp", "both"])
-def test_two_from_eighty_two_is_rejected_for_every_potion_kind(kind):
+def test_large_drop_and_restore_converge_for_every_potion_kind(kind):
     tracker = EconomyTracker([
         PotionSlotConfig(slot="7", name="Potion", kind=kind, cost=100),
     ])
@@ -532,7 +624,11 @@ def test_two_from_eighty_two_is_rejected_for_every_potion_kind(kind):
 
     tracker.record_quick_slot_counts({"7": 2}, now=1)
     tracker.record_quick_slot_counts({"7": 2}, now=1.2)
-    uses = tracker.reconcile_quick_slot_counts({"7": 2}, now=1.4)
+    assert tracker.snapshot.shortcut_current == {"7": 2}
+    assert tracker.snapshot.potion_uses == 80
+
+    tracker.record_quick_slot_counts({"7": 82}, now=1.5)
+    uses = tracker.record_quick_slot_counts({"7": 82}, now=2.0)
 
     assert uses == 0
     assert tracker.snapshot.shortcut_current == {"7": 82}

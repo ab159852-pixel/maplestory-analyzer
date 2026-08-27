@@ -22,6 +22,14 @@ from PIL import Image
 MODEL_NAME = "en_PP-OCRv4_mobile_rec"
 MODEL_RELATIVE_DIR = Path("paddle_models") / MODEL_NAME
 
+# The numeric recognizer reads only a handful of tiny crops.  Letting ONNX
+# Runtime create one worker per CPU core for each 0.2s batch is vastly more
+# expensive than the inference itself and can make desktop input stutter when
+# MapleStory is in the background.  Keep the model deterministic and yield
+# the cores to the game/UI instead.
+NUMERIC_ORT_INTRA_OP_THREADS = 1
+NUMERIC_ORT_INTER_OP_THREADS = 1
+
 # This is the character dictionary shipped in the model's inference.yml.
 # CTC index 0 is the blank token; the space character is appended last.
 CHARACTER_DICT = (
@@ -157,8 +165,13 @@ class OnnxNumericRecognizer:
             )
         import onnxruntime as ort
 
+        session_options = ort.SessionOptions()
+        session_options.intra_op_num_threads = NUMERIC_ORT_INTRA_OP_THREADS
+        session_options.inter_op_num_threads = NUMERIC_ORT_INTER_OP_THREADS
+        session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         self._session = ort.InferenceSession(
             str(model_dir / "inference.onnx"),
+            sess_options=session_options,
             providers=["CPUExecutionProvider"],
         )
         self._input_name = self._session.get_inputs()[0].name

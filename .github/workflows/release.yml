@@ -44,6 +44,29 @@ jobs:
       - name: Build one-folder executable
         run: python -m PyInstaller --noconfirm scripts/maple_analyzer.spec
 
+      - name: Verify packaged runtime assets
+        shell: pwsh
+        run: |
+          $package = Join-Path "dist" "MapleStoryAnalyzer"
+          $exe = Join-Path $package "MapleStoryAnalyzer.exe"
+          if (-not (Test-Path -LiteralPath $exe)) {
+            throw "PyInstaller output is missing $exe"
+          }
+          $themeCandidates = @(
+            (Join-Path $package "_internal\customtkinter\assets\themes\blue.json"),
+            (Join-Path $package "customtkinter\assets\themes\blue.json")
+          )
+          $theme = $themeCandidates |
+            Where-Object { Test-Path -LiteralPath $_ } |
+            Select-Object -First 1
+          if (-not $theme) {
+            throw "Packaged CustomTkinter themes are missing; refusing to publish a broken update"
+          }
+          $appTheme = Join-Path $package "maple_insight_dark_blue.json"
+          if (-not (Test-Path -LiteralPath $appTheme)) {
+            throw "Packaged Maple Insight theme is missing: $appTheme"
+          }
+
       - name: Package and checksum release
         shell: pwsh
         run: |

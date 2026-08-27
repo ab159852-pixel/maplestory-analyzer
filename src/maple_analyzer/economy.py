@@ -30,17 +30,17 @@ RECOVERY_MIN_TOLERANCE = 3
 # can therefore be confirmed after the status frame that contains its heal;
 # keep the marker alive long enough for that frame to arrive.
 POTION_PENDING_SECONDS = 5.0
-# A lower value must survive two samples before it becomes a consumption
-# event; one-frame digit loss during the drink animation must not become
-# several potions.  The elapsed-time rate guard below is the second gate.
+# A lower value must survive two samples before it becomes a provisional
+# consumption event.  This keeps a single redraw from charging immediately,
+# while allowing a later higher quantity to correct an overcharge.
 SLOT_CONFIRMATIONS_REQUIRED = 2
 # Enhanced full-bar retries can take longer than one auxiliary interval on a
 # CPU-only machine.  Keep a one-frame lower candidate through that delay so a
 # later identical/lower read can still confirm it.
 SLOT_CANDIDATE_MAX_GAP_SECONDS = 5.0
-# A stable OCR result may still be a substituted digit (for example
-# 1487 -> 1467).  Never turn that kind of multi-digit jump into a live cost;
-# a longer missing interval is handled by final reconciliation instead.
+# Keep the old name as the boundary between ordinary and bulk drops for
+# compatibility with diagnostics/tests. It is no longer a hard maximum: a
+# genuine 5-10 bottle decrease is admitted by the time/multi-frame gates.
 MAX_SLOT_DROP_PER_SCAN = MAX_SHORTCUT_SINGLE_SAMPLE_DROP
 SLOT_CORRECTION_CONFIRMATIONS_REQUIRED = 2
 # An increase is not a potion event.  The live session does not refill slots,
@@ -51,10 +51,9 @@ SLOT_INCREASE_CONFIRMATIONS_REQUIRED = 3
 # quantity change is therefore treated as an OCR artifact and never replaces
 # the trusted inventory baseline.
 MAX_IN_SESSION_RESTOCK_DELTA = 5
-# Maple's fastest practical held-key potion cadence is about one drink per
-# half second.  A quantity jump larger than the elapsed-time allowance is not
-# a real inventory event, even when the OCR value looks numeric.
-POTION_MIN_INTERVAL_SECONDS = 0.5
+# Retained for compatibility with diagnostic callers of the old rate helper.
+# Live accounting is now reversible rather than rate-blocked.
+POTION_MIN_INTERVAL_SECONDS = 0.3
 POTION_RATE_TOLERANCE_SECONDS = 0.06
 # HP/MP OCR can briefly lose a leading digit or read a visual effect as part
 # of the status value. Small changes are useful recovery evidence immediately,
@@ -71,24 +70,18 @@ RESOURCE_MAX_CHANGE_FACTOR = 2.0
 # next auxiliary OCR frame is missed. Keep this close to the independent
 # 0.2/0.3s worker cadence so a late OCR artefact cannot borrow an old flash.
 BAR_FLASH_WINDOW_SECONDS = 1.25
-# A final inventory reconciliation may cover a long interval, so it is not
-# limited by the per-scan held-key guard above.  Values larger than this are
-# more likely to be a missing OCR digit than a real single-session depletion.
-MAX_SLOT_RECONCILE_DROP = 999
+# Bulk confirmation may arrive after several drinks and several OCR frames.
+# Keep edge-triggered flashes long enough to corroborate a multi-bottle drop,
+# without making them a standalone source of potion uses.
+BULK_BAR_FLASH_WINDOW_SECONDS = POTION_PENDING_SECONDS
+MAX_RECENT_BAR_FLASHES = 32
+# A final inventory reconciliation may cover a long interval.  The quantity
+# itself is already bounded to four digits, so do not add a smaller arbitrary
+# drop ceiling that would lose a legitimate near-empty stack.
+MAX_SLOT_RECONCILE_DROP = MAX_SHORTCUT_QUANTITY
 HP_RECOVERY_MESOS_PER_POINT = 1.2
 MP_RECOVERY_MESOS_PER_POINT = 2.1
 MESOS_Y_MATCH_PX = 52.0
-
-
-def _is_probable_truncated_count(previous: int, current: int) -> bool:
-    """Return whether OCR dropped one or more leading quantity digits."""
-    previous_text = str(previous)
-    current_text = str(current)
-    return (
-        len(current_text) < len(previous_text)
-        and bool(current_text)
-        and previous_text.endswith(current_text)
-    )
 
 
 def _is_probable_leading_digit_recovery(previous: int, current: int) -> bool:
@@ -96,16 +89,6 @@ def _is_probable_leading_digit_recovery(previous: int, current: int) -> bool:
     previous_text = str(previous)
     current_text = str(current)
     return len(current_text) > len(previous_text) and current_text.endswith(previous_text)
-
-
-def _is_probable_shortcut_truncation(previous: int, current: int) -> bool:
-    """Reject a missing-leading-digit read, including nonmatching suffixes."""
-    if _is_probable_truncated_count(previous, current):
-        return True
-    # OCR can turn a two-digit quantity such as 82 into a lone 2 while also
-    # changing the surviving glyph enough that the suffix test misses it.
-    # A genuine 10 -> 9 drink is the only one-digit transition worth keeping.
-    return previous >= 10 and current < 10 and previous - current > 1
 
 
 def parse_mesos_amount(text: str) -> int | None:
@@ -384,7 +367,6 @@ class EconomyTracker:
         # enters a name/price/type. Once any slot is explicitly configured,
         # however, only those slots are authoritative; neighboring cells must
         # not be allowed to masquerade as a configured blue/HP potion.
-        configured_by_slot = {slot.slot: slot for slot in configured}
         self._slots = configured or [
             PotionSlotConfig(slot=slot, kind="both", enabled=True)
             for slot in SHORTCUT_SLOT_BOXES
@@ -401,8 +383,11 @@ class EconomyTracker:
             self._shortcut_baseline.clear()
             self._shortcut_observed.clear()
             self._slot_candidates.clear()
-            self._slot_suspect_drops.clear()
             self._pending_potions.clear()
+            # Existing totals remain part of the session history, but their
+            # old slot links must not be used to reverse a newly configured
+            # potion row.
+            self._potion_recovery_events.clear()
         if default_recovery_hp is not None:
             self._default_recovery_hp = max(0, int(default_recovery_hp))
         if default_recovery_mp is not None:
@@ -422,8 +407,11 @@ class EconomyTracker:
         self._shortcut_baseline.clear()
         self._shortcut_observed.clear()
         self._slot_candidates.clear()
-        self._slot_suspect_drops.clear()
         self._pending_potions.clear()
+        # No charged slot drop can be rolled back across a new
+        # start/resume baseline, so discard only the attribution links while
+        # keeping the already accumulated recovery totals.
+        self._potion_recovery_events.clear()
         # Auxiliary monitoring is disabled while paused/stopped, but the
         # status worker keeps producing frames. Re-anchor HP/MP when it is
         # enabled again so time spent outside the session is never counted as
@@ -480,12 +468,11 @@ class EconomyTracker:
         self._shortcut_baseline: dict[str, int] = {}
         self._shortcut_observed: dict[str, int] = {}
         self._slot_candidates: dict[str, tuple[int, int, float]] = {}
-        # A live OCR jump of two-to-four items is not charged as permanently
-        # correct just because it repeated.  Keep a small correction marker so
-        # a later stable return to the previous quantity can reverse that
-        # provisional charge instead of leaving the mesos total inflated.
-        self._slot_suspect_drops: dict[str, tuple[int, float]] = {}
         self._pending_potions: list[_PendingPotion] = []
+        # Keep the source slot for potion-recovery totals.  If an OCR drop is
+        # later corrected upward, its already matched HP/MP recovery must be
+        # reversible along with the potion cost.
+        self._potion_recovery_events: dict[str, list[tuple[str, int]]] = {}
         self._recent_bar_flashes: dict[str, list[float]] = {"hp": [], "mp": []}
 
     def record_bar_flash(
@@ -510,8 +497,8 @@ class EconomyTracker:
             values.append(timestamp)
             self._recent_bar_flashes[kind] = [
                 value for value in values
-                if timestamp - value <= BAR_FLASH_WINDOW_SECONDS
-            ][-4:]
+                if timestamp - value <= BULK_BAR_FLASH_WINDOW_SECONDS
+            ][-MAX_RECENT_BAR_FLASHES:]
 
     def _flash_kind_for_slot(self, slot: PotionSlotConfig) -> tuple[str, ...]:
         if slot.kind == "hp":
@@ -546,6 +533,55 @@ class EconomyTracker:
             for kind in self._flash_kind_for_slot(slot)
         )
 
+    def _matching_bar_flash_count(
+        self,
+        slot: PotionSlotConfig,
+        timestamp: float,
+        *,
+        since: float | None = None,
+    ) -> int:
+        """Count recent flashes that can corroborate this slot's drop."""
+        lower_bound = timestamp - BULK_BAR_FLASH_WINDOW_SECONDS
+        if since is not None:
+            lower_bound = max(lower_bound, since)
+        return sum(
+            1
+            for kind in self._flash_kind_for_slot(slot)
+            for value in self._recent_bar_flashes.get(kind, ())
+            if lower_bound <= value <= timestamp
+        )
+
+    def _consume_matching_bar_flashes(
+        self,
+        slot: PotionSlotConfig,
+        timestamp: float,
+        count: int,
+        *,
+        since: float | None = None,
+    ) -> int:
+        """Consume up to ``count`` matching flash markers after a commit."""
+        remaining = max(0, int(count))
+        consumed = 0
+        lower_bound = timestamp - BULK_BAR_FLASH_WINDOW_SECONDS
+        if since is not None:
+            lower_bound = max(lower_bound, since)
+        for kind in self._flash_kind_for_slot(slot):
+            if remaining <= 0:
+                break
+            values = self._recent_bar_flashes.get(kind, [])
+            eligible = [
+                index
+                for index, value in enumerate(values)
+                if lower_bound <= value <= timestamp
+            ]
+            for index in reversed(eligible[:remaining]):
+                values.pop(index)
+                remaining -= 1
+                consumed += 1
+                if remaining <= 0:
+                    break
+        return consumed
+
     def record_pickup_lines(self, lines: Iterable[object], now: float | None = None) -> int:
         observations: list[MesosObservation] = []
         for line in lines:
@@ -560,9 +596,9 @@ class EconomyTracker:
 
         In the live session, upward quantity changes are rejected because the
         user does not refill shortcut slots while testing.  A decrease must be
-        visible in two consecutive OCR samples and fit the one-drink-per-half-
-        second rate limit.  This keeps OCR artifacts from becoming potion uses
-        or false mesos costs.
+        visible in two consecutive OCR samples before it becomes a provisional
+        charge.  A later stable increase toward the session baseline can roll
+        that charge back when the lower value was an OCR error.
         """
         timestamp = time.monotonic() if now is None else now
         valid_counts = {
@@ -604,22 +640,19 @@ class EconomyTracker:
             if current > previous:
                 # Refilling is outside the live-test model. An upward change
                 # is therefore never allowed to redefine the trusted value;
-                # this blocks neighbouring-cell merges such as 86 -> 865 and
-                # also prevents a later false increase from inflating the
-                # final potion cost. There is one narrowly-scoped exception:
-                # if a repeated, multi-item lower value was already charged,
-                # a repeated return toward the session baseline is treated as
-                # OCR correction and the provisional charge is reversed.
-                # Keep the optional historical restock path available for
-                # callers that explicitly opt into it.
+                # this blocks neighbouring-cell merges such as 86 -> 865.
+                # A value between the last trusted count and the session
+                # baseline is different: it is a correction to an earlier
+                # provisional lower OCR read, so the matching charge is
+                # rolled back after the same confirmation gate.  This is what
+                # makes 100 -> 40 -> 80 settle at 20 bottles, not 60.
                 if not self._allow_in_session_restock:
                     baseline = self._shortcut_baseline.get(slot_id)
-                    suspect = self._slot_suspect_drops.get(slot_id)
+                    charged = self._slot_charged.get(slot_id, 0)
                     if (
                         baseline is None
                         or current > baseline
-                        or suspect is None
-                        or self._slot_charged.get(slot_id, 0) <= 0
+                        or charged <= 0
                     ):
                         self._slot_candidates.pop(slot_id, None)
                         continue
@@ -630,9 +663,15 @@ class EconomyTracker:
                     )
                     if candidate_is_recent and candidate[0] == current:
                         confirmations = candidate[1] + 1
+                        candidate_started_at = candidate[2]
                     else:
                         confirmations = 1
-                    self._slot_candidates[slot_id] = (current, confirmations, timestamp)
+                        candidate_started_at = timestamp
+                    self._slot_candidates[slot_id] = (
+                        current,
+                        confirmations,
+                        candidate_started_at,
+                    )
                     self._shortcut_observed[slot_id] = current
                     if confirmations < SLOT_CORRECTION_CONFIRMATIONS_REQUIRED:
                         continue
@@ -647,11 +686,6 @@ class EconomyTracker:
                     self._shortcut_observed[slot_id] = current
                     self._slot_last_accepted_at[slot_id] = timestamp
                     self._rollback_slot_drop(slot_id, rollback)
-                    remaining = suspect[0] - rollback
-                    if remaining > 1 and current < baseline:
-                        self._slot_suspect_drops[slot_id] = (remaining, suspect[1])
-                    else:
-                        self._slot_suspect_drops.pop(slot_id, None)
                     continue
                 if current - previous > MAX_IN_SESSION_RESTOCK_DELTA:
                     self._slot_candidates.pop(slot_id, None)
@@ -687,19 +721,7 @@ class EconomyTracker:
             if candidate is not None and candidate[0] > previous:
                 self._slot_candidates.pop(slot_id, None)
 
-            if _is_probable_shortcut_truncation(previous, current):
-                # Keep the trusted and displayed values stable; a suffix such
-                # as 6/16 is a crop error, not a real drop from 116.
-                self._slot_candidates.pop(slot_id, None)
-                continue
-
             drop = previous - current
-            if drop > MAX_SLOT_DROP_PER_SCAN:
-                # Do not turn a missing digit (e.g. 1180 -> 180) into hundreds
-                # of potion uses.  Keep the last trusted baseline until OCR
-                # produces a plausible stable value.
-                self._slot_candidates.pop(slot_id, None)
-                continue
 
             # Publish a plausible lower observation immediately so the UI can
             # prove that OCR saw a quantity change. The trusted quantity and
@@ -717,40 +739,58 @@ class EconomyTracker:
                 # drinks: that sequence is also produced by joined cells or
                 # unstable digit OCR.
                 confirmations = candidate[1] + 1
+                candidate_started_at = candidate[2]
             else:
                 confirmations = 1
-            self._slot_candidates[slot_id] = (current, confirmations, timestamp)
+                candidate_started_at = timestamp
+            self._slot_candidates[slot_id] = (
+                current,
+                confirmations,
+                candidate_started_at,
+            )
             slot = self._by_slot.get(slot_id)
             flash_confirmed = bool(
                 slot is not None
                 and drop == 1
                 and self._has_matching_bar_flash(slot, timestamp)
             ) if slot is not None else False
-            if confirmations >= SLOT_CONFIRMATIONS_REQUIRED or flash_confirmed:
+            bulk_flash_confirmed = bool(
+                slot is not None
+                and drop > MAX_SLOT_DROP_PER_SCAN
+                and self._matching_bar_flash_count(
+                    slot,
+                    timestamp,
+                    since=self._slot_last_accepted_at.get(slot_id),
+                ) >= drop
+            ) if slot is not None else False
+            # Every valid lower reading is provisional and reversible.  A
+            # large decrease may be a real group of drinks, or it may be an
+            # OCR frame such as 100 -> 40.  Do not discard either case here:
+            # two identical frames make the observation billable, while a
+            # later stable increase toward the session baseline rolls back
+            # the overcharge.
+            confirmations_required = SLOT_CONFIRMATIONS_REQUIRED
+            if (
+                confirmations >= confirmations_required
+                or flash_confirmed
+                or bulk_flash_confirmed
+            ):
                 confirmed_drop = previous - current
-                # Rate-limit against the last trusted quantity, not the last
-                # OCR frame. This is essential when the quantity changes
-                # between two fast auxiliary samples.
-                allowed_drop = self._allowed_drop_for_slot(slot_id, timestamp)
-                if allowed_drop <= 0:
-                    # The candidate may be real but it arrived before the
-                    # game's minimum drink interval.  Keep it pending until a
-                    # later scan reaches the timing window.
-                    continue
                 self._slot_candidates.pop(slot_id, None)
-                if confirmed_drop > min(MAX_SLOT_DROP_PER_SCAN, allowed_drop):
-                    # Numeric OCR is not enough evidence for a bulk decrease.
-                    # Discard it instead of converting a suffix/crop failure
-                    # into dozens of potion uses and a false cost.
-                    continue
-                if flash_confirmed and slot is not None:
-                    self._consume_matching_bar_flash(slot, timestamp)
+                if slot is not None:
+                    if bulk_flash_confirmed:
+                        self._consume_matching_bar_flashes(
+                            slot,
+                            timestamp,
+                            confirmed_drop,
+                            since=self._slot_last_accepted_at.get(slot_id),
+                        )
+                    elif flash_confirmed:
+                        self._consume_matching_bar_flash(slot, timestamp)
                 self._slot_counts[slot_id] = current
                 self._shortcut_observed[slot_id] = current
                 self._slot_last_accepted_at[slot_id] = timestamp
                 uses += self._commit_slot_drop(slot_id, confirmed_drop, timestamp)
-                if confirmed_drop > 1:
-                    self._slot_suspect_drops[slot_id] = (confirmed_drop, timestamp)
         return uses
 
     def _allowed_drop_for_slot(
@@ -760,12 +800,13 @@ class EconomyTracker:
         *,
         reference_at: float | None = None,
     ) -> int:
-        """Return believable consumption since the last trusted quantity.
+        """Return the legacy rate estimate for diagnostic callers.
 
         ``_slot_last_sample_at`` advances on every OCR frame, including a
         repeated pending candidate. It is therefore not a valid rate-limit
         origin. ``reference_at`` remains available for compatibility with
-        older callers, while normal live accounting uses the accepted time.
+        older callers. Live accounting intentionally does not use this value
+        as a hard block; its ledger is corrected by later quantity increases.
         """
         last = (
             reference_at
@@ -797,8 +838,8 @@ class EconomyTracker:
 
         Quantity OCR is allowed to be optimistic for display, but the cost
         ledger must be reversible when a later stable frame proves that a
-        substituted digit was charged.  This only runs for the narrow
-        correction path above; ordinary upward readings remain ignored.
+        substituted digit was charged.  Recovery amounts matched to those
+        provisional potion uses are rolled back at the same time.
         """
         slot = self._by_slot.get(slot_id)
         charged = self._slot_charged.get(slot_id, 0)
@@ -822,6 +863,15 @@ class EconomyTracker:
             self._shared_potion_uses = max(0, self._shared_potion_uses - amount)
             self._shared_potion_cost = max(0, self._shared_potion_cost - cost)
 
+        # Keep at most the number of recovery events that can still be
+        # explained by the slot's remaining charged uses. Any event that no
+        # longer has a matching use is reclassified as natural/skill recovery
+        # instead of disappearing from the recovery totals.
+        self._trim_potion_recovery_to_uses(
+            slot_id,
+            self._slot_charged.get(slot_id, 0),
+        )
+
         breakdown_key = slot.name or slot.slot
         remaining_breakdown = self._potion_breakdown.get(breakdown_key, 0) - amount
         if remaining_breakdown > 0:
@@ -841,6 +891,42 @@ class EconomyTracker:
             if remaining <= 0:
                 break
         return amount
+
+    def _trim_potion_recovery_to_uses(self, slot_id: str, max_uses: int) -> None:
+        """Keep recovery attribution within the corrected use count.
+
+        A shared HP/MP potion can produce one event for each resource, so the
+        per-kind limit is intentionally applied independently.  Events that
+        no longer fit the corrected count are moved to natural/skill recovery
+        so the recovery total and saved-cost estimate remain conserved.
+        """
+        events = self._potion_recovery_events.get(slot_id)
+        if not events:
+            return
+        max_uses = max(0, int(max_uses))
+        for kind in ("hp", "mp"):
+            matching_indices = [
+                index
+                for index, (event_kind, _amount) in enumerate(events)
+                if event_kind == kind
+            ]
+            overflow = max(0, len(matching_indices) - max_uses)
+            for index in reversed(matching_indices[-overflow:] if overflow else []):
+                event_kind, event_amount = events[index]
+                if event_kind != kind:
+                    break
+                events.pop(index)
+                if kind == "hp":
+                    self._hp_recovery_potion = max(
+                        0, self._hp_recovery_potion - event_amount
+                    )
+                else:
+                    self._mp_recovery_potion = max(
+                        0, self._mp_recovery_potion - event_amount
+                    )
+                self._add_non_potion_recovery(kind, event_amount)
+        if not events:
+            self._potion_recovery_events.pop(slot_id, None)
 
     def reconcile_quick_slot_counts(self, counts: dict[str, int], now: float | None = None) -> int:
         """Reconcile the final visible inventory before pause/restart/close.
@@ -873,10 +959,8 @@ class EconomyTracker:
                 self._slot_charged[slot_id] = 0
                 continue
             trusted = self._slot_counts.get(slot_id, baseline)
-            suspect = self._slot_suspect_drops.get(slot_id)
             if (
-                suspect is not None
-                and baseline >= current > trusted
+                baseline >= current > trusted
                 and self._slot_charged.get(slot_id, 0) > 0
             ):
                 rollback = min(
@@ -889,11 +973,6 @@ class EconomyTracker:
                     self._slot_candidates.pop(slot_id, None)
                     self._slot_last_accepted_at[slot_id] = timestamp
                     self._rollback_slot_drop(slot_id, rollback)
-                    remaining = suspect[0] - rollback
-                    if remaining > 1 and current < baseline:
-                        self._slot_suspect_drops[slot_id] = (remaining, suspect[1])
-                    else:
-                        self._slot_suspect_drops.pop(slot_id, None)
                 continue
             if current >= baseline:
                 # The live test does not refill slots.  Ignore upward OCR
@@ -904,21 +983,39 @@ class EconomyTracker:
                     self._shortcut_observed[slot_id] = current
                 self._slot_candidates.pop(slot_id, None)
                 continue
-            if _is_probable_shortcut_truncation(self._slot_counts.get(slot_id, baseline), current):
-                continue
             total_drop = baseline - current
             already_charged = self._slot_charged.get(slot_id, 0)
             missing = total_drop - already_charged
             if not (0 < missing <= MAX_SLOT_RECONCILE_DROP):
                 continue
-            allowed_drop = self._allowed_drop_for_slot(slot_id, timestamp)
-            if allowed_drop <= 0 or missing > allowed_drop:
-                continue
+            slot = self._by_slot.get(slot_id)
+            accepted_before = self._slot_last_accepted_at.get(slot_id)
+            bulk_flash_confirmed = bool(
+                slot is not None
+                and missing > MAX_SLOT_DROP_PER_SCAN
+                and self._matching_bar_flash_count(
+                    slot,
+                    timestamp,
+                    since=accepted_before,
+                ) >= missing
+            ) if slot is not None else False
+            # The final visible quantity is the best correction point.  Do
+            # not reject a large or suffix-shaped change here: any amount
+            # already charged for that OCR path is subtracted from the
+            # baseline difference, so the ledger converges to the latest
+            # stable value rather than remaining permanently inflated.
             self._slot_counts[slot_id] = current
             self._shortcut_observed[slot_id] = current
             self._slot_candidates.pop(slot_id, None)
             self._slot_last_accepted_at[slot_id] = timestamp
             self._slot_last_sample_at[slot_id] = timestamp
+            if bulk_flash_confirmed and slot is not None:
+                self._consume_matching_bar_flashes(
+                    slot,
+                    timestamp,
+                    missing,
+                    since=accepted_before,
+                )
             uses += self._commit_slot_drop(slot_id, missing, timestamp)
         return uses
 
@@ -1110,14 +1207,7 @@ class EconomyTracker:
                 continue
             if slot.kind not in (kind, "both"):
                 continue
-            if _is_probable_shortcut_truncation(previous, current):
-                self._slot_candidates.pop(slot_id, None)
-                continue
             drop = previous - current
-            allowed_drop = self._allowed_drop_for_slot(slot_id, now)
-            if allowed_drop <= 0 or drop > min(MAX_SLOT_DROP_PER_SCAN, allowed_drop):
-                self._slot_candidates.pop(slot_id, None)
-                continue
             expected = slot.recovery or self._default_recovery(kind)
             if expected > 0 and _recovery_matches(expected, amount):
                 exact.append((slot_id, drop, current))
@@ -1135,7 +1225,7 @@ class EconomyTracker:
         pending_index = self._matching_pending(kind, amount)
         if pending_index is not None:
             pending = self._pending_potions[pending_index]
-            self._add_potion_recovery(kind, amount)
+            self._add_potion_recovery(kind, amount, pending.config.slot)
             # A shared potion may produce two recovery observations (one HP,
             # one MP) for the same use.  Keep the pending marker until both
             # kinds have matched so the second observation is classified as
@@ -1172,11 +1262,17 @@ class EconomyTracker:
     def _default_recovery(self, kind: str) -> int:
         return self._default_recovery_hp if kind == "hp" else self._default_recovery_mp
 
-    def _add_potion_recovery(self, kind: str, amount: int) -> None:
+    def _add_potion_recovery(
+        self, kind: str, amount: int, slot_id: str | None = None
+    ) -> None:
         if kind == "hp":
             self._hp_recovery_potion += amount
         else:
             self._mp_recovery_potion += amount
+        if slot_id is not None:
+            self._potion_recovery_events.setdefault(slot_id, []).append(
+                (kind, amount)
+            )
 
     def _add_non_potion_recovery(self, kind: str, amount: int) -> None:
         if kind == "hp":
@@ -1207,9 +1303,10 @@ class EconomyTracker:
             mp_recovery_savings=round(self._mp_recovery_savings, 1),
             potion_breakdown=dict(self._potion_breakdown),
             shortcut_baseline=dict(self._shortcut_baseline),
-            # Current is the latest trusted quantity.  A raw OCR suffix such
-            # as 6 from 116 must never leak into the UI while a decrease is
-            # being validated.
+            # Current is the latest accepted quantity used by the reversible
+            # ledger. ``shortcut_observed`` can temporarily be a newer OCR
+            # candidate while a decrease or its upward correction is being
+            # confirmed.
             shortcut_current=dict(self._slot_counts),
             shortcut_observed=dict(self._shortcut_observed),
             shortcut_baseline_ready=bool(self._shortcut_baseline),

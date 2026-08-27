@@ -72,7 +72,11 @@ from .economy import (
     parse_slot_count,
 )
 from .i18n import Lang, t
-from .monitor import BackgroundMonitor, merge_status_snapshots
+from .monitor import (
+    BackgroundMonitor,
+    _lower_current_worker_priority,
+    merge_status_snapshots,
+)
 from .ocr import StatPanelOcr
 from .parser import StatSnapshot, parse_fields
 from .rate import Session, SessionSummary
@@ -684,6 +688,10 @@ class OverlayApp:
         self.root.after(50, self._poll_ocr_loader)
 
     def _ocr_worker(self) -> None:
+        # Model construction can briefly use every CPU core.  Keep that
+        # startup-only work below normal priority so opening the analyzer does
+        # not make the game or desktop input feel frozen.
+        _lower_current_worker_priority()
         try:
             engine = StatPanelOcr()
         except Exception as exc:

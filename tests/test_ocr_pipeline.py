@@ -222,6 +222,28 @@ def test_shortcut_numeric_views_keep_aligned_prefixes_in_the_same_vote_families(
     ) == 1830
 
 
+def test_shortcut_layout_pattern_tracks_every_narrow_one_without_fixed_slots():
+    assert ocr_module._shortcut_layout_pattern(1105) == "11xx"
+    assert ocr_module._shortcut_layout_pattern(1115) == "111x"
+    assert ocr_module._shortcut_layout_pattern(1005) == "1xx1"
+    assert ocr_module._shortcut_layout_pattern(2105) == "x1xx"
+    assert ocr_module._shortcut_layout_pattern(2115) == "x11x"
+
+
+def test_shortcut_layout_pattern_expands_left_as_narrow_ones_increase():
+    from PIL import Image
+
+    image = Image.new("RGB", (100, 20), (20, 20, 20))
+    one_narrow = ocr_module._shortcut_pattern_quantity_crop(image, 2105)
+    two_narrow = ocr_module._shortcut_pattern_quantity_crop(image, 2115)
+    three_narrow = ocr_module._shortcut_pattern_quantity_crop(image, 1115)
+
+    assert one_narrow is not None
+    assert two_narrow is not None
+    assert three_narrow is not None
+    assert one_narrow.width < two_narrow.width < three_narrow.width
+
+
 def test_right_aligned_quantity_crop_follows_the_glyph_run_width():
     """A leading 1 may be narrow, but both strings share the same right edge."""
     from PIL import Image, ImageDraw
@@ -257,7 +279,7 @@ def test_right_aligned_quantity_crop_follows_the_glyph_run_width():
         assert bright_columns[-1] >= crop.width - 4
 
 
-def test_shortcut_numeric_batch_accepts_clean_views_and_rejects_large_jump():
+def test_shortcut_numeric_batch_passes_complete_bulk_observation_to_economy():
     class FakeNumeric:
         def __init__(self, values):
             self.values = values
@@ -288,7 +310,7 @@ def test_shortcut_numeric_batch_accepts_clean_views_and_rejects_large_jump():
         {"7": ("7", image)},
         blue_slot_ids=set(),
         previous_counts={"7": 1830},
-    ) == {}
+    ) == {"7": 1630}
 
 
 def test_numeric_shortcut_cache_skips_onnx_when_the_quantity_strip_is_unchanged():
@@ -324,6 +346,40 @@ def test_numeric_shortcut_cache_skips_onnx_when_the_quantity_strip_is_unchanged(
     assert first == {"7": 1830}
     assert second == {"7": 1830}
     assert numeric.calls == 1
+
+
+def test_numeric_shortcut_cache_retries_an_unchanged_crop_after_blank_ocr():
+    class BlankThenNumeric:
+        def __init__(self):
+            self.calls = 0
+
+        def read_fields(self, images):
+            self.calls += 1
+            if self.calls == 1:
+                return {}
+            return {key: "1830" for key in images}
+
+    from PIL import Image
+    image = Image.new("RGB", (38, 41))
+    numeric = BlankThenNumeric()
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._numeric_engine = numeric
+    ocr._shortcut_last_cell_signatures = {}
+    ocr._shortcut_last_cell_values = {}
+
+    assert ocr._read_shortcut_slot_counts(
+        image,
+        {"7"},
+        slot_images={"7": image},
+        previous_counts={},
+    ) == {}
+    assert ocr._read_shortcut_slot_counts(
+        image,
+        {"7"},
+        slot_images={"7": image},
+        previous_counts={},
+    ) == {"7": 1830}
+    assert numeric.calls == 2
 
 
 def test_reset_shortcut_cache_forgets_the_previous_quantity_baseline():

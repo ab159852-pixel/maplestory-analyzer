@@ -43,6 +43,26 @@ PICKUP_DETECTION_INTERVAL_S = 0.35
 EXP_DISPLAY_TOTAL_BAND = 0.25
 
 
+def _lower_current_worker_priority() -> None:
+    """Keep OCR workers from competing with desktop/game input on Windows."""
+    try:
+        import ctypes
+        import sys
+
+        if sys.platform != "win32":
+            return
+        # THREAD_PRIORITY_BELOW_NORMAL = -1. The OCR worker still runs at the
+        # configured cadence, but Windows can schedule mouse/UI work first
+        # when the game is minimized or another app is in the foreground.
+        ctypes.windll.kernel32.SetThreadPriority(
+            ctypes.windll.kernel32.GetCurrentThread(),
+            -1,
+        )
+    except Exception:
+        # Priority is an optimization only; it must never prevent monitoring.
+        return
+
+
 class MonitorSource(Protocol):
     def grab_fields(self) -> dict[str, Any]:
         ...
@@ -542,6 +562,7 @@ class BackgroundMonitor:
         It logs the complete traceback and retries after a short backoff while
         the user can still see the HUD and stop the session normally.
         """
+        _lower_current_worker_priority()
         if label == "context" and not callable(getattr(self.source, "grab_context", None)):
             # Older/custom capture adapters may not expose the optional
             # background map/job surface.  This worker is optional; do not
