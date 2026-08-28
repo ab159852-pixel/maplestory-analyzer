@@ -1702,7 +1702,24 @@ def _select_shortcut_numeric_views(
             # conflicting raw result such as 320 beside threshold 3204 is
             # intentionally rejected rather than resolved by vote count.
             if colour_values.get(threshold_value, 0) <= 0:
-                return None
+                # A quantity with three or fewer digits can be followed by a
+                # single bright border/icon stroke in the raw colour view.
+                # The digit recognizer then appends that stroke, e.g. the
+                # real ``797`` becomes ``7972`` in one view while another
+                # colour projection sees ``7922``.  The white-glyph view is
+                # the only view that has removed the blue artwork, so keep it
+                # when at least one colour view preserves the complete value
+                # as a prefix.  This is deliberately limited to a longer
+                # prefix match; a same-length substitution such as
+                # ``1359`` -> ``1959`` still remains rejected below.
+                threshold_text = str(threshold_value)
+                has_trailing_colour_artifact = any(
+                    len(str(value)) > len(threshold_text)
+                    and str(value).startswith(threshold_text)
+                    for value in colour_values
+                )
+                if not has_trailing_colour_artifact:
+                    return None
             # Do not let a majority of colour preprocessings hide a
             # same-width disagreement.  This is the failure mode behind a
             # real 920 being promoted to 320: three views see 320 while the

@@ -272,6 +272,18 @@ def test_shortcut_numeric_views_reject_1359_to_1959_substitution_but_keep_correc
     ) == 80
 
 
+def test_shortcut_numeric_views_keeps_clean_three_digit_value_when_blue_artwork_adds_suffix():
+    """A blue icon may append one border stroke to only one colour decode."""
+    assert ocr_module._select_shortcut_numeric_views(
+        [
+            (797, "raw-white170"),
+            (7922, "raw-r"),
+            (7972, "raw-g"),
+        ],
+        previous=None,
+    ) == 797
+
+
 def test_shortcut_fast_path_uses_latest_fast_cache_as_previous_value():
     # A full-bar cache for another slot must not hide the newest fast value for
     # this slot.  Without this regression guard, 1359 -> 1959 could be
