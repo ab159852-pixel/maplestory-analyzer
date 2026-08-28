@@ -828,12 +828,16 @@ class BackgroundMonitor:
             # rule was introduced, but it is intentionally not used as a
             # fallback source of OCR work.
             observed_slots = configured_slots
-            configured_ids = {slot.slot for slot in observed_slots}
-            blue_ids = {
+            # Preserve Settings order when constructing the batch.  The OCR
+            # result is keyed by slot, but deterministic ordering makes the
+            # two-cell (for example 6/7) initial scan reproducible for engines
+            # that return only the successfully decoded batch entries.
+            configured_ids = tuple(slot.slot for slot in observed_slots)
+            blue_ids = tuple(
                 slot.slot
                 for slot in observed_slots
                 if slot.kind in ("mp", "both")
-            }
+            )
             slot_images = {
                 slot.slot: regions[f"shortcut:{slot.slot}"]
                 for slot in observed_slots

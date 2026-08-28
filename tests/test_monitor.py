@@ -49,3 +49,24 @@ def test_background_ocr_receives_only_enabled_shortcut_cell():
 
     assert monitor._read_potion_counts(_regions(), configured, configured) == {"1": 2676}
     assert ocr.calls == [({"1"}, set(), {"1"}, True)]
+
+
+def test_background_ocr_receives_all_enabled_shortcut_cells_in_settings_order():
+    class _TwoCellOcr(_RecordingOcr):
+        def read_shortcut_counts(self, image, required, blue, **kwargs):
+            super().read_shortcut_counts(image, required, blue, **kwargs)
+            return {"6": 2676, "7": 1875}
+
+    ocr = _TwoCellOcr()
+    monitor = BackgroundMonitor.__new__(BackgroundMonitor)
+    monitor.ocr = ocr
+    configured = (
+        PotionSlotConfig(slot="6", kind="hp", cost=10, enabled=True),
+        PotionSlotConfig(slot="7", kind="mp", cost=20, enabled=True),
+    )
+
+    assert monitor._read_potion_counts(_regions(), configured, configured) == {
+        "6": 2676,
+        "7": 1875,
+    }
+    assert ocr.calls == [({"6", "7"}, {"7"}, {"6", "7"}, True)]

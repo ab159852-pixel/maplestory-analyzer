@@ -2571,15 +2571,42 @@ class OverlayApp:
             self._potion_baseline_samples.append(dict(counts))
             if len(self._potion_baseline_samples) > POTION_BASELINE_SAMPLE_WINDOW:
                 del self._potion_baseline_samples[:-POTION_BASELINE_SAMPLE_WINDOW]
+
+            # A partial frame is normal: the two configured shortcut cells can
+            # redraw on different compositor frames.  The old implementation
+            # committed as soon as *any* one cell became stable, so slot 6
+            # arriving first permanently closed calibration and slot 7 was
+            # never added to the initial inventory.  Build stability from all
+            # recent observations and do not finish until every enabled cell
+            # has its own confirmed value.
+            configured_ids = {
+                str(slot.slot)
+                for slot in getattr(self._settings, "potion_slots", ())
+                if getattr(slot, "enabled", False)
+            }
+            observed_ids = set().union(
+                *(sample.keys() for sample in self._potion_baseline_samples)
+            )
+            candidate_ids = configured_ids or observed_ids
             stable: dict[str, int] = {}
-            for slot_id, count in counts.items():
-                confirmations = sum(
-                    sample.get(slot_id) == count
+            for slot_id in candidate_ids & observed_ids:
+                values = [
+                    sample[slot_id]
                     for sample in self._potion_baseline_samples
+                    if slot_id in sample
+                ]
+                if not values:
+                    continue
+                count = values[-1]
+                confirmations = sum(
+                    observed == count
+                    for observed in values
                 )
                 if confirmations >= POTION_BASELINE_CONFIRMATIONS:
                     stable[slot_id] = count
-            if not stable:
+            if not stable or (
+                configured_ids and not configured_ids.issubset(stable)
+            ):
                 return
             economy.prime_quick_slot_counts(stable, now=now)
             self._potion_baseline_pending = False
