@@ -87,6 +87,7 @@ def _crop_frame_to_client(
     window_rect: tuple[int, int, int, int],
     *,
     item_size: tuple[int, int] | None = None,
+    preserve_native: bool = False,
 ) -> Image.Image | None:
     """Convert a WGC frame into client-relative pixels.
 
@@ -96,6 +97,13 @@ def _crop_frame_to_client(
     client-sized pool for a full-window item, so a same-sized frame could
     still contain a resized title bar.  The item size plus the actual HWND
     geometry lets us distinguish the two cases and scale the crop precisely.
+
+    ``preserve_native`` is used by the live WGC path.  If Win32 reports the
+    HWND in logical pixels while the compositor returns physical pixels (the
+    common failure mode on a 2K monitor with 125%/150% display scaling),
+    resizing the crop back to the Win32 client size throws away the extra
+    glyph pixels before OCR sees them.  The caller can keep the native crop
+    and rescale the cached geometry to that same pixel space instead.
     """
     client_left, client_top, client_right, client_bottom = client_rect
     window_left, window_top, window_right, window_bottom = window_rect
@@ -140,7 +148,7 @@ def _crop_frame_to_client(
     ):
         return None
     cropped = image.crop((crop_left, crop_top, crop_right, crop_bottom))
-    if cropped.size != client_size:
+    if cropped.size != client_size and not preserve_native:
         cropped = cropped.resize(client_size, Image.Resampling.BILINEAR)
     return cropped
 
@@ -384,6 +392,43 @@ def box_sample_points(
     return points
 
 
+def context_sample_points(
+    client_size: tuple[int, int],
+    *,
+    window_size: tuple[int, int] | None = None,
+    client_offset: tuple[int, int] = (0, 0),
+) -> list[tuple[int, int]]:
+    """Return points inside the visible map/job OCR crops.
+
+    Context OCR runs before a session starts and is often displayed over the
+    game's mini-map.  The desktop fallback must not quietly read the analyzer
+    HUD (or another foreground window) as if it were map text.  Keep this
+    separate from :func:`field_sample_points` because the map is pinned to the
+    client top-left while the job label follows the centered status viewport.
+    """
+    points: list[tuple[int, int]] = []
+    for name in ("map", "job"):
+        raw_box = CONTEXT_BOXES[name]
+        if window_size is None:
+            mapper = scale_top_left_box if name == "map" else scale_box
+            box = mapper(raw_box, client_size)
+        elif name == "map":
+            box = scale_window_top_left_box_to_client(
+                raw_box, client_size, window_size, client_offset
+            )
+        else:
+            box = scale_window_box_to_client(
+                raw_box, client_size, window_size, client_offset
+            )
+        points += [
+            (box.left + 1, box.top + 1),
+            (box.right - 2, box.top + 1),
+            (box.left + 1, box.bottom - 2),
+            (box.right - 2, box.bottom - 2),
+        ]
+    return points
+
+
 def panel_is_obscured(sample_points, game_hwnd: int, window_at) -> bool:
     """True if any sample point belongs to a window other than the game.
 
@@ -585,6 +630,43 @@ class GameWindowCapture:
             client_top - window_top,
         )
 
+    def _rescale_geometry_for_frame(
+        self,
+        reported_client_size: tuple[int, int],
+        frame_size: tuple[int, int],
+    ) -> None:
+        """Keep crop geometry in the pixel space returned by WGC.
+
+        On a mixed-DPI/2K desktop, Win32 can report the HWND in logical
+        pixels while Windows Graphics Capture hands back a physical-pixel
+        bitmap.  The old path resized that bitmap down to the logical client
+        size, which made the fixed HUD crops smaller and moved thin quantity
+        glyphs across a cell boundary.  Once the native bitmap is retained,
+        scale the cached outer-window dimensions and client origin by the
+        same per-axis ratio so every later ``_live_box`` call stays aligned.
+        """
+        old_width, old_height = reported_client_size
+        frame_width, frame_height = frame_size
+        if min(old_width, old_height, frame_width, frame_height) <= 0:
+            return
+        if reported_client_size == frame_size:
+            self.client_size = frame_size
+            return
+
+        scale_x = frame_width / old_width
+        scale_y = frame_height / old_height
+        if self.window_size is not None:
+            self.window_size = (
+                max(1, round(self.window_size[0] * scale_x)),
+                max(1, round(self.window_size[1] * scale_y)),
+            )
+        if self.client_offset is not None:
+            self.client_offset = (
+                round(self.client_offset[0] * scale_x),
+                round(self.client_offset[1] * scale_y),
+            )
+        self.client_size = frame_size
+
     def _live_box(
         self,
         raw_box: tuple[int, int, int, int],
@@ -757,8 +839,13 @@ class GameWindowCapture:
                 client_rect,
                 window_rect,
                 item_size=item_size,
+                preserve_native=True,
             )
             if frame is not None:
+                self._rescale_geometry_for_frame(
+                    (client_width, client_height),
+                    frame.size,
+                )
                 self.graphics_capture_error = None
                 self.capture_backend = "windows-graphics"
                 return frame
@@ -1159,6 +1246,20 @@ class GameWindowCapture:
         left, top, right, bottom = client_rect
         client_size = (right - left, bottom - top)
         self.client_size = client_size
+        # Unlike WGC, the desktop fallback sees the visible desktop.  The
+        # analyzer is commonly kept above the game, and its translucent HUD
+        # can cover the mini-map title.  Refuse this frame instead of feeding
+        # the HUD labels into map/job OCR and publishing a false map name.
+        points = [
+            (left + x, top + y)
+            for x, y in context_sample_points(
+                client_size,
+                window_size=self.window_size,
+                client_offset=self.client_offset or (0, 0),
+            )
+        ]
+        if panel_is_obscured(points, self._hwnd, self._root_window_at):
+            raise RuntimeError(self._obscured_live_error())
         regions: dict[str, Image.Image] = {}
         for name, raw_box in CONTEXT_BOXES.items():
             box = self._live_box(

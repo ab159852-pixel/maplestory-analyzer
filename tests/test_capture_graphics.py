@@ -8,7 +8,7 @@ import pytest
 
 from PIL import Image
 
-from maple_analyzer.capture import GameWindowCapture
+from maple_analyzer.capture import GameWindowCapture, _crop_frame_to_client
 from maple_analyzer.graphics_capture import GraphicsCaptureError, WindowsGraphicsCapture
 
 
@@ -94,6 +94,63 @@ def test_graphics_frame_scales_native_window_frame_before_client_crop(monkeypatc
     assert result is not None
     assert result.size == (200, 120)
     assert result.getpixel((0, 0)) == (171, 205, 239)
+
+
+def test_native_graphics_crop_can_preserve_physical_pixels():
+    """A DPI-scaled WGC bitmap must not be reduced before OCR."""
+    image = Image.new("RGB", (520, 320), "#000000")
+    image.paste("#abcdef", (40, 40, 440, 280))
+
+    resized = _crop_frame_to_client(
+        image,
+        (20, 20, 220, 140),
+        (0, 0, 260, 160),
+    )
+    native = _crop_frame_to_client(
+        image,
+        (20, 20, 220, 140),
+        (0, 0, 260, 160),
+        preserve_native=True,
+    )
+
+    assert resized is not None and resized.size == (200, 120)
+    assert native is not None and native.size == (400, 240)
+    assert native.getpixel((20, 20)) == (171, 205, 239)
+
+
+def test_native_graphics_frame_rescales_cached_geometry():
+    """Later live boxes must use the same physical-pixel space as WGC."""
+    capture = GameWindowCapture.__new__(GameWindowCapture)
+    capture.window_size = (260, 160)
+    capture.client_offset = (20, 20)
+    capture.client_size = (200, 120)
+
+    capture._rescale_geometry_for_frame((200, 120), (400, 240))
+
+    assert capture.client_size == (400, 240)
+    assert capture.window_size == (520, 320)
+    assert capture.client_offset == (40, 40)
+
+
+def test_graphics_path_keeps_native_frame_and_maps_boxes_in_that_space(monkeypatch):
+    """Exercise the same mismatch through GameWindowCapture's WGC path."""
+    image = Image.new("RGB", (520, 320), "#000000")
+    capture, fake = _capture_stub(
+        frame=image,
+        window_rect=(0, 0, 260, 160),
+        item_size=(260, 160),
+    )
+    monkeypatch.setattr("maple_analyzer.graphics_capture.WindowsGraphicsCapture", fake)
+
+    result = GameWindowCapture._try_graphics_frame(
+        capture,
+        (20, 20, 220, 140),
+    )
+
+    assert result is not None and result.size == (400, 240)
+    assert capture.client_size == (400, 240)
+    assert capture.window_size == (520, 320)
+    assert capture.client_offset == (40, 40)
 
 
 def test_graphics_frame_accepts_a_client_only_graphics_item(monkeypatch):

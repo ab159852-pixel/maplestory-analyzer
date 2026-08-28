@@ -89,3 +89,25 @@ def test_hp_digits_are_stable_at_1920(snapshot_1920):
     hp = text["HP"].replace(" ", "")
     assert "824" in hp
     assert hp.count("824") == 2, hp  # both numbers present, both correct
+
+
+def test_2k_live_window_mapping_keeps_status_and_shortcut_crops_in_client():
+    """A 2K client with a title bar must stay in one physical-pixel space."""
+    from maple_analyzer.regions import (
+        scale_window_box_to_client,
+        scale_window_shortcut_box_to_client,
+    )
+
+    client = (2560, 1431)
+    window = (2560, 1467)
+    offset = (0, 36)
+    panel = scale_window_box_to_client(STAT_PANEL_BOX, client, window, offset)
+    shortcut = scale_window_shortcut_box_to_client(
+        (925, 659, 1072, 736), client, window, offset
+    )
+
+    for name, box in (("panel", panel), ("shortcut", shortcut)):
+        assert 0 <= box.left < box.right <= client[0], name
+        assert 0 <= box.top < box.bottom <= client[1], name
+    assert panel.bottom == client[1]
+    assert shortcut.bottom < client[1]

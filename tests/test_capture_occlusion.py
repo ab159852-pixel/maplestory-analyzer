@@ -12,8 +12,17 @@ from __future__ import annotations
 
 import pytest
 
-from maple_analyzer.capture import field_sample_points, panel_is_obscured
-from maple_analyzer.regions import FIELD_BOXES, REFERENCE_CLIENT_SIZE, scale_box
+from maple_analyzer.capture import (
+    context_sample_points,
+    field_sample_points,
+    panel_is_obscured,
+)
+from maple_analyzer.regions import (
+    CONTEXT_BOXES,
+    FIELD_BOXES,
+    REFERENCE_CLIENT_SIZE,
+    scale_box,
+)
 
 GAME = 1000
 OTHER = 2000
@@ -72,6 +81,30 @@ def test_sample_points_scale_with_the_client():
     large = field_sample_points((1920, 1077))
     assert len(small) == len(large)
     assert max(x for x, _ in large) > max(x for x, _ in small)
+
+
+def test_context_sample_points_cover_map_and_job_at_2k_geometry():
+    points = context_sample_points(
+        (2560, 1431),
+        window_size=(2560, 1467),
+        client_offset=(0, 36),
+    )
+    assert len(points) == 8
+    for name in ("map", "job"):
+        if name == "map":
+            from maple_analyzer.regions import scale_window_top_left_box_to_client
+
+            box = scale_window_top_left_box_to_client(
+                CONTEXT_BOXES[name], (2560, 1431), (2560, 1467), (0, 36)
+            )
+        else:
+            from maple_analyzer.regions import scale_window_box_to_client
+
+            box = scale_window_box_to_client(
+                CONTEXT_BOXES[name], (2560, 1431), (2560, 1467), (0, 36)
+            )
+        name_points = points[:4] if name == "map" else points[4:]
+        assert all(box.left <= x < box.right and box.top <= y < box.bottom for x, y in name_points)
 
 
 def test_obscured_message_is_localised():
