@@ -252,17 +252,40 @@ def detect_shortcut_frame(image: Image.Image, expected: Box | None = None) -> Bo
         expected_center_x = (expected.left + expected.right) / 2
         expected_center_y = (expected.top + expected.bottom) / 2
 
+        # The shortcut HUD is pinned to the bottom-right of the client.  The
+        # search window also contains the inner separators and the item/icon
+        # edges, so a wide candidate range can legitimately choose an
+        # internal pair of edges.  That produces a plausible-looking parent
+        # crop but cuts the last configured cell (usually slot 7/8) away from
+        # its real quantity.  Keep the detector tolerant of DPI rounding, but
+        # require the measured frame to stay near the deterministic
+        # right/bottom anchor calculated from the actual HWND geometry.
+        width_min = expected_width * 0.80
+        width_max = expected_width * 1.22
+        height_min = expected_height * 0.80
+        height_max = expected_height * 1.22
+        right_anchor_tolerance = max(4.0, expected_width * 0.16)
+        bottom_anchor_tolerance = max(4.0, expected_height * 0.16)
+        left_anchor_tolerance = max(4.0, expected_width * 0.20)
+        top_anchor_tolerance = max(4.0, expected_height * 0.20)
+
         x_candidates: list[tuple[float, int, int]] = []
         for left, left_score in x_peaks:
             for right, right_score in x_peaks:
                 width = right - left
-                if width < expected_width * 0.65 or width > expected_width * 1.45:
+                if width < width_min or width > width_max:
+                    continue
+                if abs(right - expected.right) > right_anchor_tolerance:
+                    continue
+                if abs(left - expected.left) > left_anchor_tolerance:
                     continue
                 score = (
                     left_score
                     + right_score
                     - abs(width - expected_width) * 0.55
                     - abs((left + right) / 2 - expected_center_x) * 0.35
+                    - abs(right - expected.right) * 0.80
+                    - abs(left - expected.left) * 0.45
                 )
                 x_candidates.append((score, left, right))
 
@@ -270,13 +293,19 @@ def detect_shortcut_frame(image: Image.Image, expected: Box | None = None) -> Bo
         for top, top_score in y_peaks:
             for bottom, bottom_score in y_peaks:
                 height = bottom - top
-                if height < expected_height * 0.60 or height > expected_height * 1.45:
+                if height < height_min or height > height_max:
+                    continue
+                if abs(bottom - expected.bottom) > bottom_anchor_tolerance:
+                    continue
+                if abs(top - expected.top) > top_anchor_tolerance:
                     continue
                 score = (
                     top_score
                     + bottom_score
                     - abs(height - expected_height) * 0.65
                     - abs((top + bottom) / 2 - expected_center_y) * 0.40
+                    - abs(bottom - expected.bottom) * 0.90
+                    - abs(top - expected.top) * 0.50
                 )
                 y_candidates.append((score, top, bottom))
 

@@ -3414,6 +3414,7 @@ class OverlayApp:
                                 regions["shortcut"], configured_ids, blue_ids,
                                 allow_full_validation=False,
                                 slot_images=slot_images,
+                                live=True,
                             )
                         except TypeError:
                             try:

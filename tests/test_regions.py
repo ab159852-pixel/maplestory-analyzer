@@ -166,6 +166,17 @@ def test_shortcut_frame_detector_tracks_real_reference_sizes():
         assert 0 <= frame.top < frame.bottom <= image.height
 
 
+def test_shortcut_frame_detector_preserves_the_bottom_right_anchor():
+    """An internal separator must not become the parent frame for slot 7."""
+    for path in (SAMPLE_IMAGE, SAMPLE_IMAGE_1920):
+        image = Image.open(path).convert("RGB")
+        expected = scale_shortcut_box(SHORTCUT_BOX, image.size)
+        frame = detect_shortcut_frame(image, expected)
+
+        assert abs(frame.right - expected.right) <= max(4, round(expected.width * 0.16))
+        assert abs(frame.bottom - expected.bottom) <= max(4, round(expected.height * 0.16))
+
+
 def test_wide_client_extends_pickup_feed_to_the_actual_client_edge():
     client = (1368, 768)
     boxes = _pickup_boxes_for_client(client)

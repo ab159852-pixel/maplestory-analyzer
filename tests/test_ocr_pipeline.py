@@ -441,6 +441,53 @@ def test_live_blue_shortcut_reads_when_rgb_view_is_blank():
     }
 
 
+def test_live_shortcut_batch_recovers_a_missing_configured_second_cell():
+    """A blank slot 7 must not disappear just because slot 6 decoded first."""
+    from PIL import Image
+
+    class PartialThenRecoveryNumeric:
+        def __init__(self):
+            self.calls = []
+
+        def read_digit_fields(self, images, *, max_digits=4):
+            del max_digits
+            self.calls.append(tuple(images))
+            result = {}
+            for key in images:
+                parts = key.split(":")
+                slot_id = parts[1]
+                view_name = parts[-1]
+                if key.startswith("shortcut:"):
+                    # Slot 6 is healthy; the MP slot 7 is blank for this
+                    # frame. This is the exact failure mode of the old live
+                    # branch: it returned the first cell and never retried
+                    # the second one with the recovery crop.
+                    if slot_id == "6":
+                        result[key] = "2676"
+                elif slot_id == "7" and view_name in {
+                    "raw-rgb", "raw-gray", "raw-r", "raw-g"
+                }:
+                    result[key] = "1875"
+            return result
+
+    numeric = PartialThenRecoveryNumeric()
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._numeric_engine = numeric
+    image = Image.new("RGB", (39, 36))
+
+    assert ocr._read_shortcut_numeric_batch(
+        {"6:False": ("6", image), "7:True": ("7", image)},
+        blue_slot_ids={"7"},
+        previous_counts={},
+        live=True,
+    ) == {"6": 2676, "7": 1875}
+    assert len(numeric.calls) == 2
+    assert all(
+        key.startswith("shortcut-recovery:7:")
+        for key in numeric.calls[1]
+    )
+
+
 def test_shortcut_layout_pattern_tracks_every_narrow_one_without_fixed_slots():
     assert ocr_module._shortcut_layout_pattern(1105) == "11xx"
     assert ocr_module._shortcut_layout_pattern(1115) == "111x"
@@ -609,6 +656,7 @@ def test_reset_shortcut_cache_forgets_the_previous_quantity_baseline():
     ocr._shortcut_last_full_counts = {"7": 1830}
     ocr._shortcut_last_validation_at = 12.0
     ocr._shortcut_validation_signature = (("7",), ("7",))
+    ocr._shortcut_live_recovery_at = {"7": 20.0}
 
     ocr.reset_shortcut_cache()
 
@@ -618,6 +666,7 @@ def test_reset_shortcut_cache_forgets_the_previous_quantity_baseline():
     assert ocr._shortcut_last_full_counts == {}
     assert ocr._shortcut_last_validation_at == 0.0
     assert ocr._shortcut_validation_signature is None
+    assert ocr._shortcut_live_recovery_at == {}
 
 
 def test_numeric_engine_blank_does_not_fall_back_to_whole_cell_quantity():

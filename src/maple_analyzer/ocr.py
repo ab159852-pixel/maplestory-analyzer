@@ -47,6 +47,11 @@ from .regions import (
 # per-cell path remains active between validations; a failed full detector must
 # not force another 2–3 second detector pass on every potion sample.
 SHORTCUT_FULL_VALIDATION_INTERVAL_SECONDS = 30.0
+# A missing configured cell gets one taller colour recovery, but a blank
+# redraw must not make the live worker run that larger batch on every 150ms
+# tick.  This cadence is still below the game's normal 0.3-0.7s potion
+# animation and keeps a second cell from appearing permanently absent.
+SHORTCUT_LIVE_RECOVERY_INTERVAL_SECONDS = 0.30
 # RapidOCR owns separate detector/classifier/recognizer ONNX sessions.  The
 # default package configuration uses all CPU cores in each session, which is
 # disproportionate for the small fixed crops used here and causes input lag
@@ -95,6 +100,7 @@ class StatPanelOcr:
         self._shortcut_last_full_counts: dict[str, int] = {}
         self._shortcut_last_validation_at = 0.0
         self._shortcut_validation_signature: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+        self._shortcut_live_recovery_at: dict[str, float] = {}
 
     def read_field(self, image: Image.Image) -> str:
         """Recognition-only OCR on a small pre-cropped single-line field crop.
@@ -253,6 +259,7 @@ class StatPanelOcr:
         self._shortcut_last_full_counts = {}
         self._shortcut_last_validation_at = 0.0
         self._shortcut_validation_signature = None
+        self._shortcut_live_recovery_at = {}
 
     def _read_shortcut_once(self, image: Image.Image) -> tuple[str, list[OcrLine]]:
         """Read a shortcut quantity with a layout-safe numeric fallback.
@@ -494,6 +501,7 @@ class StatPanelOcr:
         if configuration_changed:
             self._shortcut_last_cell_signatures = {}
             self._shortcut_last_cell_values = {}
+            self._shortcut_live_recovery_at = {}
         elapsed = now - last_validation_at
         full_validation_due = (
             not required
@@ -853,30 +861,35 @@ class StatPanelOcr:
         # only retry unresolved configured cells with a slightly taller view.
         # The recovery path is intentionally colour-only and requires every
         # independent colour view to agree, so it cannot turn a threshold
-        # majority into a guessed quantity.
-        recovery_pending = {
-            slot_key: item
-            for slot_key, item in pending.items()
-            # ``pending`` is keyed by ``slot_id:colour`` while ``result`` is
-            # keyed by the plain slot id. Comparing the former directly to
-            # the latter made every successful live read launch the expensive
-            # recovery batch as well, which was the main reason potion counts
-            # appeared several scans late.
-            # A completely blank primary batch is retried on the next live
-            # sample; only a conflicting/partial numeric candidate deserves
-            # the taller recovery crop in this same call.
-            if item[0] not in result and candidates.get(item[0])
-        }
-        if live:
-            # The configured-cell worker has a hard 0.3-0.7s game-animation
-            # deadline. A conflicting primary read is not allowed to launch
-            # the much larger recovery batch in this call: that batch measured
-            # about 0.7s by itself on a CPU-only machine and made an otherwise
-            # healthy sample appear several bottles late. The cell signature
-            # remains uncached when unresolved, so the next live frame retries
-            # it naturally. Non-live callers retain the full diagnostic
-            # recovery below.
-            return result
+        # majority into a guessed quantity.  This retry is especially
+        # important for a blue MP cell: the live path uses only R/G/white
+        # views, and one of those views can be blank while the other two
+        # disagree during the potion redraw.  Previously the live branch
+        # returned here before recovery, so a configured second cell (most
+        # visibly slot 7) could remain absent forever while slot 6 continued
+        # to update normally.
+        recovery_pending: dict[str, tuple[str, Image.Image]] = {}
+        recovery_at = dict(
+            getattr(self, "_shortcut_live_recovery_at", {}) or {}
+        )
+        now = time.monotonic()
+        for slot_key, item in pending.items():
+            slot_id = item[0]
+            if slot_id in result:
+                continue
+            if not live and not candidates.get(slot_id):
+                continue
+            if live:
+                # One unresolved cell can otherwise launch the taller
+                # recovery batch on every 150ms sample.  Throttle only the
+                # expensive recovery; the cheap primary batch still runs on
+                # every frame and can recover immediately when the redraw is
+                # clear.
+                if now < recovery_at.get(slot_id, 0.0):
+                    continue
+                recovery_at[slot_id] = now + SHORTCUT_LIVE_RECOVERY_INTERVAL_SECONDS
+            recovery_pending[slot_key] = item
+        self._shortcut_live_recovery_at = recovery_at
 
         if recovery_pending:
             recovery_batch: dict[str, Image.Image] = {}
@@ -885,10 +898,23 @@ class StatPanelOcr:
                 strip = _shortcut_quantity_recovery_strip(crop)
                 if strip.width <= 1 or strip.height <= 1:
                     continue
-                for view_name, view in _shortcut_numeric_views(
+                recovery_views = _shortcut_numeric_views(
                     strip,
                     blue=slot_id in blue_slot_ids,
-                ):
+                )
+                if live:
+                    # The recovery selector intentionally ignores white
+                    # threshold views and requires independent colour views
+                    # to agree.  Do not spend an ONNX pass constructing those
+                    # threshold images in the high-frequency worker: the
+                    # live blue-cell recovery needs RGB/gray/R/G (and HP
+                    # needs RGB/gray) only.
+                    recovery_views = [
+                        (view_name, view)
+                        for view_name, view in recovery_views
+                        if not _numeric_view_base_name(view_name).startswith("white")
+                    ]
+                for view_name, view in recovery_views:
                     key_view_name = view_name
                     if not callable(getattr(numeric_engine, "read_digit_fields", None)):
                         key_view_name = view_name.removeprefix("raw-")
