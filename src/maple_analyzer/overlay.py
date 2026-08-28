@@ -137,6 +137,12 @@ POTION_PROJECTION_MIN_SECONDS = 60.0  # avoid a first-drink spike in a short sam
 # accounting even began.
 POTION_BASELINE_SAMPLE_WINDOW = 3
 POTION_BASELINE_CONFIRMATIONS = 2
+# A cell can remain unreadable because of a redraw, animation, or a temporary
+# capture mismatch.  Do not hold the whole session in "detecting initial
+# quantities" forever: after this short grace period, commit every cell that
+# has a confirmed value and let EconomyTracker establish a no-charge baseline
+# for a missing cell when it becomes readable later.
+POTION_BASELINE_TIMEOUT_SECONDS = 5.0
 SCALE_STEP_PCT = 10
 SCALE_MIN_PCT = 50
 SCALE_MAX_PCT = 150
@@ -376,6 +382,7 @@ class OverlayApp:
         # The first shortcut OCR result after Start/Resume is an inventory
         # baseline, never a potion-use event.
         self._potion_baseline_pending = True
+        self._potion_baseline_started_at = time.monotonic()
         self._potion_baseline_samples: list[dict[str, int]] = []
         self._last_logged_shortcut_counts: dict[str, int] | None = None
         self._next_aux_scan = 0.0
@@ -2513,6 +2520,7 @@ class OverlayApp:
             if callable(reset_flash):
                 reset_flash()
             self._potion_baseline_pending = True
+            self._potion_baseline_started_at = time.monotonic()
             # Keep the state transition defensive for lightweight test/stub
             # objects and for an older in-memory OverlayApp instance created
             # before this baseline buffer was introduced. A normal app always
@@ -2607,7 +2615,19 @@ class OverlayApp:
             if not stable or (
                 configured_ids and not configured_ids.issubset(stable)
             ):
-                return
+                started_at = getattr(self, "_potion_baseline_started_at", now)
+                try:
+                    elapsed = max(0.0, float(now) - float(started_at))
+                except (TypeError, ValueError):
+                    elapsed = 0.0
+                if not stable or elapsed < POTION_BASELINE_TIMEOUT_SECONDS:
+                    return
+                missing = sorted(configured_ids - stable.keys())
+                if missing:
+                    self._log(
+                        f"[{time.strftime('%H:%M:%S')}] potion baseline partial: "
+                        f"waiting for slot(s) {', '.join(missing)} timed out"
+                    )
             economy.prime_quick_slot_counts(stable, now=now)
             self._potion_baseline_pending = False
             self._last_logged_shortcut_counts = dict(stable)
