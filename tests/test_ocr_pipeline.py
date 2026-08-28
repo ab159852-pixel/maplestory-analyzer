@@ -370,7 +370,7 @@ def test_shortcut_numeric_batch_uses_colour_recovery_for_a_three_digit_cell():
     ) == {"8": 920}
 
 
-def test_live_shortcut_numeric_batch_uses_two_views_per_configured_cell():
+def test_live_shortcut_numeric_batch_uses_blue_channels_for_mp_cells():
     from PIL import Image
 
     class CountingNumeric:
@@ -391,10 +391,54 @@ def test_live_shortcut_numeric_batch_uses_two_views_per_configured_cell():
         previous_counts={},
         live=True,
     ) == {"6": 1830, "7": 1830}
-    # Live tracking keeps the independent colour/threshold guard, but does
-    # not pay for the full diagnostic family or recovery batch on every redraw.
-    assert len(numeric.calls[0]) == 4
+    # Live tracking keeps the independent colour/threshold guard.  The MP
+    # cell uses red/green projections instead of the blue-artwork-heavy RGB
+    # projection, while HP remains the two-view fast path.
+    assert len(numeric.calls[0]) == 5
+    assert {
+        "shortcut:7:raw-r",
+        "shortcut:7:raw-g",
+        "shortcut:7:raw-white170",
+    }.issubset(numeric.calls[0])
     assert len(numeric.calls) == 1
+
+
+def test_live_blue_shortcut_reads_when_rgb_view_is_blank():
+    """The configured MP slot must not depend on the blue-artwork RGB view."""
+    from PIL import Image
+
+    class BlueNumeric:
+        def __init__(self):
+            self.keys = ()
+
+        def read_digit_fields(self, images, *, max_digits=4):
+            del max_digits
+            self.keys = tuple(images)
+            return {
+                key: (
+                    "1875"
+                    if key.endswith((":raw-r", ":raw-g", ":raw-white170"))
+                    else ""
+                )
+                for key in images
+            }
+
+    numeric = BlueNumeric()
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._numeric_engine = numeric
+    image = Image.new("RGB", (35, 36))
+
+    assert ocr._read_shortcut_numeric_batch(
+        {"7": ("7", image)},
+        blue_slot_ids={"7"},
+        previous_counts={},
+        live=True,
+    ) == {"7": 1875}
+    assert set(numeric.keys) == {
+        "shortcut:7:raw-r",
+        "shortcut:7:raw-g",
+        "shortcut:7:raw-white170",
+    }
 
 
 def test_shortcut_layout_pattern_tracks_every_narrow_one_without_fixed_slots():

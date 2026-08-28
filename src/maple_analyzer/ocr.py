@@ -1404,13 +1404,22 @@ def _shortcut_numeric_views(
     prefix = "raw-"
     if live:
         # The live monitor is a deadline-driven path.  The numeric model is
-        # already specialized for a pre-cropped digit strip, so one untouched
-        # colour view plus one white-glyph threshold is enough to require an
-        # independent agreement without running ten model images whenever two
-        # configured slots redraw.  The full family below remains available
-        # for non-live validation and the diagnostic recovery retry.
+        # already specialized for a pre-cropped digit strip, so HP cells use
+        # one untouched colour view plus one white-glyph threshold.  A blue MP
+        # icon is different: its artwork can dominate the untouched RGB
+        # projection and make the quantity look blank or disagree with the
+        # threshold view.  Red/green channel projections suppress that blue
+        # artwork while retaining the bright glyphs, so use both as the two
+        # independent colour views for blue cells.  The full family below
+        # remains available for non-live validation and diagnostic recovery.
         gray = ImageOps.autocontrast(ImageOps.grayscale(rgb))
         white = gray.point(lambda pixel: 255 if pixel >= 170 else 0)
+        if blue:
+            return [
+                (f"{prefix}r", rgb.getchannel("R").convert("RGB")),
+                (f"{prefix}g", rgb.getchannel("G").convert("RGB")),
+                (f"{prefix}white170", white.convert("RGB")),
+            ]
         return [
             (f"{prefix}rgb", rgb),
             (f"{prefix}white170", white.convert("RGB")),

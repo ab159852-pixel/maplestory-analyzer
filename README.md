@@ -139,15 +139,15 @@ py -3.10 -m venv .venv
 
 ## 發佈新版（維護者）
 
-目前這份程式的 `APP_VERSION` 是 `1.0.31`。每次先把
+目前這份程式的 `APP_VERSION` 是 `1.0.32`。每次先把
 `src/maple_analyzer/version.py` 改成下一個版本，再提交並推送同名 tag，例如：
 
 ```powershell
-git tag v1.0.31
-git push origin v1.0.31
+git tag v1.0.32
+git push origin v1.0.32
 ```
 
-GitHub Actions 會自動安裝依賴、建立 `MapleStoryAnalyzer-v1.0.31-win64.zip`、產生
+GitHub Actions 會自動安裝依賴、建立 `MapleStoryAnalyzer-v1.0.32-win64.zip`、產生
 SHA-256 checksum 並發佈 Release。使用者的打包版下次啟動就能收到更新。
 
 ## 疑難排解
