@@ -1,18 +1,26 @@
 """Crop-box definitions for the stat panel and its fields.
 
-The boxes are measured in a reference game viewport, then mapped to the actual
-client pixels reported by the capture backend on every frame.  The main status
-panel uses the game's aspect-ratio transform.  The shortcut grid is a separate
-bottom HUD layer: MapleStory scales that layer from the client width and keeps
-it bottom-anchored even when the captured client is a little shorter than the
-reference viewport.  Keeping those transforms explicit prevents the shortcut
-quantities from drifting into the neighbouring cell on a different device.
+The boxes are measured in the complete reference window image, then mapped to
+the client pixels reported by the live capture backend on every frame. The
+reference images include the native Windows title bar; live WGC/PrintWindow
+frames do not. The main status panel uses the game's aspect-ratio transform.
+The shortcut grid is a separate bottom HUD layer: MapleStory scales that
+layer from the client width and keeps it bottom-anchored even when the
+captured client is a little shorter than the reference viewport. Keeping
+those transforms explicit prevents the shortcut quantities from drifting into
+the neighbouring cell on a different device.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-REFERENCE_CLIENT_SIZE = (1351, 800)  # size of samples/maple_story_ui.jpg
+# The bundled reference captures are complete top-level window screenshots,
+# not client-only frames: their first 35-ish pixels are the Windows title bar.
+# Keep the old public name for compatibility with the static-image tests, but
+# make the coordinate contract explicit. Live WGC/PrintWindow/mss captures
+# are client-only and must use the window->client helpers below.
+REFERENCE_WINDOW_SIZE = (1351, 800)  # size of samples/maple_story_ui.jpg
+REFERENCE_CLIENT_SIZE = REFERENCE_WINDOW_SIZE  # legacy public alias
 
 # A shortcut stack in MapleStory is displayed as a four-digit quantity at
 # most.  Keep this domain rule next to the shortcut geometry so every OCR and
@@ -25,12 +33,12 @@ MAX_SHORTCUT_QUANTITY = 9_999
 # bottle changes visible while still retaining the old diagnostic constant.
 MAX_SHORTCUT_SINGLE_SAMPLE_DROP = 4
 
-# Whole stat panel, in absolute pixels at REFERENCE_CLIENT_SIZE. Grabbed once per
+# Whole stat panel, in absolute pixels at REFERENCE_WINDOW_SIZE. Grabbed once per
 # tick with a single mss.grab() call; FIELD_BOXES below are sliced out of it
 # in-memory (no extra screen captures).
 STAT_PANEL_BOX = (260, 758, 900, 800)  # (left, top, right, bottom)
 
-# Per-field boxes, same reference frame as STAT_PANEL_BOX, generously padded
+# Per-field boxes, same reference-window frame as STAT_PANEL_BOX, generously padded
 # around each field's label+value text (measured off samples/maple_story_ui.jpg,
 # see commit history for the crop-and-inspect process). Recognition-only OCR
 # (no detection) runs on each of these individually -- see ocr.py's read_field()
@@ -66,7 +74,7 @@ BAR_BOXES = {
 
 # Auxiliary regions used by the economy tracker.  They are deliberately kept
 # outside STAT_PANEL_BOX so the existing HP/MP/EXP crops stay unchanged.
-# Coordinates are measured from the same 1351x800 client screenshot used by
+# Coordinates are measured from the same 1351x800 reference-window screenshot used by
 # the status panel.  The pickup feed is the right-side notification stack;
 # SHORTCUT_BOX is the visible outer frame of the 4x2 shortcut grid, not the
 # larger area around it.  The previous implementation used a 165x92 box
@@ -78,7 +86,7 @@ PICKUP_FEED_BOX = (1080, 470, 1351, 665)
 # Pickup toasts are brief and can shift with client/font scale.  Keep the
 # narrow measured feed for cheap row OCR and a wider lower-right detector box.
 PICKUP_WIDE_BOX = (760, 380, 1351, 720)
-# The feed uses a stable 16px line rhythm in the reference client.  Cropping
+# The feed uses a stable 16px line rhythm in the reference window. Cropping
 # each row lets OCR stay in recognition-only mode (about an order of magnitude
 # faster than detection+recognition) while preserving the row's y-position for
 # duplicate-event filtering.
@@ -172,7 +180,7 @@ class Box:
 
 @dataclass(frozen=True)
 class RegionTransform:
-    """Reference-viewport to current-client pixel transform."""
+    """Reference-frame to current-image pixel transform."""
 
     client_size: tuple[int, int]
     scale: float
@@ -193,7 +201,7 @@ class RegionTransform:
 
 
 def region_transform(client_size: tuple[int, int]) -> RegionTransform:
-    """Build a transform for one actual captured client size.
+    """Build a transform for one actual target-image size.
 
     The game UI is rendered into a fixed-aspect viewport.  Fit that viewport
     uniformly instead of applying separate x/y stretch factors; when the
@@ -201,7 +209,7 @@ def region_transform(client_size: tuple[int, int]) -> RegionTransform:
     letterbox and the bottom status bar remains bottom-anchored.  This also
     avoids a one-frame crop drift while a window is being resized.
     """
-    ref_w, ref_h = REFERENCE_CLIENT_SIZE
+    ref_w, ref_h = REFERENCE_WINDOW_SIZE
     client_w, client_h = client_size
     if ref_w <= 0 or ref_h <= 0 or client_w <= 0 or client_h <= 0:
         raise ValueError(f"invalid client size: {client_size!r}")
@@ -217,14 +225,14 @@ def region_transform(client_size: tuple[int, int]) -> RegionTransform:
 
 
 def scale_box(box: tuple[int, int, int, int], client_size: tuple[int, int]) -> Box:
-    """Map a reference crop box to the current client pixel coordinates."""
+    """Map a reference crop box to the current image pixel coordinates."""
     return region_transform(client_size).map_box(box)
 
 
 def scale_top_left_box(
     box: tuple[int, int, int, int], client_size: tuple[int, int]
 ) -> Box:
-    """Scale a HUD box anchored to the client's top-left corner.
+    """Scale a HUD box anchored to the target image's top-left corner.
 
     The status/economy HUD is laid out inside the centered game viewport, so
     :func:`scale_box` correctly applies its horizontal letterbox offset. The
@@ -241,6 +249,101 @@ def scale_top_left_box(
     ).map_box(box)
 
 
+def _shift_box_to_client(
+    box: Box,
+    client_size: tuple[int, int],
+    client_offset: tuple[int, int],
+) -> Box:
+    """Translate a full-window box into a client-only image and clamp it.
+
+    ``client_offset`` is the physical-pixel position of the client origin
+    inside the captured top-level window (normally the title-bar height plus
+    any invisible frame inset). Keeping this step after the reference
+    viewport transform is important: title bars and DPI borders are measured
+    in the actual window, not guessed from a fixed 35-pixel constant.
+    """
+    client_width, client_height = client_size
+    offset_x, offset_y = client_offset
+    if client_width <= 0 or client_height <= 0:
+        raise ValueError(f"invalid client size: {client_size!r}")
+
+    left = round(box.left - offset_x)
+    top = round(box.top - offset_y)
+    right = round(box.right - offset_x)
+    bottom = round(box.bottom - offset_y)
+    left = max(0, min(client_width - 1, left))
+    top = max(0, min(client_height - 1, top))
+    right = max(left + 1, min(client_width, right))
+    bottom = max(top + 1, min(client_height, bottom))
+    return Box(left, top, right, bottom)
+
+
+def _map_window_box_to_client(
+    box: tuple[int, int, int, int],
+    client_size: tuple[int, int],
+    window_size: tuple[int, int],
+    client_offset: tuple[int, int],
+    *,
+    top_left: bool = False,
+    shortcut: bool = False,
+) -> Box:
+    """Map a reference full-window box into a live client-only frame.
+
+    ``window_size`` is the actual top-level HWND frame size, while
+    ``client_size`` is the image returned by the capture backend. The
+    reference boxes were measured in the former coordinate system. For the
+    mini-map, ``top_left`` removes viewport letterboxing because the game pins
+    that HUD to the client origin. The shortcut grid uses its own
+    width-scaled/bottom-anchored transform.
+    """
+    transform = shortcut_transform(window_size) if shortcut else region_transform(window_size)
+    if top_left:
+        transform = RegionTransform(
+            client_size=window_size,
+            scale=transform.scale,
+            offset_x=0,
+            offset_y=0,
+        )
+    window_box = transform.map_box(box)
+    return _shift_box_to_client(window_box, client_size, client_offset)
+
+
+def scale_window_box_to_client(
+    box: tuple[int, int, int, int],
+    client_size: tuple[int, int],
+    window_size: tuple[int, int],
+    client_offset: tuple[int, int] = (0, 0),
+) -> Box:
+    """Map a centered/bottom-anchored full-window box to client pixels."""
+    return _map_window_box_to_client(
+        box, client_size, window_size, client_offset
+    )
+
+
+def scale_window_top_left_box_to_client(
+    box: tuple[int, int, int, int],
+    client_size: tuple[int, int],
+    window_size: tuple[int, int],
+    client_offset: tuple[int, int] = (0, 0),
+) -> Box:
+    """Map a client-origin-pinned full-window box to client pixels."""
+    return _map_window_box_to_client(
+        box, client_size, window_size, client_offset, top_left=True
+    )
+
+
+def scale_window_shortcut_box_to_client(
+    box: tuple[int, int, int, int],
+    client_size: tuple[int, int],
+    window_size: tuple[int, int],
+    client_offset: tuple[int, int] = (0, 0),
+) -> Box:
+    """Map a bottom-right shortcut box from the full window to client pixels."""
+    return _map_window_box_to_client(
+        box, client_size, window_size, client_offset, shortcut=True
+    )
+
+
 def shortcut_transform(client_size: tuple[int, int]) -> RegionTransform:
     """Build the transform for the bottom-right shortcut grid.
 
@@ -252,7 +355,7 @@ def shortcut_transform(client_size: tuple[int, int]) -> RegionTransform:
     preserves the grid geometry and bottom anchoring while still adapting to
     genuinely wider clients such as 1920px captures.
     """
-    ref_w, ref_h = REFERENCE_CLIENT_SIZE
+    ref_w, ref_h = REFERENCE_WINDOW_SIZE
     client_w, client_h = client_size
     if ref_w <= 0 or ref_h <= 0 or client_w <= 0 or client_h <= 0:
         raise ValueError(f"invalid client size: {client_size!r}")

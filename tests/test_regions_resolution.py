@@ -1,11 +1,12 @@
 """Do the crops survive a different resolution and aspect ratio?
 
-regions.py's boxes are pixels measured at REFERENCE_CLIENT_SIZE (1351x800) and
-scaled proportionally by scale_box(). Its docstring warns that this is a
-stopgap and shouldn't be trusted away from that exact size -- these tests
-measure how true that actually is, against a real second screenshot rather
-than a resized copy of the first one (resizing a screenshot does not reproduce
-how the game re-renders its UI at a different size, so it proves nothing).
+The static fixture is a complete reference-window image, with boxes measured
+at REFERENCE_CLIENT_SIZE (the legacy name for 1351x800). Live HWND capture
+uses the separate window-to-client mapping tests in test_regions.py. These
+tests keep the static OCR contract intact and measure the existing transform
+against a real second screenshot rather than a resized copy of the first one
+(resizing a screenshot does not reproduce how the game re-renders its UI at a
+different size, so it proves nothing).
 """
 from __future__ import annotations
 

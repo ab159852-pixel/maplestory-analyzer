@@ -33,13 +33,16 @@ from .regions import (
     CONTEXT_BOXES,
     Box,
     FIELD_BOXES,
-    REFERENCE_CLIENT_SIZE,
+    REFERENCE_WINDOW_SIZE,
     PICKUP_LINE_BOXES,
     SHORTCUT_BOX,
     STAT_PANEL_BOX,
     scale_box,
     scale_shortcut_box,
     scale_top_left_box,
+    scale_window_box_to_client,
+    scale_window_shortcut_box_to_client,
+    scale_window_top_left_box_to_client,
     shortcut_slot_boxes_for_parent,
 )
 
@@ -142,7 +145,7 @@ def _crop_frame_to_client(
     return cropped
 
 
-def _pickup_boxes_for_client(client_size: tuple[int, int]) -> dict[str, tuple[int, int, int, int]]:
+def _pickup_boxes_for_client(window_size: tuple[int, int]) -> dict[str, tuple[int, int, int, int]]:
     """Extend right-side pickup crops into the wide-client letterbox.
 
     MapleStory keeps the notification feed flush with the actual client edge
@@ -151,21 +154,32 @@ def _pickup_boxes_for_client(client_size: tuple[int, int]) -> dict[str, tuple[in
     get a small right extension so the ``(+275)`` amount is not clipped.
     """
     boxes = dict(AUXILIARY_BOXES)
-    if client_size[0] > REFERENCE_CLIENT_SIZE[0]:
+    if window_size[0] > REFERENCE_WINDOW_SIZE[0]:
         for name in ("pickup", "pickup_wide"):
             left, top, _right, bottom = boxes[name]
-            boxes[name] = (left, top, REFERENCE_CLIENT_SIZE[0] + 37, bottom)
+            boxes[name] = (left, top, REFERENCE_WINDOW_SIZE[0] + 37, bottom)
     return boxes
 
 
-def _shortcut_scan_box(client_size: tuple[int, int]) -> Box:
+def _shortcut_scan_box(
+    client_size: tuple[int, int],
+    *,
+    window_size: tuple[int, int] | None = None,
+    client_offset: tuple[int, int] = (0, 0),
+) -> Box:
     """Return a small search area around the expected shortcut frame.
 
     The shortcut frame is detected from its chrome before the eight cells are
     cropped.  The search margin is intentionally larger than the historical
     crop error, but still much smaller than a full client capture.
     """
-    expected = scale_shortcut_box(SHORTCUT_BOX, client_size)
+    expected = (
+        scale_window_shortcut_box_to_client(
+            SHORTCUT_BOX, client_size, window_size, client_offset
+        )
+        if window_size is not None
+        else scale_shortcut_box(SHORTCUT_BOX, client_size)
+    )
     pad_x = max(18, round(expected.width * 0.24))
     pad_y = max(18, round(expected.height * 0.30))
     return Box(
@@ -292,7 +306,12 @@ def _shortcut_parent_regions(source: Image.Image, frame: Box) -> dict[str, Image
     return regions
 
 
-def field_sample_points(client_size: tuple[int, int]) -> list[tuple[int, int]]:
+def field_sample_points(
+    client_size: tuple[int, int],
+    *,
+    window_size: tuple[int, int] | None = None,
+    client_offset: tuple[int, int] = (0, 0),
+) -> list[tuple[int, int]]:
     """Client-relative points to probe for occlusion: the four corners of each
     FIELD_BOX, inset by a pixel so a corner lands inside its own box.
 
@@ -301,14 +320,34 @@ def field_sample_points(client_size: tuple[int, int]) -> list[tuple[int, int]]:
     stays readable so the value still parses, just wrong -- and a panel-level
     check with a few points can miss it.
     """
-    return box_sample_points(FIELD_BOXES.values(), client_size)
+    return box_sample_points(
+        FIELD_BOXES.values(),
+        client_size,
+        window_size=window_size,
+        client_offset=client_offset,
+    )
 
 
-def box_sample_points(boxes, client_size: tuple[int, int]) -> list[tuple[int, int]]:
+def box_sample_points(
+    boxes,
+    client_size: tuple[int, int],
+    *,
+    window_size: tuple[int, int] | None = None,
+    client_offset: tuple[int, int] = (0, 0),
+) -> list[tuple[int, int]]:
     points: list[tuple[int, int]] = []
     for box in boxes:
-        mapper = scale_shortcut_box if box == SHORTCUT_BOX else scale_box
-        b = mapper(box, client_size)
+        if window_size is None:
+            mapper = scale_shortcut_box if box == SHORTCUT_BOX else scale_box
+            b = mapper(box, client_size)
+        elif box == SHORTCUT_BOX:
+            b = scale_window_shortcut_box_to_client(
+                box, client_size, window_size, client_offset
+            )
+        else:
+            b = scale_window_box_to_client(
+                box, client_size, window_size, client_offset
+            )
         points += [
             (b.left + 1, b.top + 1), (b.right - 2, b.top + 1),
             (b.left + 1, b.bottom - 2), (b.right - 2, b.bottom - 2),
@@ -450,12 +489,18 @@ class GameWindowCapture:
         # useful number when diagnosing a bad read from a log after the fact
         # -- and the one thing missing from every capture taken so far.
         self.client_size: tuple[int, int] | None = None
+        # Reference boxes are measured from the complete top-level window
+        # screenshot. Live backends return a client-only image, so retain the
+        # actual outer size and client origin inside it for every crop.
+        self.window_size: tuple[int, int] | None = None
+        self.client_offset: tuple[int, int] | None = None
         self.shortcut_frame: Box | None = None
         # The shortcut frame is UI geometry, not per-frame content.  Reuse the
         # calibrated client-relative box until the game client size changes;
         # detecting edges on every 150ms potion sample was unnecessary CPU work
         # and made quantity updates fall behind the game's drink animation.
         self._shortcut_frame_client_size: tuple[int, int] | None = None
+        self._shortcut_frame_geometry_key: tuple | None = None
         # Status, economy, and context workers share one mss desktop grabber.
         # Serialize only the short screen-capture sections; OCR remains fully
         # independent and can never block the Tk thread.
@@ -477,6 +522,65 @@ class GameWindowCapture:
         self._print_window_disabled = False
         self._print_window_retry_at = 0.0
         self.print_window_error: str | None = None
+
+    def _remember_capture_geometry(
+        self,
+        client_rect: tuple[int, int, int, int],
+        window_rect: tuple[int, int, int, int] | None = None,
+    ) -> None:
+        """Cache the physical window/client relationship used by live crops."""
+        client_left, client_top, client_right, client_bottom = client_rect
+        client_size = (
+            client_right - client_left,
+            client_bottom - client_top,
+        )
+        if window_rect is None:
+            try:
+                hwnd = self._hwnd or self._find_window()
+                window_rect = self._window_rect_on_screen(hwnd)
+            except Exception:
+                window_rect = client_rect
+        window_left, window_top, window_right, window_bottom = window_rect
+        window_size = (
+            window_right - window_left,
+            window_bottom - window_top,
+        )
+        if min(*client_size, *window_size) <= 0:
+            # The caller will report the original invalid-geometry error; do
+            # not replace a valid previous geometry with a zero-sized frame.
+            return
+        self.client_size = client_size
+        self.window_size = window_size
+        self.client_offset = (
+            client_left - window_left,
+            client_top - window_top,
+        )
+
+    def _live_box(
+        self,
+        raw_box: tuple[int, int, int, int],
+        client_size: tuple[int, int],
+        *,
+        top_left: bool = False,
+        shortcut: bool = False,
+    ) -> Box:
+        """Map one reference box using the latest live HWND geometry."""
+        window_size = self.window_size or client_size
+        client_offset = self.client_offset or (0, 0)
+        if shortcut:
+            return scale_window_shortcut_box_to_client(
+                raw_box, client_size, window_size, client_offset
+            )
+        if top_left:
+            return scale_window_top_left_box_to_client(
+                raw_box, client_size, window_size, client_offset
+            )
+        return scale_window_box_to_client(
+            raw_box, client_size, window_size, client_offset
+        )
+
+    def _live_geometry_key(self, client_size: tuple[int, int]) -> tuple:
+        return client_size, self.window_size, self.client_offset
 
     def _owning_process_name(self, hwnd: int) -> str:
         # Title alone isn't a reliable match: e.g. a browser tab for a wiki page
@@ -594,6 +698,7 @@ class GameWindowCapture:
             client_height = client_rect[3] - client_rect[1]
             client_size = (client_width, client_height)
             window_rect = self._window_rect_on_screen(hwnd)
+            self._remember_capture_geometry(client_rect, window_rect)
             capture_size = (
                 window_rect[2] - window_rect[0],
                 window_rect[3] - window_rect[1],
@@ -726,6 +831,7 @@ class GameWindowCapture:
         self, client_rect: tuple[int, int, int, int]
     ) -> Image.Image | None:
         """Try compositor capture backends in priority order."""
+        self._remember_capture_geometry(client_rect)
         graphics = self._try_graphics_frame(client_rect)
         if graphics is not None:
             return graphics
@@ -759,11 +865,13 @@ class GameWindowCapture:
         window_frame = self._try_window_frame(client_rect)
         if window_frame is not None:
             self.client_size = window_frame.size
-            return window_frame.crop(scale_box(STAT_PANEL_BOX, window_frame.size).as_tuple())
+            return window_frame.crop(
+                self._live_box(STAT_PANEL_BOX, window_frame.size).as_tuple()
+            )
         left, top, right, bottom = client_rect
         client_size = (right - left, bottom - top)
-        self.client_size = client_size
-        box = scale_box(STAT_PANEL_BOX, client_size)
+        self._remember_capture_geometry(client_rect)
+        box = self._live_box(STAT_PANEL_BOX, client_size)
         shot = self._mss.grab({
             "left": left + box.left,
             "top": top + box.top,
@@ -783,6 +891,7 @@ class GameWindowCapture:
 
     def _grab_fields(self, *, include_bar_signals: bool = False) -> dict[str, Image.Image]:
         client_rect = self._client_rect_on_screen()
+        self._remember_capture_geometry(client_rect)
         # WGC is the live, compositor-independent path.  When it is
         # unavailable, try the visible desktop before PrintWindow: classic
         # DirectX clients can return a perfectly valid-looking but stale
@@ -791,13 +900,13 @@ class GameWindowCapture:
         if graphics is not None:
             self.client_size = graphics.size
             fields = {
-                name: graphics.crop(scale_box(box, graphics.size).as_tuple())
+                name: graphics.crop(self._live_box(box, graphics.size).as_tuple())
                 for name, box in FIELD_BOXES.items()
             }
             if include_bar_signals:
                 fields.update({
                     f"__bar_{resource}": graphics.crop(
-                        scale_box(box, graphics.size).as_tuple()
+                        self._live_box(box, graphics.size).as_tuple()
                     )
                     for resource, box in BAR_BOXES.items()
                 })
@@ -815,12 +924,19 @@ class GameWindowCapture:
         # own pixels, so anything on top of it is what would reach OCR. Refuse
         # the frame instead of reading someone else's window (~0.03ms measured
         # for the whole check, against ~60ms of OCR).
-        points = [(left + x, top + y) for x, y in field_sample_points(client_size)]
+        points = [
+            (left + x, top + y)
+            for x, y in field_sample_points(
+                client_size,
+                window_size=self.window_size,
+                client_offset=self.client_offset or (0, 0),
+            )
+        ]
         if panel_is_obscured(points, self._hwnd, self._root_window_at):
             raise RuntimeError(self._obscured_live_error())
 
         self.capture_backend = "desktop"
-        panel_box = scale_box(STAT_PANEL_BOX, client_size)
+        panel_box = self._live_box(STAT_PANEL_BOX, client_size)
         shot = self._mss.grab({
             "left": left + panel_box.left,
             "top": top + panel_box.top,
@@ -831,7 +947,7 @@ class GameWindowCapture:
 
         fields = {}
         for name, box in FIELD_BOXES.items():
-            field_box = scale_box(box, client_size)
+            field_box = self._live_box(box, client_size)
             local = (
                 field_box.left - panel_box.left, field_box.top - panel_box.top,
                 field_box.right - panel_box.left, field_box.bottom - panel_box.top,
@@ -839,7 +955,7 @@ class GameWindowCapture:
             fields[name] = panel.crop(local)
         if include_bar_signals:
             for resource, box in BAR_BOXES.items():
-                bar_box = scale_box(box, client_size)
+                bar_box = self._live_box(box, client_size)
                 fields[f"__bar_{resource}"] = panel.crop((
                     bar_box.left - panel_box.left,
                     bar_box.top - panel_box.top,
@@ -854,30 +970,36 @@ class GameWindowCapture:
 
     def _grab_auxiliary(self) -> dict[str, Image.Image]:
         client_rect = self._client_rect_on_screen()
+        self._remember_capture_geometry(client_rect)
         graphics = self._try_graphics_frame(client_rect)
         if graphics is not None:
             client_size = graphics.size
             self.client_size = client_size
-            capture_boxes = _pickup_boxes_for_client(client_size)
+            capture_window_size = self.window_size or client_size
+            capture_boxes = _pickup_boxes_for_client(capture_window_size)
             regions: dict[str, Image.Image] = {
                 name: graphics.crop(
-                    scale_box(capture_boxes[name], client_size).as_tuple()
+                    self._live_box(capture_boxes[name], client_size).as_tuple()
                 )
                 for name in capture_boxes
                 if name != "shortcut"
             }
-            expected = scale_shortcut_box(SHORTCUT_BOX, client_size)
+            expected = self._live_box(
+                SHORTCUT_BOX, client_size, shortcut=True
+            )
             cached = self.shortcut_frame
-            cached_size = getattr(self, "_shortcut_frame_client_size", None)
+            geometry_key = self._live_geometry_key(client_size)
+            cached_key = getattr(self, "_shortcut_frame_geometry_key", None)
             cached_valid = (
                 isinstance(cached, Box)
-                and cached_size == client_size
+                and cached_key == geometry_key
                 and 0 <= cached.left < cached.right <= client_size[0]
                 and 0 <= cached.top < cached.bottom <= client_size[1]
             )
             if not cached_valid:
                 self.shortcut_frame = detect_shortcut_frame(graphics, expected)
                 self._shortcut_frame_client_size = client_size
+                self._shortcut_frame_geometry_key = geometry_key
             regions.update(_shortcut_parent_regions(graphics, self.shortcut_frame))
         else:
             left, top, right, bottom = client_rect
@@ -886,17 +1008,26 @@ class GameWindowCapture:
 
             # Refuse auxiliary OCR only for the desktop fallback. Graphics
             # Capture already reads the game's own compositor surface.
-            points = [(left + x, top + y) for x, y in box_sample_points(AUXILIARY_BOXES.values(), client_size)]
+            points = [
+                (left + x, top + y)
+                for x, y in box_sample_points(
+                    AUXILIARY_BOXES.values(),
+                    client_size,
+                    window_size=self.window_size,
+                    client_offset=self.client_offset or (0, 0),
+                )
+            ]
             if panel_is_obscured(points, self._hwnd, self._root_window_at):
                 raise RuntimeError(self._obscured_live_error())
             else:
                 self.capture_backend = "desktop"
-                capture_boxes = _pickup_boxes_for_client(client_size)
+                capture_window_size = self.window_size or client_size
+                capture_boxes = _pickup_boxes_for_client(capture_window_size)
                 regions = {}
                 for name, raw_box in capture_boxes.items():
                     if name == "shortcut":
                         continue
-                    box = scale_box(raw_box, client_size)
+                    box = self._live_box(raw_box, client_size)
                     shot = self._mss.grab({
                         "left": left + box.left,
                         "top": top + box.top,
@@ -910,7 +1041,11 @@ class GameWindowCapture:
                 # frame inside it.  This is still far cheaper than grabbing
                 # the whole desktop and it prevents a few DPI pixels from
                 # moving the eight quantity crops into adjacent cells.
-                scan_box = _shortcut_scan_box(client_size)
+                scan_box = _shortcut_scan_box(
+                    client_size,
+                    window_size=self.window_size,
+                    client_offset=self.client_offset or (0, 0),
+                )
                 scan_shot = self._mss.grab({
                     "left": left + scan_box.left,
                     "top": top + scan_box.top,
@@ -920,7 +1055,9 @@ class GameWindowCapture:
                 scan_image = Image.frombytes(
                     "RGB", scan_shot.size, scan_shot.bgra, "raw", "BGRX"
                 )
-                expected = scale_shortcut_box(SHORTCUT_BOX, client_size)
+                expected = self._live_box(
+                    SHORTCUT_BOX, client_size, shortcut=True
+                )
                 expected_local = Box(
                     expected.left - scan_box.left,
                     expected.top - scan_box.top,
@@ -928,10 +1065,11 @@ class GameWindowCapture:
                     expected.bottom - scan_box.top,
                 )
                 cached = self.shortcut_frame
-                cached_size = getattr(self, "_shortcut_frame_client_size", None)
+                geometry_key = self._live_geometry_key(client_size)
+                cached_key = getattr(self, "_shortcut_frame_geometry_key", None)
                 cached_valid = (
                     isinstance(cached, Box)
-                    and cached_size == client_size
+                    and cached_key == geometry_key
                     and scan_box.left <= cached.left < cached.right <= scan_box.right
                     and scan_box.top <= cached.top < cached.bottom <= scan_box.bottom
                 )
@@ -951,13 +1089,13 @@ class GameWindowCapture:
                         frame_local.bottom + scan_box.top,
                     )
                     self._shortcut_frame_client_size = client_size
+                    self._shortcut_frame_geometry_key = geometry_key
                 regions.update(_shortcut_parent_regions(scan_image, frame_local))
 
         pickup = regions["pickup"]
-        pickup_parent = scale_box(_pickup_boxes_for_client(client_size)["pickup"], client_size)
         reference_feed_width = AUXILIARY_BOXES["pickup"][2] - AUXILIARY_BOXES["pickup"][0]
         reference_feed_height = AUXILIARY_BOXES["pickup"][3] - AUXILIARY_BOXES["pickup"][1]
-        actual_feed_size = (pickup_parent.right - pickup_parent.left, pickup_parent.bottom - pickup_parent.top)
+        actual_feed_size = pickup.size
         for line, raw_box in PICKUP_LINE_BOXES.items():
             left_box, top_box, right_box, bottom_box = raw_box
             regions[f"pickup:{line}"] = pickup.crop((
@@ -974,12 +1112,17 @@ class GameWindowCapture:
 
     def _grab_context(self) -> dict[str, Image.Image]:
         client_rect = self._client_rect_on_screen()
+        self._remember_capture_geometry(client_rect)
         window_frame = self._try_window_frame(client_rect)
         if window_frame is not None:
             self.client_size = window_frame.size
             return {
                 name: window_frame.crop(
-                    scale_top_left_box(box, window_frame.size).as_tuple()
+                    self._live_box(
+                        box,
+                        window_frame.size,
+                        top_left=name in {"map", "map_wide"},
+                    ).as_tuple()
                 )
                 for name, box in CONTEXT_BOXES.items()
             }
@@ -989,7 +1132,11 @@ class GameWindowCapture:
         self.client_size = client_size
         regions: dict[str, Image.Image] = {}
         for name, raw_box in CONTEXT_BOXES.items():
-            box = scale_top_left_box(raw_box, client_size)
+            box = self._live_box(
+                raw_box,
+                client_size,
+                top_left=name in {"map", "map_wide"},
+            )
             shot = self._mss.grab({
                 "left": left + box.left,
                 "top": top + box.top,

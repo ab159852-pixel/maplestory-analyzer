@@ -46,8 +46,9 @@
   數量範圍，也能用 ↗ 開啟 [楓憶 MapleMemory](https://morrisrrrrrrr-svg.github.io/)
   的原始頁面。資料是背景載入並在程式執行期間快取，不會阻塞 0.3 秒 OCR 更新；來源
   沒有提供機率時會顯示「—」，不自行推估。
-- **解析度與 OCR 自動適應** — 擷取位置會依楓之谷實際 client 視窗像素等比例換算，
-  自動處理不同解析度、水平黑邊與視窗調整；數值 OCR 只在結構或信心不足時做放大／
+- **解析度與 OCR 自動適應** — 擷取位置會依楓之谷實際 HWND 外框、client 尺寸與
+  client origin 換算，先移除標題列／非 client 外框，再自動處理不同解析度、水平黑邊
+  與視窗調整；數值 OCR 只在結構或信心不足時做放大／
   對比恢復，避免每一幀都使用較慢的偵測 OCR。
 - **自動更新** — Windows 打包版啟動後會在背景檢查 GitHub Releases；發現新版本時可
   下載並驗證 SHA-256，確認後由獨立更新程序重新啟動並替換檔案，不會改動使用者的
@@ -138,15 +139,15 @@ py -3.10 -m venv .venv
 
 ## 發佈新版（維護者）
 
-目前這份程式的 `APP_VERSION` 是 `1.0.28`。每次先把
+目前這份程式的 `APP_VERSION` 是 `1.0.29`。每次先把
 `src/maple_analyzer/version.py` 改成下一個版本，再提交並推送同名 tag，例如：
 
 ```powershell
-git tag v1.0.28
-git push origin v1.0.28
+git tag v1.0.29
+git push origin v1.0.29
 ```
 
-GitHub Actions 會自動安裝依賴、建立 `MapleStoryAnalyzer-v1.0.28-win64.zip`、產生
+GitHub Actions 會自動安裝依賴、建立 `MapleStoryAnalyzer-v1.0.29-win64.zip`、產生
 SHA-256 checksum 並發佈 Release。使用者的打包版下次啟動就能收到更新。
 
 ## 疑難排解

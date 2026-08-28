@@ -2513,7 +2513,13 @@ class OverlayApp:
             if callable(reset_flash):
                 reset_flash()
             self._potion_baseline_pending = True
-            self._potion_baseline_samples.clear()
+            # Keep the state transition defensive for lightweight test/stub
+            # objects and for an older in-memory OverlayApp instance created
+            # before this baseline buffer was introduced. A normal app always
+            # initializes the list in __init__.
+            baseline_samples = getattr(self, "_potion_baseline_samples", None)
+            if baseline_samples is not None:
+                baseline_samples.clear()
             self._last_logged_shortcut_counts = None
         if monitor is not None:
             set_status = getattr(monitor, "set_status_enabled", None)
@@ -3564,7 +3570,12 @@ class OverlayApp:
                     # window before the first real drink can be billed.
                     economy.prime_quick_slot_counts(idle_counts)
             self._potion_baseline_pending = not bool(idle_counts)
-            self._potion_baseline_samples.clear()
+            # The production app creates this buffer in __init__. Keep the
+            # transition safe for lightweight test/stub objects and for an
+            # older in-memory instance created before the buffer existed.
+            baseline_samples = getattr(self, "_potion_baseline_samples", None)
+            if baseline_samples is not None:
+                baseline_samples.clear()
             getattr(self, "_set_monitor_aux_enabled", lambda _enabled, **_kwargs: None)(
                 True,
                 reset_potion_baseline=not bool(idle_counts),

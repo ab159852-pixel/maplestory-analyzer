@@ -2,6 +2,7 @@
 from maple_analyzer.regions import (
     AUXILIARY_BOXES,
     Box,
+    CONTEXT_BOXES,
     FIELD_BOXES,
     REFERENCE_CLIENT_SIZE,
     SHORTCUT_BOX,
@@ -11,6 +12,9 @@ from maple_analyzer.regions import (
     region_transform,
     scale_shortcut_box,
     scale_top_left_box,
+    scale_window_box_to_client,
+    scale_window_shortcut_box_to_client,
+    scale_window_top_left_box_to_client,
     shortcut_slot_boxes_for_parent,
 )
 from maple_analyzer.capture import _pickup_boxes_for_client, detect_shortcut_frame
@@ -70,6 +74,42 @@ def test_top_left_box_does_not_apply_viewport_letterbox():
     assert centered.left > anchored.left
     assert anchored.left == round(box[0] * transform.scale)
     assert anchored.top == round(box[1] * transform.scale)
+
+
+def test_live_client_mapping_removes_the_actual_window_titlebar():
+    """Live WGC frames are client-only while the reference image is a window."""
+    client = (1351, 764)
+    window = (1351, 800)
+    offset = (0, 36)
+
+    map_box = scale_window_top_left_box_to_client(
+        CONTEXT_BOXES["map"], client, window, offset
+    )
+    status_box = scale_window_box_to_client(
+        STAT_PANEL_BOX, client, window, offset
+    )
+
+    assert map_box.as_tuple() == (0, 39, 145, 65)
+    assert status_box.as_tuple() == (260, 722, 900, 764)
+
+
+def test_live_client_mapping_tracks_a_smaller_window_and_shortcut_layer():
+    """The current 1094px window must map from its outer frame, not its crop."""
+    client = (1094, 616)
+    window = (1094, 646)
+    offset = (0, 30)
+
+    map_box = scale_window_top_left_box_to_client(
+        CONTEXT_BOXES["map"], client, window, offset
+    )
+    shortcut = scale_window_shortcut_box_to_client(
+        SHORTCUT_BOX, client, window, offset
+    )
+
+    assert map_box.as_tuple() == (0, 31, 117, 52)
+    assert shortcut.as_tuple() == (749, 502, 868, 564)
+    assert 0 <= shortcut.left < shortcut.right <= client[0]
+    assert 0 <= shortcut.top < shortcut.bottom <= client[1]
 
 
 def test_shortcut_grid_is_width_scaled_and_bottom_anchored():
