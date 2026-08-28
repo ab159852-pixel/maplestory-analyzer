@@ -13,6 +13,7 @@ import queue
 import re
 import threading
 import time
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -176,6 +177,10 @@ def merge_status_snapshots(previous: StatSnapshot, incoming: StatSnapshot) -> St
 
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
 _CANONICAL_BARRACKS_RE = re.compile(r"第\d+軍營")
+# MapleStory appends an ASCII/Unicode Roman numeral to several map names.  A
+# recognition pass over the narrow mini-map crop can drop that suffix, so it
+# must be treated as a stronger candidate than the same map name without it.
+_MAP_ROMAN_SUFFIX_RE = re.compile(r"[IVX]+$", re.IGNORECASE)
 _CONTEXT_NOISE = {
     "小地圖", "小地图", "地圖", "地图", "MINI", "MAP", "LV", "Lv", "lv",
 }
@@ -248,7 +253,10 @@ def _clean_context_text(value: str) -> str:
 
 def _normalize_context_text(value: str, *, kind: str) -> str:
     """Normalize the few stable Traditional/Simplified OCR substitutions."""
-    text = _clean_context_text(value)
+    # NFKC converts the game's full-width/Unicode Roman floor glyphs (for
+    # example Ⅱ) into the ASCII form used by the drop database (II), while
+    # leaving the Traditional Chinese map title intact.
+    text = unicodedata.normalize("NFKC", _clean_context_text(value))
     if kind == "map":
         # A shifted crop can capture the mini-map tab caption instead of the
         # second line.  These strings are UI chrome, never a real map name;
@@ -304,6 +312,19 @@ def _has_complete_map_candidate(candidates: list[str]) -> bool:
     return any(_CANONICAL_BARRACKS_RE.search(_compact_map_text(candidate)) for candidate in candidates)
 
 
+def _has_explicit_map_floor(value: str) -> bool:
+    """Return whether a map candidate keeps its visible Roman floor suffix."""
+    compact = _compact_map_text(value)
+    return len(_CJK_RE.findall(compact)) >= 2 and bool(_MAP_ROMAN_SUFFIX_RE.search(compact))
+
+
+def _has_strong_map_candidate(candidates: list[str]) -> bool:
+    """Return whether OCR found a complete numbered map or explicit floor."""
+    return _has_complete_map_candidate(candidates) or any(
+        _has_explicit_map_floor(candidate) for candidate in candidates
+    )
+
+
 def _select_context_candidate(candidates: list[str], *, kind: str) -> str | None:
     if not candidates:
         return None
@@ -314,6 +335,17 @@ def _select_context_candidate(candidates: list[str], *, kind: str) -> str | None
         ]
         if complete:
             candidates = complete
+        else:
+            # When both views produce ``寺院通道`` and one view produces the
+            # actual ``寺院通道II``, a plain mode vote would systematically
+            # discard the floor marker.  Prefer the explicit floor candidate;
+            # it carries information the shorter candidate demonstrably lost.
+            with_floor = [
+                candidate for candidate in candidates
+                if _has_explicit_map_floor(candidate)
+            ]
+            if with_floor:
+                candidates = with_floor
     # A single enlarged/detection retry can still return a plausible but wrong
     # CJK string.  Prefer the mode across all views, with the most recent
     # candidate breaking a tie, instead of selecting the longest or last OCR
@@ -381,7 +413,7 @@ def extract_context(ocr: Any, regions: dict[str, Any]) -> ContextReading:
             pass
 
     map_candidates = _context_candidates(map_lines, kind="map")
-    if not _has_complete_map_candidate(map_candidates) and map_images:
+    if not _has_strong_map_candidate(map_candidates) and map_images:
         # A single contrast retry is cheaper than running detection on every
         # context tick and helps when the game window is dimmed or partially
         # scaled by Windows DPI settings.
@@ -399,7 +431,7 @@ def extract_context(ocr: Any, regions: dict[str, Any]) -> ContextReading:
             pass
 
     map_candidates = _context_candidates(map_lines, kind="map")
-    if not _has_complete_map_candidate(map_candidates) and map_images:
+    if not _has_strong_map_candidate(map_candidates) and map_images:
         # Detection is the final confirmation path.  It runs only when the
         # cheap recognition passes did not find a complete map token.
         for image in reversed(map_images):
@@ -408,7 +440,7 @@ def extract_context(ocr: Any, regions: dict[str, Any]) -> ContextReading:
             except Exception:
                 pass
             map_candidates = _context_candidates(map_lines, kind="map")
-            if _has_complete_map_candidate(map_candidates):
+            if _has_strong_map_candidate(map_candidates):
                 break
 
     job_lines: list[object] = []
@@ -968,7 +1000,17 @@ class BackgroundMonitor:
             not feed_changed
             and feed_signature is not None
             and self._pickup_detection_signature == feed_signature
+            and self._pickup_detected_lines
+            and any(
+                parse_mesos_amount(text) is not None
+                for text, _ in self._pickup_detected_lines
+            )
         ):
+            # An empty/garbled detector result is deliberately not cached as a
+            # replacement for the fixed row reads below.  The old early return
+            # did exactly that: one detector miss made every later pass return
+            # an empty list until the whole feed image changed, so mesos
+            # income appeared to stop even though the visible row was readable.
             return list(self._pickup_detected_lines)
 
         line_images = [
@@ -989,11 +1031,13 @@ class BackgroundMonitor:
         lines: list[tuple[str, float]] = []
         for line_id, image in line_images:
             signature = current_line_signatures.get(line_id)
+            cached_text = self._pickup_line_values.get(line_id, "")
             if (
                 self._pickup_line_signatures.get(line_id) == signature
                 and line_id in self._pickup_line_values
+                and bool(str(cached_text).strip())
             ):
-                text = self._pickup_line_values[line_id]
+                text = cached_text
             else:
                 text = (
                     read_text_field(image)
@@ -1035,9 +1079,19 @@ class BackgroundMonitor:
                 detected.extend(self.ocr.read_lines(image))
                 if any(parse_mesos_amount(_line_text(line)) is not None for line in detected):
                     break
-            lines = [(_line_text(line), float(getattr(line, "y", 0) or 0)) for line in detected]
+            detected_lines = [
+                (_line_text(line), float(getattr(line, "y", 0) or 0))
+                for line in detected
+            ]
             self._pickup_detection_signature = feed_signature
-            self._pickup_detected_lines = list(lines)
+            if any(parse_mesos_amount(text) is not None for text, _ in detected_lines):
+                self._pickup_detected_lines = list(detected_lines)
+                lines = detected_lines
+            else:
+                # Keep a weak but parseable fixed-row candidate when the
+                # heavyweight detector failed to return a money line.  It is
+                # safer than replacing real visible text with an empty frame.
+                self._pickup_detected_lines = []
         elif (
             not line_images
             and regions.get("pickup") is not None

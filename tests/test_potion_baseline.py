@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from maple_analyzer.economy import EconomyTracker
-from maple_analyzer.overlay import OverlayApp
+from maple_analyzer.overlay import OverlayApp, _format_shortcut_inventory
 from maple_analyzer.settings import PotionSlotConfig, Settings
 
 
@@ -97,3 +97,23 @@ def test_late_slot_is_added_without_becoming_a_potion_charge():
         "6": 2676,
         "7": 1875,
     }
+
+
+def test_partial_shortcut_observation_is_visible_before_baseline_confirmation():
+    tracker = EconomyTracker([
+        PotionSlotConfig(slot="6", kind="hp", enabled=True),
+        PotionSlotConfig(slot="7", kind="mp", enabled=True),
+    ])
+    tracker.begin_quick_slot_baseline()
+    tracker.observe_quick_slot_counts({"6": 2676, "7": 1875})
+
+    text, pending = _format_shortcut_inventory(
+        tracker.snapshot,
+        lambda key: {
+            "potion_inventory_pending": "正在偵測初始數量…",
+            "potion_inventory_unconfirmed": "最新 OCR，待確認",
+        }[key],
+    )
+
+    assert text == "6:2,676 · 7:1,875 (最新 OCR，待確認)"
+    assert pending is True

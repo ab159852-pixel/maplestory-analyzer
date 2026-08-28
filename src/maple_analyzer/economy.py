@@ -440,6 +440,19 @@ class EconomyTracker:
                 self._slot_last_accepted_at[slot_id] = timestamp
                 self._slot_last_sample_at[slot_id] = timestamp
 
+    def observe_quick_slot_counts(self, counts: dict[str, int]) -> None:
+        """Publish valid OCR quantities without changing the billing ledger.
+
+        Startup calibration can receive one configured cell before another one
+        has been decoded.  The HUD should still show that latest observation so
+        the user can tell that OCR is working, but it must not become a session
+        baseline or a potion charge until the normal calibration/accounting
+        gates accept it.
+        """
+        for slot_id, count in counts.items():
+            if isinstance(count, int) and 0 <= count <= MAX_SHORTCUT_QUANTITY:
+                self._shortcut_observed[slot_id] = count
+
     def reset(self) -> None:
         self._mesos.reset()
         self._potion_uses = 0

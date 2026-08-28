@@ -419,6 +419,20 @@ def test_snapshot_exposes_initial_and_current_shortcut_quantities():
     assert snapshot.shortcut_observed == {"1": 1179, "2": 2037}
 
 
+def test_observed_shortcut_quantities_are_display_only_before_baseline():
+    tracker = EconomyTracker([PotionSlotConfig(slot="7", kind="mp", cost=604)])
+    tracker.begin_quick_slot_baseline()
+    tracker.observe_quick_slot_counts({"7": 1875})
+
+    snapshot = tracker.snapshot
+    assert snapshot.shortcut_observed == {"7": 1875}
+    assert snapshot.shortcut_baseline == {}
+    assert snapshot.shortcut_current == {}
+    assert snapshot.shortcut_baseline_ready is False
+    assert snapshot.potion_uses == 0
+    assert snapshot.potion_cost == 0
+
+
 def test_large_shortcut_drop_is_reversible_when_a_later_frame_restores_quantity():
     tracker = EconomyTracker([PotionSlotConfig(slot="7", kind="mp", cost=604)])
     tracker.prime_quick_slot_counts({"7": 116})

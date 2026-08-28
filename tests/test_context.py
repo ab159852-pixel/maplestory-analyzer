@@ -72,6 +72,32 @@ def test_context_prefers_complete_map_from_wider_retry():
     assert reading.map_name == "第3軍營"
 
 
+class _RomanFloorOcr:
+    def read_field(self, image):
+        # The focused view loses the trailing floor marker, while the wider
+        # view retains the Unicode glyph rendered by the game.
+        if image.height == 160:
+            return "寺院通道"
+        if image.height == 216:
+            return "寺院通道Ⅱ"
+        return ""
+
+    def read_lines(self, _image):
+        return []
+
+
+def test_context_prefers_map_candidate_with_roman_floor_suffix():
+    reading = extract_context(
+        _RomanFloorOcr(),
+        {
+            "map": Image.new("RGB", (75, 20)),
+            "map_wide": Image.new("RGB", (110, 27)),
+        },
+    )
+
+    assert reading.map_name == "寺院通道II"
+
+
 class _WeakMapOnlyOcr:
     def read_field(self, _image):
         return "軍/營"

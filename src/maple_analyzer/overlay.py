@@ -298,6 +298,63 @@ def _fmt_loss(loss: int) -> str:
     return f"-{loss}" if loss > 0 else "0"
 
 
+def _format_shortcut_inventory(snapshot, translate, *, compact: bool = False) -> tuple[str, bool]:
+    """Format the shortcut quantities without hiding partial startup OCR.
+
+    ``shortcut_baseline`` is intentionally empty while the multi-cell startup
+    confirmation is in progress.  Showing only the pending label made a valid
+    slot look like it was never read, especially when the neighbouring cell was
+    temporarily covered by an animation.  ``shortcut_observed`` is display-only
+    and therefore safe to show before accounting accepts the baseline.
+    """
+    if snapshot is None:
+        return translate("potion_inventory_pending"), True
+
+    baseline = getattr(snapshot, "shortcut_baseline", {}) or {}
+    trusted_counts = getattr(snapshot, "shortcut_current", {}) or {}
+    observed = getattr(snapshot, "shortcut_observed", {}) or {}
+    pending_observation = False
+
+    if baseline:
+        values: list[str] = []
+        baseline_ids = set(baseline)
+        for slot_id, initial in sorted(baseline.items(), key=lambda item: str(item[0])):
+            trusted = trusted_counts.get(slot_id, initial)
+            current = observed.get(slot_id, trusted)
+            pending = current != trusted
+            pending_observation = pending_observation or pending
+            if compact:
+                values.append(f"{slot_id}:{current:,}{'*' if pending else ''}")
+            else:
+                values.append(f"{slot_id}:{initial:,}→{current:,}{'*' if pending else ''}")
+        # A timed-out multi-slot calibration can establish one baseline before
+        # another configured cell becomes readable. Keep that late/partial
+        # observation visible instead of making the HUD look as if the slot was
+        # never configured.
+        for slot_id, count in sorted(observed.items(), key=lambda item: str(item[0])):
+            if slot_id not in baseline_ids:
+                values.append(f"{slot_id}:{count:,}*")
+                pending_observation = True
+        text = " · ".join(values)
+        if pending_observation:
+            text += f" ({translate('potion_inventory_unconfirmed')})"
+        return text or translate("potion_inventory_pending"), pending_observation
+
+    # The first valid cell is useful feedback even before every configured slot
+    # has repeated.  It is never used for cost/recovery accounting here.
+    values = [
+        f"{slot_id}:{count:,}"
+        for slot_id, count in sorted(observed.items(), key=lambda item: str(item[0]))
+    ]
+    if values:
+        return (
+            " · ".join(values)
+            + f" ({translate('potion_inventory_unconfirmed')})",
+            True,
+        )
+    return translate("potion_inventory_pending"), True
+
+
 def _fmt_summary(s: SessionSummary, index: int) -> str:
     # Console/debug log only, not shown in the UI -- deliberately left in
     # plain English regardless of self._settings.language.
@@ -2567,6 +2624,12 @@ class OverlayApp:
         economy = getattr(self, "_economy", None)
         if economy is None:
             return
+        # Keep the latest valid cell visible during multi-slot calibration.
+        # This is intentionally separate from prime/record: an observation is
+        # not a baseline and must never create a potion charge.
+        observe_counts = getattr(economy, "observe_quick_slot_counts", None)
+        if counts and callable(observe_counts):
+            observe_counts(counts)
         if self._potion_baseline_pending:
             if not counts:
                 return
@@ -2628,7 +2691,16 @@ class OverlayApp:
                         f"[{time.strftime('%H:%M:%S')}] potion baseline partial: "
                         f"waiting for slot(s) {', '.join(missing)} timed out"
                     )
+            # Keep one-time observations for cells that timed out during
+            # calibration.  They remain display-only until that cell gets a
+            # proper per-slot baseline, but dropping them here made the HUD
+            # silently lose a configured potion row after five seconds.
+            display_observations: dict[str, int] = {}
+            for sample in self._potion_baseline_samples:
+                display_observations.update(sample)
             economy.prime_quick_slot_counts(stable, now=now)
+            if display_observations and callable(observe_counts):
+                observe_counts(display_observations)
             self._potion_baseline_pending = False
             self._last_logged_shortcut_counts = dict(stable)
             visible = ", ".join(f"{slot}={count}" for slot, count in sorted(stable.items()))
@@ -4076,25 +4148,10 @@ class OverlayApp:
         economy = getattr(self, "_economy", None)
         if economy is not None:
             economy_snapshot = economy.snapshot
-            pending_observation = False
-            if economy_snapshot.shortcut_baseline_ready:
-                # Pair each slot's initial quantity with the latest plausible
-                # OCR observation.  The economy tracker keeps a separate
-                # trusted quantity for cost accounting, so a one-frame lower
-                # read can be shown immediately with a clear pending marker.
-                inventory_values = []
-                observed = getattr(economy_snapshot, "shortcut_observed", {})
-                for slot_id, initial in economy_snapshot.shortcut_baseline.items():
-                    trusted = economy_snapshot.shortcut_current.get(slot_id, initial)
-                    current = observed.get(slot_id, trusted)
-                    pending = current != trusted
-                    pending_observation = pending_observation or pending
-                    inventory_values.append(f"{slot_id}:{initial:,}→{current:,}{'*' if pending else ''}")
-                inventory_text = " · ".join(inventory_values) or self._t("potion_inventory_pending")
-                if pending_observation:
-                    inventory_text += f" ({self._t('potion_inventory_unconfirmed')})"
-            else:
-                inventory_text = self._t("potion_inventory_pending")
+            inventory_text, pending_observation = _format_shortcut_inventory(
+                economy_snapshot,
+                self._t,
+            )
             self._value_labels["shortcut_inventory"].configure(
                 text=inventory_text,
                 text_color=(EXP_COLOR if pending_observation else OK_COLOR)
@@ -4224,21 +4281,11 @@ class OverlayApp:
         mp_recovery = getattr(economy_snapshot, "mp_recovery_natural", 0) if economy_snapshot is not None else 0
         hp_recovery_savings = getattr(economy_snapshot, "hp_recovery_savings", 0.0) if economy_snapshot is not None else 0.0
         mp_recovery_savings = getattr(economy_snapshot, "mp_recovery_savings", 0.0) if economy_snapshot is not None else 0.0
-        if economy_snapshot is not None and economy_snapshot.shortcut_baseline_ready:
-            observed = getattr(economy_snapshot, "shortcut_observed", {})
-            pending_observation = False
-            inventory_values = []
-            for slot_id, initial in economy_snapshot.shortcut_baseline.items():
-                trusted = economy_snapshot.shortcut_current.get(slot_id, initial)
-                current = observed.get(slot_id, trusted)
-                pending = current != trusted
-                pending_observation = pending_observation or pending
-                inventory_values.append(f"{slot_id}:{current:,}{'*' if pending else ''}")
-            shortcut_inventory = " · ".join(inventory_values) or "--"
-            if pending_observation:
-                shortcut_inventory += f" ({self._t('potion_inventory_unconfirmed')})"
-        else:
-            shortcut_inventory = self._t("potion_inventory_pending")
+        shortcut_inventory, _pending_observation = _format_shortcut_inventory(
+            economy_snapshot,
+            self._t,
+            compact=True,
+        )
         exp_diff = self._session.exp_diff
         exp_rate = self._session.exp_per_hour
         rendered = {
