@@ -116,6 +116,12 @@ class AuxiliaryReading:
 class ContextReading:
     map_name: str | None = None
     job_name: str | None = None
+    # One scan already contains several independent recognition views.  Let
+    # the UI publish a value immediately when those views corroborate it (or
+    # when it contains an unambiguous numbered/floor marker), while retaining
+    # the cross-scan stability gate for a lone generic OCR guess.
+    map_confirmed: bool = False
+    job_confirmed: bool = False
     error: str | None = None
 
 
@@ -536,6 +542,29 @@ def _context_candidates(lines: list[object], *, kind: str) -> list[str]:
     return candidates
 
 
+def _context_candidate_is_confirmed(
+    candidates: list[str],
+    selected: str | None,
+    *,
+    kind: str,
+) -> bool:
+    """Return whether one scan has enough evidence to publish immediately."""
+    if not selected:
+        return False
+    if Counter(candidates).get(selected, 0) >= 2:
+        return True
+    if kind == "map":
+        # A numbered barracks name or explicit Roman floor cannot be produced
+        # by merely dropping a glyph from a neighbouring label.  These are the
+        # two real tiny-map cases where waiting another 2s made drop lookup feel
+        # broken even though the first OCR pass was already complete.
+        return _has_strong_map_candidate([selected])
+    # The alias table is intentionally narrow and currently canonicalizes only
+    # the repeatedly observed thief label.  A recognized canonical alias is
+    # stronger than an arbitrary two-CJK-glyph string from a single view.
+    return selected in set(_JOB_ALIASES.values())
+
+
 def extract_context(ocr: Any, regions: dict[str, Any]) -> ContextReading:
     """Best-effort extraction from the fixed visible map/status labels."""
     map_lines: list[object] = []
@@ -544,11 +573,11 @@ def extract_context(ocr: Any, regions: dict[str, Any]) -> ContextReading:
         regions.get("map_wide"),
     ]
     map_images = [image for image in map_images if image is not None]
+    # First read only the enlarged focused/wide views.  In real captures these
+    # two views already recover the numbered prefix or Roman floor suffix.  The
+    # previous implementation also read both tiny originals before checking
+    # the result, doubling startup latency even when the answer was complete.
     for image in map_images:
-        # The focused crop is only one line high.  Recognition on an enlarged
-        # copy is materially more reliable than asking detection to rediscover
-        # a 75x21-pixel label.  The wider retry recovers the leading "第3" when
-        # a client has shifted the mini-map text left by a few pixels.
         try:
             from PIL import Image
             resampling = getattr(getattr(Image, "Resampling", Image), "BICUBIC", 3)
@@ -556,12 +585,17 @@ def extract_context(ocr: Any, regions: dict[str, Any]) -> ContextReading:
             map_lines.append(ocr.read_field(enlarged))
         except Exception:
             pass
-        try:
-            map_lines.append(ocr.read_field(image))
-        except Exception:
-            pass
 
     map_candidates = _context_candidates(map_lines, kind="map")
+    if not _has_strong_map_candidate(map_candidates):
+        # Tiny originals are a cheap secondary vote for generic map names.  Do
+        # not pay for them after a complete numbered/floor result is available.
+        for image in map_images:
+            try:
+                map_lines.append(ocr.read_field(image))
+            except Exception:
+                pass
+        map_candidates = _context_candidates(map_lines, kind="map")
     if not _has_strong_map_candidate(map_candidates) and map_images:
         # A single contrast retry is cheaper than running detection on every
         # context tick and helps when the game window is dimmed or partially
@@ -650,9 +684,21 @@ def extract_context(ocr: Any, regions: dict[str, Any]) -> ContextReading:
             pass
     maps = _context_candidates(map_lines, kind="map")
     jobs = _context_candidates(job_lines, kind="job")
+    selected_map = _select_context_candidate(maps, kind="map")
+    selected_job = _select_context_candidate(jobs, kind="job")
     return ContextReading(
-        map_name=_select_context_candidate(maps, kind="map"),
-        job_name=_select_context_candidate(jobs, kind="job"),
+        map_name=selected_map,
+        job_name=selected_job,
+        map_confirmed=_context_candidate_is_confirmed(
+            maps,
+            selected_map,
+            kind="map",
+        ),
+        job_confirmed=_context_candidate_is_confirmed(
+            jobs,
+            selected_job,
+            kind="job",
+        ),
     )
 
 
@@ -699,6 +745,11 @@ class BackgroundMonitor:
         self._potion_request = threading.Event()
         self._pickup_request = threading.Event()
         self._context_request = threading.Event()
+        # Startup/manual context scans briefly take priority over status and
+        # pickup OCR so map/job lookup cannot starve behind 0.15-0.3s workers.
+        # Potion quantity remains the highest-priority billing signal.
+        self._context_priority = threading.Event()
+        self._context_priority.set()
         self._potion_scan_active = threading.Event()
         self._aux_capture_lock = threading.Lock()
         self._aux_capture_cache: tuple[float, dict[str, Any]] | None = None
@@ -781,6 +832,9 @@ class BackgroundMonitor:
             # Older/custom capture adapters may not expose the optional
             # background map/job surface.  This worker is optional; do not
             # turn that normal capability gap into an endless crash-log loop.
+            context_priority = getattr(self, "_context_priority", None)
+            if context_priority is not None:
+                context_priority.clear()
             return
         while not self._stop.is_set():
             try:
@@ -808,6 +862,9 @@ class BackgroundMonitor:
         self._potion_request.set()
         self._pickup_request.set()
         self._context_request.set()
+        context_priority = getattr(self, "_context_priority", None)
+        if context_priority is not None:
+            context_priority.set()
         self._potion_scan_active.clear()
         deadline = time.monotonic() + max(0.0, float(total_timeout))
 
@@ -870,6 +927,7 @@ class BackgroundMonitor:
         self._pickup_request.set()
 
     def request_context(self) -> None:
+        self._context_priority.set()
         self._context_request.set()
 
     def reset_bar_flash_detection(self) -> None:
@@ -921,6 +979,10 @@ class BackgroundMonitor:
             if potion_priority and (
                 self._potion_request.is_set() or self._potion_scan_active.is_set()
             ):
+                self._stop.wait(0.01)
+                continue
+            context_priority = getattr(self, "_context_priority", None)
+            if context_priority is not None and context_priority.is_set():
                 self._stop.wait(0.01)
                 continue
             started = time.perf_counter()
@@ -1252,6 +1314,12 @@ class BackgroundMonitor:
             if self._potion_scan_active.is_set():
                 self._stop.wait(0.01)
                 continue
+            context_priority = getattr(self, "_context_priority", None)
+            if context_priority is not None and context_priority.is_set():
+                # Preserve ``pending``; context gets one bounded recognition
+                # turn, then this exact captured pickup frame resumes.
+                self._stop.wait(0.01)
+                continue
             if not self._ocr_lock.acquire(blocking=False):
                 # Keep this captured frame pending.  Discarding it here would
                 # recreate the exact blind spot the capture queue is meant to
@@ -1466,7 +1534,13 @@ class BackgroundMonitor:
         while len(cache) > PICKUP_VISUAL_CACHE_SIZE:
             cache.pop(next(iter(cache)))
         self._pickup_visual_text_cache = cache
-        self._pickup_scan_confident = bool(result) or not uncertain
+        # A partially readable stack is not a complete feed boundary.  If one
+        # visible money row is retained while another briefly fails OCR,
+        # publishing only ``result`` makes MesosFeedTracker forget the missed
+        # row; when it reappears on the next frame it is then counted twice.
+        # Keep the previous visible state until every candidate row is either
+        # parsed or explicitly known to be non-mesos text.
+        self._pickup_scan_confident = not uncertain
         return result
 
     def _read_dynamic_pickup_row(self, image: Any) -> str:
@@ -1519,17 +1593,35 @@ class BackgroundMonitor:
                 # signal.  Never make the potion worker wait for a full CJK
                 # detector pass just because a scheduled map refresh landed
                 # at the same instant.
-                if not self._ocr_lock.acquire(blocking=False):
+                priority_event = getattr(self, "_context_priority", None)
+                priority = bool(priority_event is not None and priority_event.is_set())
+                if self._potion_scan_active.is_set():
+                    self._stop.wait(0.02)
+                    continue
+                acquired = (
+                    self._ocr_lock.acquire(timeout=0.25)
+                    if priority
+                    else self._ocr_lock.acquire(blocking=False)
+                )
+                if not acquired:
                     self._stop.wait(0.02)
                     continue
                 try:
                     reading = extract_context(self.ocr, regions)
                 finally:
                     self._ocr_lock.release()
+                if priority_event is not None:
+                    priority_event.clear()
                 _put_latest(self.context_queue, reading)
             except RuntimeError as exc:
+                priority_event = getattr(self, "_context_priority", None)
+                if priority_event is not None:
+                    priority_event.clear()
                 _put_latest(self.context_queue, ContextReading(error=str(exc)))
             except Exception as exc:
+                priority_event = getattr(self, "_context_priority", None)
+                if priority_event is not None:
+                    priority_event.clear()
                 _put_latest(self.context_queue, ContextReading(error=f"OCR: {exc}"))
             deadline = time.monotonic() + self._context_scan_ms / 1000
             while not self._stop.is_set():

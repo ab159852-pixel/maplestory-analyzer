@@ -4,6 +4,7 @@ from __future__ import annotations
 from PIL import Image
 
 from maple_analyzer.monitor import extract_context
+from maple_analyzer.overlay import OverlayApp
 from maple_analyzer.regions import CONTEXT_BOXES
 
 
@@ -41,6 +42,8 @@ def test_context_reads_the_second_map_line_and_normalizes_ocr_glyphs():
 
     assert reading.map_name == "第3軍營"
     assert reading.job_name == "俠盜"
+    assert reading.map_confirmed is True
+    assert reading.job_confirmed is True
 
 
 class _WideRecoveryOcr:
@@ -70,6 +73,7 @@ def test_context_prefers_complete_map_from_wider_retry():
     )
 
     assert reading.map_name == "第3軍營"
+    assert reading.map_confirmed is True
 
 
 class _RomanFloorOcr:
@@ -96,6 +100,48 @@ def test_context_prefers_map_candidate_with_roman_floor_suffix():
     )
 
     assert reading.map_name == "寺院通道II"
+    assert reading.map_confirmed is True
+
+
+def test_complete_floor_map_stops_after_the_two_enlarged_views():
+    class CountingOcr(_RomanFloorOcr):
+        def __init__(self):
+            self.field_calls = 0
+
+        def read_field(self, image):
+            self.field_calls += 1
+            return super().read_field(image)
+
+    ocr = CountingOcr()
+    reading = extract_context(
+        ocr,
+        {
+            "map": Image.new("RGB", (75, 20)),
+            "map_wide": Image.new("RGB", (110, 27)),
+        },
+    )
+
+    assert reading.map_name == "寺院通道II"
+    assert ocr.field_calls == 2
+
+
+def test_internally_confirmed_context_is_published_on_first_scan():
+    app = OverlayApp.__new__(OverlayApp)
+
+    app._accept_context_candidate("map", "寺院通道II", confirmed=True)
+
+    assert app._detected_map_name == "寺院通道II"
+    assert app._map_candidate_hits == 1
+
+
+def test_unconfirmed_generic_context_still_requires_two_scans():
+    app = OverlayApp.__new__(OverlayApp)
+
+    app._accept_context_candidate("map", "神秘森林", confirmed=False)
+    assert getattr(app, "_detected_map_name", None) is None
+    app._accept_context_candidate("map", "神秘森林", confirmed=False)
+
+    assert app._detected_map_name == "神秘森林"
 
 
 class _WeakMapOnlyOcr:

@@ -295,6 +295,54 @@ def test_same_length_numeric_conflict_cannot_fall_back_to_wrong_colour_vote():
     ) == {}
 
 
+def _real_game_font_conflict_strip(rows, *, left):
+    """Rebuild a thresholded glyph crop taken from the supplied 2K captures."""
+    from PIL import Image
+
+    image = Image.new("L", (66, 34), 0)
+    pixels = image.load()
+    for y, row in enumerate(rows):
+        for x in range(16):
+            if row & (1 << (15 - x)):
+                pixels[left + x, y] = 255
+    return image.convert("RGB")
+
+
+def test_real_game_font_shape_resolves_2320_from_2920_at_multiple_scales():
+    from PIL import Image
+
+    # Second digit from the real ``2320`` shortcut cell. This is the glyph the
+    # colour numeric model repeatedly changed to 9 in the live HUD.
+    rows = (
+        0, 0, 0, 4064, 4064, 12312, 12312, 24, 24, 24, 25, 995,
+        61465, 61465, 3992, 24, 12312, 12312, 2016, 2016, 0, 0,
+    )
+    strip = _real_game_font_conflict_strip(rows, left=18)
+    for image in (
+        strip,
+        strip.resize((33, 17), Image.Resampling.BILINEAR),
+        strip.resize((83, 43), Image.Resampling.BILINEAR),
+    ):
+        assert ocr_module._resolve_shortcut_game_font_3_9_conflict(
+            image,
+            [(2320, "white170"), (2920, "rgb")],
+            previous=None,
+        ) == 2320
+
+
+def test_real_game_font_shape_keeps_983_when_threshold_erases_9_loop():
+    rows = (
+        4095, 63, 63, 8143, 8143, 24624, 24624, 1840, 1840, 48, 48,
+        1999, 48, 48, 48, 48, 24624, 24624, 4032, 4032, 0, 0,
+    )
+    strip = _real_game_font_conflict_strip(rows, left=3)
+    assert ocr_module._resolve_shortcut_game_font_3_9_conflict(
+        strip,
+        [(383, "white170"), (983, "r")],
+        previous=None,
+    ) == 983
+
+
 def test_shortcut_numeric_views_reject_1359_to_1959_substitution_but_keep_correction():
     # 3 -> 9 in the hundreds place is the reported same-length upward OCR
     # substitution.  A correction such as 40 -> 80 must remain possible so a

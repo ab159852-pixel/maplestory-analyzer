@@ -3115,9 +3115,17 @@ class OverlayApp:
             self._context_refresh_pending = False
             self._context_error = reading.error
             if reading.map_name:
-                self._accept_context_candidate("map", reading.map_name)
+                self._accept_context_candidate(
+                    "map",
+                    reading.map_name,
+                    confirmed=getattr(reading, "map_confirmed", False),
+                )
             if reading.job_name:
-                self._accept_context_candidate("job", reading.job_name)
+                self._accept_context_candidate(
+                    "job",
+                    reading.job_name,
+                    confirmed=getattr(reading, "job_confirmed", False),
+                )
             if self._run_state == "running":
                 if self._session_map_name is None and self._current_map_name():
                     self._session_map_name = self._current_map_name()
@@ -3125,7 +3133,13 @@ class OverlayApp:
                     self._session_job_name = self._current_job_name()
         self._render_context()
 
-    def _accept_context_candidate(self, kind: str, value: str) -> None:
+    def _accept_context_candidate(
+        self,
+        kind: str,
+        value: str,
+        *,
+        confirmed: bool = False,
+    ) -> None:
         """Promote a context OCR value only after a consistent confirmation."""
         value = value.strip()
         if not value:
@@ -3147,7 +3161,7 @@ class OverlayApp:
             hits = 1
         setattr(self, candidate_attr, candidate)
         setattr(self, hits_attr, hits)
-        if hits >= 2 or getattr(self, stable_attr, None) == value:
+        if confirmed or hits >= 2 or getattr(self, stable_attr, None) == value:
             setattr(self, stable_attr, value)
 
     def _do_tick(self) -> int:

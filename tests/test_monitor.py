@@ -243,3 +243,30 @@ def test_uncertain_white_pickup_row_does_not_publish_a_false_empty_boundary():
         now=1.0,
     ) == []
     assert monitor._pickup_scan_confident is False
+
+
+def test_partial_money_stack_cannot_advance_the_duplicate_tracking_boundary():
+    class _PickupOcr:
+        def __init__(self):
+            self.values = iter(("獲取楓幣。(+100)", ""))
+
+        def read_text_field(self, _image):
+            return next(self.values)
+
+        def read_lines(self, _image):
+            return []
+
+    first = Image.new("RGB", (100, 18), "black")
+    second = Image.new("RGB", (100, 18), "black")
+    ImageDraw.Draw(first).rectangle((20, 3, 70, 13), fill="white")
+    ImageDraw.Draw(second).rectangle((20, 3, 82, 13), fill="white")
+    monitor = BackgroundMonitor(None, _PickupOcr())
+
+    assert monitor._read_dynamic_pickup_rows([
+        (first, 90.0),
+        (second, 104.0),
+    ]) == [("獲取楓幣。(+100)", 90.0)]
+    # The readable +100 row must not make the partial result look complete.
+    # Otherwise the missed second row is forgotten and counted again as new
+    # when it becomes readable on the next 0.1-0.2s frame.
+    assert monitor._pickup_scan_confident is False

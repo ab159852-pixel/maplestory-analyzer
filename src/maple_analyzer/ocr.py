@@ -21,6 +21,7 @@ this change.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from numbers import Real
 import re
 import time
@@ -873,6 +874,14 @@ class StatPanelOcr:
                 hard_conflict_slots.add(slot_id)
             strip = quantity_strips.get(slot_id)
             if strip is None:
+                continue
+            game_font_value = _resolve_shortcut_game_font_3_9_conflict(
+                strip,
+                values,
+                previous=(previous_counts or {}).get(slot_id),
+            )
+            if game_font_value is not None:
+                result[slot_id] = game_font_value
                 continue
             try:
                 general_text, general_records = self._read_once(strip)
@@ -1858,6 +1867,228 @@ def _shortcut_numeric_views_have_same_length_conflict(
         for threshold in threshold_values
         for colour in colour_values
     )
+
+
+# Tiny binary templates cut from the real MapleStory shortcut font at the
+# normalized 2K-cell scale (34px quantity strip).  The bundled PP-OCR model's
+# only repeatable same-width failure is 3 <-> 9: colour views often close the
+# open left side of 3, while a hard white threshold can erase the upper loop of
+# 9.  Keeping both real 9 samples and several 3 samples makes the decision about
+# the game glyph itself instead of asking another generic OCR model to repeat
+# the same ambiguity.  Each integer is one 16-bit row of a 16x22 target crop.
+_SHORTCUT_GAME_FONT_3_9_ROWS: dict[str, tuple[tuple[int, ...], ...]] = {
+    "3": (
+        (0, 0, 0, 4064, 4064, 12312, 12312, 24, 24, 24, 24, 994,
+         61464, 61464, 3992, 24, 12312, 12312, 2016, 2016, 0, 0),
+        (0, 0, 0, 4064, 4064, 12312, 12312, 24, 24, 24, 25, 995,
+         61465, 61465, 3992, 24, 12312, 12312, 2016, 2016, 0, 0),
+        (0, 0, 0, 8128, 8128, 24624, 24624, 1072, 48, 48, 48, 1984,
+         48, 48, 48, 48, 8208, 8208, 4032, 4032, 0, 0),
+        (0, 0, 0, 4064, 4064, 12312, 12312, 24, 24, 32792, 57368,
+         58336, 61464, 61464, 1560, 1560, 4104, 4104, 2016, 2016, 0, 0),
+    ),
+    "9": (
+        (31, 31, 31, 4071, 4071, 12312, 12312, 920, 920, 24, 24, 999,
+         24, 24, 152, 152, 4104, 4104, 2016, 2016, 0, 0),
+        (4095, 63, 63, 8143, 8143, 24624, 24624, 1840, 1840, 48, 48,
+         1999, 48, 48, 48, 48, 24624, 24624, 4032, 4032, 0, 0),
+    ),
+}
+_SHORTCUT_GLYPH_NORMALIZED_HEIGHT = 34
+_SHORTCUT_GLYPH_TARGET_HEIGHT = 22
+_SHORTCUT_GLYPH_TARGET_WIDTH = 16
+
+
+@lru_cache(maxsize=1)
+def _shortcut_game_font_3_9_templates() -> dict[str, tuple[Any, ...]]:
+    """Decode the compact row constants once, outside the live hot path."""
+    import numpy as np
+
+    decoded: dict[str, tuple[Any, ...]] = {}
+    for digit, templates in _SHORTCUT_GAME_FONT_3_9_ROWS.items():
+        decoded[digit] = tuple(
+            np.asarray(
+                [
+                    [bool(row & (1 << (15 - column))) for column in range(16)]
+                    for row in rows
+                ],
+                dtype=bool,
+            )
+            for rows in templates
+        )
+    return decoded
+
+
+def _shortcut_game_font_target(
+    image: Image.Image,
+    candidate_text: str,
+    digit_index: int,
+) -> Any | None:
+    """Normalize one proportional game-font digit to the template envelope.
+
+    Shortcut quantities are left aligned. Ordinary digits advance about 15px
+    at a 34px strip height, while the narrow digit 1 advances about 9px.  The
+    layout is normalized by the measured strip height, so 1080p, 1440p and DPI
+    scaled clients use the same geometry without absolute screen coordinates.
+    """
+    try:
+        import numpy as np
+
+        gray = ImageOps.autocontrast(ImageOps.grayscale(image))
+        mask = gray.point(lambda pixel: 255 if pixel >= 170 else 0)
+        width, height = mask.size
+        if width <= 1 or height <= 1:
+            return None
+        normalized_height = _SHORTCUT_GLYPH_NORMALIZED_HEIGHT
+        if height != normalized_height:
+            normalized_width = max(2, round(width * normalized_height / height))
+            mask = mask.resize(
+                (normalized_width, normalized_height),
+                getattr(Image, "Resampling", Image).NEAREST,
+            )
+        pixels = np.asarray(mask, dtype=np.uint8) > 0
+        anchor = 4
+        for digit in candidate_text[:digit_index]:
+            anchor += 9 if digit == "1" else 15
+        left = anchor - 1
+        target = np.zeros(
+            (_SHORTCUT_GLYPH_TARGET_HEIGHT, _SHORTCUT_GLYPH_TARGET_WIDTH),
+            dtype=bool,
+        )
+        source_left = max(0, left)
+        source_right = min(pixels.shape[1], left + _SHORTCUT_GLYPH_TARGET_WIDTH)
+        if source_right <= source_left:
+            return None
+        destination_left = max(0, -left)
+        source = pixels[:_SHORTCUT_GLYPH_TARGET_HEIGHT, source_left:source_right]
+        target[:source.shape[0], destination_left:destination_left + source.shape[1]] = source
+        if int(target.sum()) < 16:
+            return None
+        return target
+    except Exception:
+        return None
+
+
+def _shortcut_shifted_dice(left: Any, right: Any) -> float:
+    """Return the best binary-glyph overlap after a small DPI alignment shift."""
+    try:
+        import numpy as np
+
+        best = 0.0
+        for shift_y in range(-2, 3):
+            for shift_x in range(-2, 3):
+                shifted = np.zeros_like(right)
+                source_y0 = max(0, -shift_y)
+                source_y1 = min(right.shape[0], right.shape[0] - shift_y)
+                source_x0 = max(0, -shift_x)
+                source_x1 = min(right.shape[1], right.shape[1] - shift_x)
+                if source_y1 <= source_y0 or source_x1 <= source_x0:
+                    continue
+                shifted[
+                    source_y0 + shift_y:source_y1 + shift_y,
+                    source_x0 + shift_x:source_x1 + shift_x,
+                ] = right[source_y0:source_y1, source_x0:source_x1]
+                denominator = int(left.sum()) + int(shifted.sum())
+                if denominator <= 0:
+                    continue
+                overlap = int(np.logical_and(left, shifted).sum())
+                best = max(best, 2.0 * overlap / denominator)
+        return best
+    except Exception:
+        return 0.0
+
+
+def _classify_shortcut_game_font_3_or_9(
+    image: Image.Image,
+    candidate_text: str,
+    digit_index: int,
+) -> str | None:
+    target = _shortcut_game_font_target(image, candidate_text, digit_index)
+    if target is None:
+        return None
+    templates = _shortcut_game_font_3_9_templates()
+    scores = {
+        digit: max(
+            (_shortcut_shifted_dice(target, template) for template in digit_templates),
+            default=0.0,
+        )
+        for digit, digit_templates in templates.items()
+    }
+    winner = max(scores, key=scores.get)
+    loser = "9" if winner == "3" else "3"
+    # At half the 2K scale the real samples still score 0.36-0.50 with a
+    # 0.12+ margin.  Keep a little room for animation/anti-aliasing, but reject
+    # a weak or near-tied redraw instead of inventing an inventory change.
+    if scores[winner] < 0.30 or scores[winner] - scores[loser] < 0.08:
+        return None
+    return winner
+
+
+def _resolve_shortcut_game_font_3_9_conflict(
+    image: Image.Image,
+    candidates: Iterable[tuple[int, str]],
+    *,
+    previous: int | None,
+) -> int | None:
+    """Resolve only a pure 3/9 disagreement using the actual game glyph."""
+    values = [
+        (value, str(view_name))
+        for value, view_name in candidates
+        if isinstance(value, int) and 0 <= value <= MAX_SHORTCUT_QUANTITY
+    ]
+    threshold_values = {
+        value
+        for value, view_name in values
+        if _numeric_view_base_name(view_name).startswith("white")
+    }
+    colour_values = {
+        value
+        for value, view_name in values
+        if not view_name.startswith("soft-")
+        and not _numeric_view_base_name(view_name).startswith("white")
+    }
+    resolved_values: set[int] = set()
+    for threshold_value in threshold_values:
+        threshold_text = str(threshold_value)
+        for colour_value in colour_values:
+            colour_text = str(colour_value)
+            if len(threshold_text) != len(colour_text):
+                continue
+            differing = [
+                index
+                for index, (left, right) in enumerate(zip(threshold_text, colour_text))
+                if left != right
+            ]
+            if not differing or any(
+                {threshold_text[index], colour_text[index]} != {"3", "9"}
+                for index in differing
+            ):
+                continue
+            decided = list(threshold_text)
+            for index in differing:
+                digit = _classify_shortcut_game_font_3_or_9(
+                    image,
+                    threshold_text,
+                    index,
+                )
+                if digit is None:
+                    decided = []
+                    break
+                decided[index] = digit
+            if not decided:
+                continue
+            value = int("".join(decided))
+            if value not in {threshold_value, colour_value}:
+                continue
+            if previous is not None and not _shortcut_numeric_transition_is_usable(
+                previous,
+                value,
+            ):
+                continue
+            resolved_values.add(value)
+    if len(resolved_values) != 1:
+        return None
+    return next(iter(resolved_values))
 
 
 def _select_shortcut_general_confirmation(
