@@ -49,6 +49,32 @@ def test_mesos_feed_counts_new_lines_once_while_they_remain_visible():
     assert tracker.update([MesosObservation(144, 100)]) == 144
 
 
+def test_mesos_feed_preserves_every_fast_scroll_step_including_duplicate_amounts():
+    tracker = MesosFeedTracker()
+
+    # Existing visible row establishes the session boundary.
+    assert tracker.update([MesosObservation(100, 100)]) == 0
+    assert tracker.update([
+        MesosObservation(100, 86),
+        MesosObservation(200, 100),
+    ]) == 200
+    assert tracker.update([
+        MesosObservation(100, 72),
+        MesosObservation(200, 86),
+        MesosObservation(300, 100),
+    ]) == 300
+    # A second +200 is a separate pickup even while the first +200 remains in
+    # the stack.  Amount multiplicity, not a set of values, must be tracked.
+    assert tracker.update([
+        MesosObservation(100, 58),
+        MesosObservation(200, 72),
+        MesosObservation(300, 86),
+        MesosObservation(200, 100),
+    ]) == 200
+    assert tracker.total == 700
+    assert tracker.events == 3
+
+
 def test_shortcut_drop_is_the_only_source_of_cost_and_classifies_recovery():
     tracker = EconomyTracker(
         [PotionSlotConfig(slot="F1", name="Red Potion", kind="hp", cost=25, recovery=50)]

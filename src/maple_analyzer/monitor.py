@@ -18,7 +18,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from PIL import Image
+from PIL import Image, ImageChops, ImageOps
 
 from .economy import mesos_text_needs_full_detection, parse_mesos_amount, parse_slot_count
 from .bar_flash import BarFlashDetector
@@ -38,6 +38,15 @@ from .settings import PotionSlotConfig
 AUX_SCAN_MIN_MS = 150
 PICKUP_SCAN_MIN_MS = 100
 PICKUP_DETECTION_INTERVAL_S = 0.35
+# A changed notification frame is tiny compared with a full game capture.  A
+# longer queue preserves the exact 100-200ms sequence while status/potion OCR
+# briefly owns the shared model; unchanged frames are coalesced below so this
+# does not grow continuously while the feed is idle.
+PICKUP_FRAME_QUEUE_SIZE = 32
+PICKUP_RESULT_QUEUE_SIZE = 64
+PICKUP_UNCHANGED_RETRY_SECONDS = 0.30
+PICKUP_VISUAL_CACHE_SIZE = 96
+PICKUP_REFERENCE_FEED_HEIGHT = 195
 # The potion and pickup workers share one screen grab.  A very small cache
 # prevents both workers from asking WGC/mss for the same frame when their
 # deadlines overlap, without making the quantity older than one redraw.
@@ -238,6 +247,146 @@ def _image_signature(image: Any) -> tuple | None:
         return reduced.size, hash(reduced.tobytes())
     except Exception:
         return None
+
+
+def _pickup_capture_signature(image: Any) -> tuple | None:
+    """Sign only the right-side toast surface, excluding animated map pixels."""
+    try:
+        width, height = image.size
+        left = max(0, min(width - 1, round(width * 0.12)))
+        return _image_signature(image.crop((left, 0, width, height)))
+    except Exception:
+        return _image_signature(image)
+
+
+def _pickup_row_fingerprint(image: Any) -> tuple | None:
+    """Return a position-independent fingerprint for one rendered toast row.
+
+    The same message moves upward whenever a newer pickup arrives.  Hashing by
+    fixed row number therefore re-ran OCR for every visible line on every
+    scroll.  A thresholded glyph crop stays identical after that movement and
+    lets the worker OCR only the genuinely new row.
+    """
+    try:
+        gray = ImageOps.grayscale(image)
+        mask = gray.point(lambda value: 255 if value >= 100 else 0)
+        bounds = mask.getbbox()
+        if bounds is None:
+            return None
+        glyphs = mask.crop(bounds)
+        return glyphs.size, glyphs.tobytes()
+    except Exception:
+        return _image_signature(image)
+
+
+def _segment_pickup_money_rows(image: Any) -> tuple[list[tuple[Any, float]], bool]:
+    """Locate white pickup rows without invoking the OCR detector.
+
+    MapleStory renders bonus/EXP notifications in yellow and the mesos pickup
+    toast in white on the right-side black surface.  Horizontal projection is
+    both faster and more accurate than twelve fixed 16px crops: the live font
+    is spaced about 14px apart and scales with the game viewport.  ``bool`` is
+    false only when the pixels do not resemble a line stack, allowing legacy
+    adapters and synthetic tests to retain the old fixed-row fallback.
+    """
+    try:
+        rgb = image.convert("RGB")
+        width, height = rgb.size
+        if width < 16 or height < 16:
+            return [], False
+    except Exception:
+        return [], False
+
+    scale = max(0.5, height / PICKUP_REFERENCE_FEED_HEIGHT)
+    left = max(0, min(width - 1, round(width * 0.12)))
+    min_bright = max(4, round(width * 0.014))
+    # Let Pillow perform colour projection in native code.  The old Python
+    # pixel loop was already faster than OCR at 1366x768, but at 2K it could
+    # consume 50-70ms by itself and erode the 100ms capture budget.
+    _hue, saturation, value = rgb.convert("HSV").split()
+    bright_mask = value.point(lambda pixel: 255 if pixel >= 120 else 0)
+    neutral_mask = saturation.point(lambda pixel: 255 if pixel <= 100 else 0)
+    white_mask = ImageChops.multiply(bright_mask, neutral_mask)
+    surface_width = width - left
+    resampling = getattr(Image, "Resampling", Image)
+
+    def projected_counts(mask: Any) -> list[int]:
+        projection = mask.crop((left, 0, width, height)).resize(
+            (1, height), resampling.BOX
+        )
+        get_values = getattr(projection, "get_flattened_data", projection.getdata)
+        return [round(value * surface_width / 255) for value in get_values()]
+
+    bright_counts = projected_counts(bright_mask)
+    white_counts = projected_counts(white_mask)
+    row_stats = list(zip(bright_counts, white_counts))
+    active_rows = [
+        y for y, bright in enumerate(bright_counts)
+        if bright >= min_bright
+    ]
+
+    # A genuinely empty feed is a valid, confident observation.
+    if not active_rows:
+        return [], True
+
+    max_gap = max(1, round(1.5 * scale))
+    bands: list[list[int]] = []
+    for y in active_rows:
+        if not bands or y - bands[-1][-1] > max_gap + 1:
+            bands.append([y])
+        else:
+            bands[-1].append(y)
+
+    min_height = max(3, round(5 * scale))
+    max_height = max(min_height, round(18 * scale))
+    pad = max(2, round(2 * scale))
+    valid_band_seen = False
+    candidates: list[tuple[Any, float]] = []
+    for band in bands:
+        top = band[0]
+        bottom = band[-1]
+        band_height = bottom - top + 1
+        if not min_height <= band_height <= max_height:
+            continue
+        valid_band_seen = True
+        bright = sum(row_stats[y][0] for y in band)
+        white = sum(row_stats[y][1] for y in band)
+        # White money text is effectively 100% low-saturation in observed
+        # game frames; 55% leaves room for antialiasing and capture scaling.
+        if white < max(4, round(min_bright * scale)) or white / max(1, bright) < 0.55:
+            continue
+        crop_top = max(0, top - pad)
+        crop_bottom = min(height, bottom + pad + 1)
+        candidates.append((rgb.crop((0, crop_top, width, crop_bottom)), (top + bottom) / 2))
+
+    if not valid_band_seen:
+        return [], False
+    return candidates, True
+
+
+def _explicit_non_mesos_text(text: str) -> bool:
+    compact = re.sub(r"\s+", "", str(text)).lower()
+    return any(token in compact for token in (
+        "經驗", "经验", "經值", "验值", "exp", "bonus", "增益", "通行證", "通行证",
+    ))
+
+
+def _canonical_mesos_text(amount: int) -> str:
+    return f"獲取楓幣。(+{amount})"
+
+
+def _normalize_pickup_row_for_ocr(image: Any) -> Any:
+    """Normalize scaled game fonts to the recognizer's fast 32px height."""
+    try:
+        width, height = image.size
+        if height <= 0 or 28 <= height <= 36:
+            return image
+        target_height = 32
+        target_width = max(1, round(width * target_height / height))
+        resampling = getattr(Image, "Resampling", Image)
+        return image.resize((target_width, target_height), resampling.LANCZOS)
+    except Exception:
+        return image
 
 
 def _pickup_lines_need_detection(lines: list[tuple[str, float]]) -> bool:
@@ -523,7 +672,13 @@ class BackgroundMonitor:
         self.source = source
         self.ocr = ocr
         self.status_queue: queue.Queue[StatusReading] = queue.Queue(maxsize=24)
-        self.auxiliary_queue: queue.Queue[AuxiliaryReading] = queue.Queue(maxsize=4)
+        # Pickup snapshots are event-bearing, unlike status frames where only
+        # the newest value matters.  Keep enough tiny OCR results for the
+        # 300ms Tk drain to consume a burst without evicting intermediate
+        # messages that represent real income.
+        self.auxiliary_queue: queue.Queue[AuxiliaryReading] = queue.Queue(
+            maxsize=PICKUP_RESULT_QUEUE_SIZE
+        )
         # Potion readings must not be evicted by the much noisier pickup-feed
         # stream.  The UI drains both queues in timestamp order.
         self.potion_queue: queue.Queue[AuxiliaryReading] = queue.Queue(maxsize=8)
@@ -533,7 +688,7 @@ class BackgroundMonitor:
         # short sequence of already-captured feed frames prevents those OCR
         # milliseconds from becoming blind time.
         self._pickup_frame_queue: queue.Queue[tuple[float, dict[str, Any]]] = (
-            queue.Queue(maxsize=8)
+            queue.Queue(maxsize=PICKUP_FRAME_QUEUE_SIZE)
         )
         self._stop = threading.Event()
         self._status_enabled = threading.Event()
@@ -568,6 +723,10 @@ class BackgroundMonitor:
         self._pickup_detected_lines: list[tuple[str, float]] = []
         self._pickup_line_signatures: dict[str, tuple | None] = {}
         self._pickup_line_values: dict[str, str] = {}
+        self._pickup_visual_text_cache: dict[tuple, str] = {}
+        self._pickup_capture_frame_signature: tuple | None = None
+        self._pickup_capture_last_queued_at = 0.0
+        self._pickup_scan_confident = True
         self._bar_flash_detector = BarFlashDetector()
 
     def start(self) -> None:
@@ -973,6 +1132,8 @@ class BackgroundMonitor:
         return counts
 
     def _clear_pickup_frames(self) -> None:
+        self._pickup_capture_frame_signature = None
+        self._pickup_capture_last_queued_at = 0.0
         frame_queue = getattr(self, "_pickup_frame_queue", None)
         if frame_queue is None:
             return
@@ -1047,7 +1208,23 @@ class BackgroundMonitor:
                     ),
                 )
             else:
-                self._queue_pickup_frame(now, regions)
+                pickup = regions.get("pickup")
+                signature = _pickup_capture_signature(pickup)
+                last_signature = getattr(self, "_pickup_capture_frame_signature", None)
+                last_queued_at = getattr(self, "_pickup_capture_last_queued_at", 0.0)
+                should_queue = (
+                    requested
+                    or signature != last_signature
+                    or now - last_queued_at >= PICKUP_UNCHANGED_RETRY_SECONDS
+                )
+                self._pickup_capture_frame_signature = signature
+                if should_queue:
+                    self._pickup_capture_last_queued_at = now
+                    # The OCR worker now derives scaled rows directly from the
+                    # feed image.  Do not retain shortcut cells and twelve
+                    # duplicate row crops in a burst queue.
+                    pickup_regions = {"pickup": pickup} if pickup is not None else regions
+                    self._queue_pickup_frame(now, pickup_regions)
 
     def _pickup_loop(self) -> None:
         """OCR the captured pickup sequence without controlling its cadence."""
@@ -1083,15 +1260,19 @@ class BackgroundMonitor:
                 continue
             try:
                 try:
-                    lines = self._read_pickup_lines(regions, captured_at)
+                    lines = self._read_pickup_lines(
+                        regions,
+                        captured_at,
+                        allow_full_detection=self._pickup_frame_queue.empty(),
+                    )
                 finally:
                     self._ocr_lock.release()
                 _put_latest(
                     self.auxiliary_queue,
                     AuxiliaryReading(
                         lines=tuple(lines),
-                        timestamp=time.monotonic(),
-                        pickup_scanned=True,
+                        timestamp=captured_at,
+                        pickup_scanned=getattr(self, "_pickup_scan_confident", True),
                     ),
                 )
             except RuntimeError as exc:
@@ -1107,10 +1288,21 @@ class BackgroundMonitor:
             finally:
                 pending = None
 
-    def _read_pickup_lines(self, regions: dict[str, Any], now: float) -> list[tuple[str, float]]:
+    def _read_pickup_lines(
+        self,
+        regions: dict[str, Any],
+        now: float,
+        *,
+        allow_full_detection: bool = True,
+    ) -> list[tuple[str, float]]:
+        self._pickup_scan_confident = True
         feed_signature = _image_signature(regions.get("pickup"))
         feed_changed = feed_signature != self._pickup_feed_signature
         self._pickup_feed_signature = feed_signature
+
+        dynamic_rows, segmentation_valid = _segment_pickup_money_rows(regions.get("pickup"))
+        if segmentation_valid:
+            return self._read_dynamic_pickup_rows(dynamic_rows)
 
         # A full notification detector is the expensive fallback. Reuse its
         # result while the same toast stack remains on screen instead of
@@ -1187,6 +1379,7 @@ class BackgroundMonitor:
             needs_detection
             and feed_signature is not None
             and not detection_already_attempted
+            and allow_full_detection
             and now >= self._next_pickup_detection
         ):
             self._next_pickup_detection = now + PICKUP_DETECTION_INTERVAL_S
@@ -1217,6 +1410,7 @@ class BackgroundMonitor:
             and self._image_has_content(regions["pickup"])
             and feed_signature is not None
             and not detection_already_attempted
+            and allow_full_detection
             and now >= self._next_pickup_detection
         ):
             detected: list[Any] = []
@@ -1236,6 +1430,83 @@ class BackgroundMonitor:
             # detector result from the previous toast stack.
             self._pickup_detected_lines = []
         return lines
+
+    def _read_dynamic_pickup_rows(
+        self,
+        rows: list[tuple[Any, float]],
+    ) -> list[tuple[str, float]]:
+        """Read only new white rows and reuse text after the stack scrolls."""
+        cache = getattr(self, "_pickup_visual_text_cache", {})
+        result: list[tuple[str, float]] = []
+        uncertain = False
+        for image, y in rows:
+            fingerprint = _pickup_row_fingerprint(image)
+            text = cache.get(fingerprint, "") if fingerprint is not None else ""
+            if not text.strip():
+                text = self._read_dynamic_pickup_row(image)
+                if (
+                    fingerprint is not None
+                    and text.strip()
+                    and (
+                        not mesos_text_needs_full_detection(text)
+                        or _explicit_non_mesos_text(text)
+                    )
+                ):
+                    cache[fingerprint] = text
+
+            amount = parse_mesos_amount(text)
+            if amount is not None and not mesos_text_needs_full_detection(text):
+                result.append((text, y))
+            elif not _explicit_non_mesos_text(text):
+                # Do not turn an OCR miss into a false empty-feed boundary.
+                # The unchanged-frame retry will read this still-visible row
+                # again in 300ms without making the event tracker forget it.
+                uncertain = True
+
+        while len(cache) > PICKUP_VISUAL_CACHE_SIZE:
+            cache.pop(next(iter(cache)))
+        self._pickup_visual_text_cache = cache
+        self._pickup_scan_confident = bool(result) or not uncertain
+        return result
+
+    def _read_dynamic_pickup_row(self, image: Any) -> str:
+        """Confirm one candidate row with two cheap, row-sized OCR passes."""
+        normalized = _normalize_pickup_row_for_ocr(image)
+        read_text_field = getattr(self.ocr, "read_text_field", None)
+        first = (
+            read_text_field(normalized)
+            if callable(read_text_field)
+            else self.ocr.read_field(normalized)
+        )
+        first_amount = parse_mesos_amount(first)
+        if first_amount is not None and not mesos_text_needs_full_detection(first):
+            return first
+        if _explicit_non_mesos_text(first):
+            return first
+
+        # Detector OCR over the whole 286x195 feed costs hundreds of
+        # milliseconds.  Over one already-located 15-30px row it is normally
+        # ~20-30ms and preserves the complete right-aligned amount.
+        try:
+            detected = self.ocr.read_lines(normalized)
+        except Exception:
+            detected = []
+        detected_texts = [_line_text(line) for line in detected if _line_text(line)]
+        for candidate in detected_texts:
+            amount = parse_mesos_amount(candidate)
+            if amount is not None and not mesos_text_needs_full_detection(candidate):
+                return candidate
+        for candidate in detected_texts:
+            amount = parse_mesos_amount(candidate)
+            if amount is not None and first_amount == amount:
+                # Recognition-only and detector paths independently agree on
+                # the number.  Canonicalize the marker so this confirmed row
+                # never falls into the expensive whole-feed fallback.
+                return _canonical_mesos_text(amount)
+        for candidate in detected_texts:
+            if _explicit_non_mesos_text(candidate):
+                return candidate
+        return first
 
     def _context_loop(self) -> None:
         grab_context = getattr(self.source, "grab_context", None)
