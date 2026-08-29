@@ -1276,6 +1276,27 @@ class GameWindowCapture:
             regions[name] = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
         return regions
 
+    def close(self) -> None:
+        """Release native capture handles during app/update shutdown.
+
+        Windows Graphics Capture owns a WinRT frame-pool/session and ``mss``
+        owns a desktop device context.  Leaving either alive until interpreter
+        teardown can keep a frozen executable visible in Task Manager after
+        Tk has closed, which in turn prevents the updater from replacing that
+        executable.
+        """
+        graphics_capture = getattr(self, "_graphics_capture", None)
+        self._graphics_capture = None
+        self._graphics_capture_size = None
+        if graphics_capture is not None:
+            with contextlib.suppress(Exception):
+                graphics_capture.close()
+        mss_capture = getattr(self, "_mss", None)
+        self._mss = None
+        if mss_capture is not None:
+            with contextlib.suppress(Exception):
+                mss_capture.close()
+
 
 def get_capture(sample_path: str | Path | None = None) -> WindowCapture:
     if sample_path is not None:

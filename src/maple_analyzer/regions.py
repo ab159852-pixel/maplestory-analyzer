@@ -21,6 +21,16 @@ from dataclasses import dataclass
 # are client-only and must use the window->client helpers below.
 REFERENCE_WINDOW_SIZE = (1351, 800)  # size of samples/maple_story_ui.jpg
 REFERENCE_CLIENT_SIZE = REFERENCE_WINDOW_SIZE  # legacy public alias
+# The reference screenshot contains a 36px native title bar.  Live capture
+# backends return only the game client, so top-left-pinned UI (the mini-map)
+# must first be converted into this client coordinate system and only then be
+# scaled to the current frame.  Scaling the complete window and subtracting
+# the *current* title bar afterwards drifts the crop downward at 2K.
+REFERENCE_CLIENT_TOP = 36
+REFERENCE_GAME_CLIENT_SIZE = (
+    REFERENCE_WINDOW_SIZE[0],
+    REFERENCE_WINDOW_SIZE[1] - REFERENCE_CLIENT_TOP,
+)
 
 # A shortcut stack in MapleStory is displayed as a four-digit quantity at
 # most.  Keep this domain rule next to the shortcut geometry so every OCR and
@@ -326,10 +336,34 @@ def scale_window_top_left_box_to_client(
     window_size: tuple[int, int],
     client_offset: tuple[int, int] = (0, 0),
 ) -> Box:
-    """Map a client-origin-pinned full-window box to client pixels."""
-    return _map_window_box_to_client(
-        box, client_size, window_size, client_offset, top_left=True
+    """Map a client-origin-pinned reference-window box to live client pixels.
+
+    ``box`` was measured in a screenshot that includes the reference title
+    bar, while WGC/PrintWindow already return client-only pixels.  Convert the
+    reference Y coordinates first, then scale against the actual client.  The
+    real ``window_size``/``client_offset`` remain part of the public signature
+    for consistency with the other live mappers, but must not be applied a
+    second time to a client-only frame.
+    """
+    del window_size, client_offset
+    left, top, right, bottom = box
+    client_box = (
+        left,
+        max(0, top - REFERENCE_CLIENT_TOP),
+        right,
+        max(1, bottom - REFERENCE_CLIENT_TOP),
     )
+    ref_width, ref_height = REFERENCE_GAME_CLIENT_SIZE
+    client_width, client_height = client_size
+    if min(ref_width, ref_height, client_width, client_height) <= 0:
+        raise ValueError(f"invalid client size: {client_size!r}")
+    scale = min(client_width / ref_width, client_height / ref_height)
+    return RegionTransform(
+        client_size=client_size,
+        scale=scale,
+        offset_x=0,
+        offset_y=0,
+    ).map_box(client_box)
 
 
 def scale_window_shortcut_box_to_client(

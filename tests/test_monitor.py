@@ -1,6 +1,9 @@
 """Regression tests for the settings-driven background OCR selection."""
 from __future__ import annotations
 
+import threading
+import queue
+
 from PIL import Image
 
 from maple_analyzer.monitor import BackgroundMonitor
@@ -15,6 +18,49 @@ def _regions():
             for slot in range(1, 9)
         },
     }
+
+
+def test_monitor_stop_releases_native_capture_source_with_one_total_budget():
+    class Source:
+        def __init__(self):
+            self.closed = threading.Event()
+
+        def close(self):
+            self.closed.set()
+
+    monitor = BackgroundMonitor.__new__(BackgroundMonitor)
+    monitor.source = Source()
+    monitor._stop = threading.Event()
+    monitor._status_enabled = threading.Event()
+    monitor._aux_enabled = threading.Event()
+    monitor._potion_request = threading.Event()
+    monitor._pickup_request = threading.Event()
+    monitor._context_request = threading.Event()
+    monitor._potion_scan_active = threading.Event()
+    monitor._threads = []
+
+    monitor.stop(total_timeout=0.2)
+
+    assert monitor.source.closed.is_set()
+    assert monitor._stop.is_set()
+
+
+def test_pickup_capture_queue_keeps_latest_stack_without_blocking():
+    monitor = BackgroundMonitor.__new__(BackgroundMonitor)
+    monitor._pickup_frame_queue = queue.Queue(maxsize=2)
+
+    monitor._queue_pickup_frame(1.0, {"pickup": "first"})
+    monitor._queue_pickup_frame(2.0, {"pickup": "second"})
+    monitor._queue_pickup_frame(3.0, {"pickup": "latest"})
+
+    assert monitor._pickup_frame_queue.get_nowait() == (
+        2.0,
+        {"pickup": "second"},
+    )
+    assert monitor._pickup_frame_queue.get_nowait() == (
+        3.0,
+        {"pickup": "latest"},
+    )
 
 
 class _RecordingOcr:

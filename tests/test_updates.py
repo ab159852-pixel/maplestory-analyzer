@@ -93,6 +93,10 @@ def test_updater_handles_renamed_exe_and_records_transaction_progress():
     assert "in-place-copy-complete" in _POWERSHELL_UPDATER
     assert "old-process-restarted" in _POWERSHELL_UPDATER
     assert "System.Windows.Forms.MessageBox" in _POWERSHELL_UPDATER
+    assert "Get-InstallProcesses" in _POWERSHELL_UPDATER
+    assert "[System.IO.Path]::GetFullPath($candidatePath)" in _POWERSHELL_UPDATER
+    assert "force-stopping-install-process" in _POWERSHELL_UPDATER
+    assert "old-install-processes-cleared" in _POWERSHELL_UPDATER
 
 
 def test_updater_does_not_use_detached_process_for_powershell():

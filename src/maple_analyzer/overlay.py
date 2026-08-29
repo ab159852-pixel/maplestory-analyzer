@@ -935,14 +935,12 @@ class OverlayApp:
                             )
                     else:
                         self._set_update_status("update_status_installing", version=info.version, color=OK_COLOR)
-                        self._on_close()
-                        # The PowerShell helper waits for this exact packaged
-                        # PID before replacing the install directory.  A
-                        # normal Tk destroy may leave the frozen interpreter
-                        # alive briefly, so explicitly terminate only the
-                        # packaged update path after cleanup has completed.
-                        if getattr(sys, "frozen", False):
-                            os._exit(0)
+                        # The helper cannot replace the executable until every
+                        # native capture/OCR handle has been released.  The
+                        # packaged close path performs bounded cleanup and
+                        # then terminates the process itself; its watchdog
+                        # guarantees hand-off even if a native callback hangs.
+                        self._on_close(force_exit_delay=2.0)
         except queue.Empty:
             pass
         finally:
@@ -4316,29 +4314,52 @@ class OverlayApp:
             label.configure(text=rendered.get(key, "--"))
         self._render_context()
 
-    def _on_close(self) -> None:
+    def _on_close(self, *, force_exit_delay: float = 4.0) -> None:
         """Flush the latest preferences/history before closing the HUD."""
         if getattr(self, "_closing", False):
             return
         self._closing = True
+        frozen = bool(getattr(sys, "frozen", False))
+        if frozen:
+            # A WinRT/ONNX teardown regression must not leave the executable
+            # in Task Manager forever.  This watchdog starts before any
+            # potentially blocking finalization; the normal path below exits
+            # sooner after state has been saved and native capture is closed.
+            watchdog = threading.Timer(
+                max(0.5, float(force_exit_delay)),
+                lambda: os._exit(0),
+            )
+            watchdog.daemon = True
+            watchdog.start()
         try:
             if self._run_state in ("running", "paused"):
                 self._commit_session_to_history()
         except Exception as exc:
             log_exception("close/finalize error", exc)
         finally:
-            monitor = getattr(self, "_monitor", None)
-            if monitor is not None:
-                with contextlib.suppress(Exception):
-                    monitor.stop()
+            # Persist before joining OCR threads.  A native inference call can
+            # be slow or stuck, but user settings/history are ordinary local
+            # writes and should not be lost while waiting for it.
             with contextlib.suppress(Exception):
                 _maybe_persist_settings(self)
             with contextlib.suppress(Exception):
                 _maybe_persist_history(self)
+            monitor = getattr(self, "_monitor", None)
+            if monitor is not None:
+                with contextlib.suppress(Exception):
+                    try:
+                        monitor.stop(total_timeout=0.8)
+                    except TypeError:
+                        monitor.stop()
             with contextlib.suppress(Exception):
                 self.root.quit()
             with contextlib.suppress(Exception):
                 self.root.destroy()
+            if frozen:
+                # ``root.destroy`` only closes Tk.  PyInstaller can otherwise
+                # remain alive while a native WGC/ONNX callback is still
+                # attached, leaving the install directory locked.
+                os._exit(0)
 
     def run(self) -> None:
         try:

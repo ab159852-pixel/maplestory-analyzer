@@ -112,6 +112,18 @@ def test_live_client_mapping_tracks_a_smaller_window_and_shortcut_layer():
     assert 0 <= shortcut.top < shortcut.bottom <= client[1]
 
 
+def test_live_client_mapping_scales_minimap_from_client_origin_at_2k():
+    """A 2K title bar must not be scaled into the mini-map Y coordinate."""
+    map_box = scale_window_top_left_box_to_client(
+        CONTEXT_BOXES["map"],
+        (2560, 1431),
+        (2560, 1467),
+        (0, 36),
+    )
+
+    assert map_box.as_tuple() == (0, 73, 272, 122)
+
+
 def test_shortcut_grid_is_width_scaled_and_bottom_anchored():
     # The fallback transform remains deterministic before the border detector
     # has a frame to measure.  The eight cells must still be inside one parent.

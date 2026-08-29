@@ -238,6 +238,53 @@ function Copy-WithRobocopy([string] $Source, [string] $Destination) {
         throw "robocopy failed with exit code $result"
     }
 }
+function Get-InstallProcesses() {
+    # Match by the resolved executable path, not just by process name.  Users
+    # may keep another portable Maple Insight version elsewhere; the updater
+    # must never close that unrelated copy (and must never touch the game).
+    $expectedPath = [System.IO.Path]::GetFullPath((Join-Path $InstallDir $ExeName))
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($ExeName)
+    return @(
+        Get-Process -Name $baseName -ErrorAction SilentlyContinue |
+            Where-Object {
+                try {
+                    $candidatePath = $_.Path
+                    $candidatePath -and [string]::Equals(
+                        [System.IO.Path]::GetFullPath($candidatePath),
+                        $expectedPath,
+                        [System.StringComparison]::OrdinalIgnoreCase
+                    )
+                } catch {
+                    $false
+                }
+            }
+    )
+}
+function Stop-InstallProcesses([int] $GraceMilliseconds = 2000) {
+    $processes = @(Get-InstallProcesses)
+    if ($processes.Count -eq 0) { return }
+    Write-UpdateStatus ("install-processes-found pids=" + (($processes | ForEach-Object { $_.Id }) -join ","))
+    foreach ($process in $processes) {
+        try { $null = $process.CloseMainWindow() } catch { }
+    }
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($GraceMilliseconds)
+    do {
+        Start-Sleep -Milliseconds 100
+        $processes = @(Get-InstallProcesses)
+    } while ($processes.Count -gt 0 -and [DateTime]::UtcNow -lt $deadline)
+    foreach ($process in $processes) {
+        Write-UpdateStatus ("force-stopping-install-process pid=" + $process.Id)
+        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    }
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        $processes = @(Get-InstallProcesses)
+        if ($processes.Count -eq 0) { break }
+        Start-Sleep -Milliseconds 100
+    }
+    if (@(Get-InstallProcesses).Count -gt 0) {
+        throw "a Maple Insight process from the install directory is still running"
+    }
+}
 try {
     # The app is normally launched with its own install directory as the
     # process working directory. Windows refuses to move a directory that a
@@ -282,14 +329,22 @@ try {
     }
     Write-UpdateStatus ("package-ready path=" + $targetExe)
 
-    for ($attempt = 0; $attempt -lt 60; $attempt++) {
+    for ($attempt = 0; $attempt -lt 12; $attempt++) {
         if ($null -eq (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) { break }
         Start-Sleep -Milliseconds 500
     }
     if ($null -ne (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
-        throw "the old application did not exit"
+        Write-UpdateStatus ("old-process-did-not-exit pid=" + $ProcessId)
+    }
+    # Closing Tk can leave a frozen process alive while WinRT/ONNX tears down.
+    # Clear every process whose executable is this exact install path before
+    # attempting a directory rename or in-place replacement.
+    Stop-InstallProcesses
+    if ($null -ne (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
+        throw "the old application did not exit and could not be stopped safely"
     }
     Write-UpdateStatus "old-process-exited"
+    Write-UpdateStatus "old-install-processes-cleared"
 
     $usedCopyFallback = $false
     try {

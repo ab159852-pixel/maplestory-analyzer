@@ -528,6 +528,13 @@ class BackgroundMonitor:
         # stream.  The UI drains both queues in timestamp order.
         self.potion_queue: queue.Queue[AuxiliaryReading] = queue.Queue(maxsize=8)
         self.context_queue: queue.Queue[ContextReading] = queue.Queue(maxsize=2)
+        # Screen sampling and pickup OCR must be independent.  At 100-200ms a
+        # detector pass can outlive the next sample deadline; retaining a
+        # short sequence of already-captured feed frames prevents those OCR
+        # milliseconds from becoming blind time.
+        self._pickup_frame_queue: queue.Queue[tuple[float, dict[str, Any]]] = (
+            queue.Queue(maxsize=8)
+        )
         self._stop = threading.Event()
         self._status_enabled = threading.Event()
         self._aux_enabled = threading.Event()
@@ -581,7 +588,13 @@ class BackgroundMonitor:
             ),
             threading.Thread(
                 target=self._worker_entry,
-                args=(self._pickup_loop, "pickup"),
+                args=(self._pickup_capture_loop, "pickup-capture"),
+                name="maple-pickup-capture",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._worker_entry,
+                args=(self._pickup_loop, "pickup-ocr"),
                 name="maple-pickup-monitor",
                 daemon=True,
             ),
@@ -628,13 +641,36 @@ class BackgroundMonitor:
             )
             self._stop.wait(0.5)
 
-    def stop(self) -> None:
+    def stop(self, *, total_timeout: float = 0.8) -> None:
+        """Signal every worker and release capture handles within one budget."""
         self._stop.set()
         self._status_enabled.set()
         self._aux_enabled.set()
+        self._potion_request.set()
+        self._pickup_request.set()
+        self._context_request.set()
         self._potion_scan_active.clear()
+        deadline = time.monotonic() + max(0.0, float(total_timeout))
+
+        # Native WGC/WinRT teardown can itself wait on a frame callback.  Run
+        # it off the Tk thread and give it part of the same bounded budget;
+        # closing the capture source also wakes workers currently blocked in a
+        # frame request.
+        close_source = getattr(self.source, "close", None)
+        if callable(close_source):
+            close_thread = threading.Thread(
+                target=close_source,
+                name="maple-capture-close",
+                daemon=True,
+            )
+            close_thread.start()
+            close_thread.join(timeout=min(0.25, max(0.0, deadline - time.monotonic())))
+
         for thread in self._threads:
-            thread.join(timeout=0.8)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
         self._threads.clear()
 
     def set_sample_interval(self, value_ms: int) -> None:
@@ -667,6 +703,7 @@ class BackgroundMonitor:
             self._aux_enabled.clear()
             self._potion_request.clear()
             self._pickup_request.clear()
+            self._clear_pickup_frames()
 
     def request_auxiliary_scan(self) -> None:
         """Wake the economy worker for a fresh Start/Resume baseline."""
@@ -806,6 +843,12 @@ class BackgroundMonitor:
                 self._stop.wait(min(0.1, next_potion_scan - now))
                 continue
             self._potion_request.clear()
+            # Schedule from the *start* of this sample.  Scheduling after OCR
+            # made the effective cadence ``configured interval + inference
+            # time``; a 150ms setting could therefore update only every
+            # 400-700ms and miss several bottle changes.  If OCR itself takes
+            # longer than the interval, the next loop runs immediately.
+            next_potion_scan = now + potion_interval
             self._potion_scan_active.set()
             try:
                 with self._lock:
@@ -839,7 +882,6 @@ class BackgroundMonitor:
                 )
             finally:
                 self._potion_scan_active.clear()
-                next_potion_scan = time.monotonic() + potion_interval
 
     def _read_potion_counts(
         self,
@@ -930,8 +972,41 @@ class BackgroundMonitor:
                 counts[slot.slot] = count
         return counts
 
-    def _pickup_loop(self) -> None:
-        """Track the pickup feed independently from high-frequency potions."""
+    def _clear_pickup_frames(self) -> None:
+        frame_queue = getattr(self, "_pickup_frame_queue", None)
+        if frame_queue is None:
+            return
+        while True:
+            try:
+                frame_queue.get_nowait()
+            except queue.Empty:
+                return
+
+    def _queue_pickup_frame(
+        self,
+        captured_at: float,
+        regions: dict[str, Any],
+    ) -> None:
+        """Keep the newest feed sequence without blocking screen sampling."""
+        item = (captured_at, regions)
+        try:
+            self._pickup_frame_queue.put_nowait(item)
+            return
+        except queue.Full:
+            # A later toast stack contains the still-visible older entries as
+            # well as the newest pickup.  Drop one oldest frame rather than
+            # blocking capture behind OCR and losing the latest stack.
+            try:
+                self._pickup_frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+        try:
+            self._pickup_frame_queue.put_nowait(item)
+        except queue.Full:
+            pass
+
+    def _pickup_capture_loop(self) -> None:
+        """Capture pickup pixels at the configured cadence, independent of OCR."""
         next_pickup_scan = 0.0
         while not self._stop.is_set():
             if not self._aux_enabled.wait(0.1):
@@ -942,12 +1017,57 @@ class BackgroundMonitor:
                 track_pickup = self._track_pickup
                 pickup_interval = self._pickup_interval_ms / 1000
             if not track_pickup:
+                self._pickup_request.clear()
+                self._clear_pickup_frames()
                 self._stop.wait(0.1)
                 continue
             if not requested and now < next_pickup_scan:
-                self._stop.wait(min(0.1, next_pickup_scan - now))
+                self._stop.wait(min(0.05, next_pickup_scan - now))
                 continue
             self._pickup_request.clear()
+            next_pickup_scan = now + pickup_interval
+            try:
+                regions = self._grab_auxiliary_cached()
+            except RuntimeError as exc:
+                _put_latest(
+                    self.auxiliary_queue,
+                    AuxiliaryReading(
+                        error=str(exc),
+                        timestamp=time.monotonic(),
+                        pickup_scanned=False,
+                    ),
+                )
+            except Exception as exc:
+                _put_latest(
+                    self.auxiliary_queue,
+                    AuxiliaryReading(
+                        error=f"OCR: {exc}",
+                        timestamp=time.monotonic(),
+                        pickup_scanned=False,
+                    ),
+                )
+            else:
+                self._queue_pickup_frame(now, regions)
+
+    def _pickup_loop(self) -> None:
+        """OCR the captured pickup sequence without controlling its cadence."""
+        pending: tuple[float, dict[str, Any]] | None = None
+        while not self._stop.is_set():
+            if not self._aux_enabled.wait(0.1):
+                pending = None
+                continue
+            with self._lock:
+                track_pickup = self._track_pickup
+            if not track_pickup:
+                pending = None
+                self._stop.wait(0.1)
+                continue
+            if pending is None:
+                try:
+                    pending = self._pickup_frame_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+            captured_at, regions = pending
             # A potion quantity frame has priority over the optional full
             # pickup detector.  The latter can invoke detector OCR and take
             # hundreds of milliseconds; never let it hold the shared model
@@ -955,16 +1075,15 @@ class BackgroundMonitor:
             if self._potion_scan_active.is_set():
                 self._stop.wait(0.01)
                 continue
+            if not self._ocr_lock.acquire(blocking=False):
+                # Keep this captured frame pending.  Discarding it here would
+                # recreate the exact blind spot the capture queue is meant to
+                # remove whenever status/context OCR owns the shared model.
+                self._stop.wait(0.01)
+                continue
             try:
-                regions = self._grab_auxiliary_cached()
-                if self._potion_scan_active.is_set():
-                    self._stop.wait(0.01)
-                    continue
-                if not self._ocr_lock.acquire(blocking=False):
-                    self._stop.wait(0.01)
-                    continue
                 try:
-                    lines = self._read_pickup_lines(regions, now)
+                    lines = self._read_pickup_lines(regions, captured_at)
                 finally:
                     self._ocr_lock.release()
                 _put_latest(
@@ -986,7 +1105,7 @@ class BackgroundMonitor:
                     AuxiliaryReading(error=f"OCR: {exc}", timestamp=time.monotonic()),
                 )
             finally:
-                next_pickup_scan = time.monotonic() + pickup_interval
+                pending = None
 
     def _read_pickup_lines(self, regions: dict[str, Any], now: float) -> list[tuple[str, float]]:
         feed_signature = _image_signature(regions.get("pickup"))

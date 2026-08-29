@@ -248,6 +248,53 @@ def test_shortcut_numeric_views_prefer_clean_threshold_consensus_and_reject_conf
     ) is None
 
 
+def test_independent_text_model_resolves_real_3_vs_9_quantity_conflict():
+    """The two provided 2K captures read 2320/2365 as 2920/2965 in RGB."""
+    from PIL import Image
+
+    class Numeric:
+        def read_digit_fields(self, images, *, max_digits=4):
+            result = {}
+            for name in images:
+                view = name.rsplit(":", 1)[-1]
+                result[name] = "2320" if "white" in view else "2920"
+            return result
+
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._numeric_engine = Numeric()
+    ocr._read_once = lambda _image: ("2320", [])
+
+    assert ocr._read_shortcut_numeric_batch(
+        {"6:False": ("6", Image.new("RGB", (39, 36)))},
+        blue_slot_ids=set(),
+        previous_counts={},
+        live=True,
+    ) == {"6": 2320}
+
+
+def test_same_length_numeric_conflict_cannot_fall_back_to_wrong_colour_vote():
+    from PIL import Image
+
+    class Numeric:
+        def read_digit_fields(self, images, *, max_digits=4):
+            result = {}
+            for name in images:
+                view = name.rsplit(":", 1)[-1]
+                result[name] = "2320" if "white" in view else "2920"
+            return result
+
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._numeric_engine = Numeric()
+    ocr._read_once = lambda _image: ("", [])
+
+    assert ocr._read_shortcut_numeric_batch(
+        {"6:False": ("6", Image.new("RGB", (39, 36)))},
+        blue_slot_ids=set(),
+        previous_counts={},
+        live=True,
+    ) == {}
+
+
 def test_shortcut_numeric_views_reject_1359_to_1959_substitution_but_keep_correction():
     # 3 -> 9 in the hundreds place is the reported same-length upward OCR
     # substitution.  A correction such as 40 -> 80 must remain possible so a

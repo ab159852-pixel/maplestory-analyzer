@@ -792,10 +792,12 @@ class StatPanelOcr:
 
         batch: dict[str, Image.Image] = {}
         owners: dict[str, str] = {}
+        quantity_strips: dict[str, Image.Image] = {}
         for _slot_key, (slot_id, crop) in pending.items():
             strip = _shortcut_quantity_strip(crop)
             if strip.width <= 1 or strip.height <= 1:
                 continue
+            quantity_strips[slot_id] = strip
             views = _shortcut_numeric_views(
                 strip,
                 blue=slot_id in blue_slot_ids,
@@ -846,6 +848,7 @@ class StatPanelOcr:
             candidates.setdefault(owners.get(key, ""), []).append((value, view_name))
 
         result: dict[str, int] = {}
+        hard_conflict_slots: set[str] = set()
         for slot_id, values in candidates.items():
             if not slot_id:
                 continue
@@ -855,6 +858,39 @@ class StatPanelOcr:
             )
             if selected is not None:
                 result[slot_id] = selected
+                continue
+
+            # The bundled digit-only recognizer has a repeatable ambiguity in
+            # MapleStory's outlined font: the untouched colour views can read
+            # 3 as 9 (2365 -> 2965 / 2320 -> 2920), while the white-glyph
+            # views keep the correct digit.  A colour-only recovery used to
+            # turn that disagreement into the wrong value.  Ask the
+            # independent general recognizer only for this unresolved,
+            # changed cell and accept its answer only when it exactly matches
+            # one of the numeric-model candidates.  Healthy/stable cells pay
+            # no extra OCR cost.
+            if _shortcut_numeric_views_have_same_length_conflict(values):
+                hard_conflict_slots.add(slot_id)
+            strip = quantity_strips.get(slot_id)
+            if strip is None:
+                continue
+            try:
+                general_text, general_records = self._read_once(strip)
+            except Exception:
+                continue
+            if not _numeric_shortcut_text_is_clean(general_text):
+                continue
+            general_value = _extract_shortcut_count(general_text)
+            confidence = _confidence(general_records)
+            if confidence is not None and confidence < 0.70:
+                continue
+            confirmed = _select_shortcut_general_confirmation(
+                general_value,
+                values,
+                previous=(previous_counts or {}).get(slot_id),
+            )
+            if confirmed is not None:
+                result[slot_id] = confirmed
 
         # A three-digit quantity can leave the bottom-right frame stroke in
         # the normal strip.  Do not pay for a second crop on healthy cells;
@@ -876,6 +912,12 @@ class StatPanelOcr:
         for slot_key, item in pending.items():
             slot_id = item[0]
             if slot_id in result:
+                continue
+            # A same-width digit disagreement is not a border/suffix problem.
+            # If the independent recognizer could not confirm either value,
+            # keep the previous trusted quantity and retry the next frame
+            # instead of letting repeated colour views manufacture a change.
+            if slot_id in hard_conflict_slots:
                 continue
             if not live and not candidates.get(slot_id):
                 continue
@@ -1782,6 +1824,67 @@ def _select_shortcut_colour_recovery(
     ):
         return None
     return value
+
+
+def _shortcut_numeric_views_have_same_length_conflict(
+    candidates: Iterable[tuple[int, str]],
+) -> bool:
+    """Return whether protected and colour views disagree digit-for-digit.
+
+    A longer colour value can be a harmless frame/icon suffix (983 -> 9834),
+    which the existing recovery crop is designed to remove.  Equal-length
+    alternatives such as 2320/2920 are a real glyph ambiguity and must not be
+    resolved by counting how many preprocessings produced each answer.
+    """
+    values = [
+        (value, str(view_name))
+        for value, view_name in candidates
+        if isinstance(value, int) and 0 <= value <= MAX_SHORTCUT_QUANTITY
+    ]
+    threshold_values = {
+        value
+        for value, view_name in values
+        if _numeric_view_base_name(view_name).startswith("white")
+    }
+    colour_values = {
+        value
+        for value, view_name in values
+        if not view_name.startswith("soft-")
+        and not _numeric_view_base_name(view_name).startswith("white")
+    }
+    return any(
+        threshold != colour
+        and len(str(threshold)) == len(str(colour))
+        for threshold in threshold_values
+        for colour in colour_values
+    )
+
+
+def _select_shortcut_general_confirmation(
+    general_value: int | None,
+    candidates: Iterable[tuple[int, str]],
+    *,
+    previous: int | None,
+) -> int | None:
+    """Confirm one disputed numeric read with the independent text model."""
+    if (
+        not isinstance(general_value, int)
+        or not 0 <= general_value <= MAX_SHORTCUT_QUANTITY
+    ):
+        return None
+    candidate_values = {
+        value
+        for value, _view_name in candidates
+        if isinstance(value, int) and 0 <= value <= MAX_SHORTCUT_QUANTITY
+    }
+    if general_value not in candidate_values:
+        return None
+    if previous is not None and not _shortcut_numeric_transition_is_usable(
+        previous,
+        general_value,
+    ):
+        return None
+    return general_value
 
 
 def _numeric_view_base_name(view_name: str) -> str:
