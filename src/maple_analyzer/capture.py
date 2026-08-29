@@ -5,8 +5,9 @@ Two implementations:
 
 - `GameWindowCapture` (Windows only): finds the MapleStory window by title via
   pywin32 and prefers Windows Graphics Capture for the target HWND, so a
-  foreground window cannot replace the game's pixels. It falls back to an
-  `mss` desktop grab when Windows Graphics Capture is unavailable.
+  foreground window cannot replace the game's pixels. Live status/economy can
+  use a guarded desktop compatibility path while visible; context OCR is
+  target-window-only because the floating HUD commonly covers the mini-map.
 - `StaticImageCapture` (any platform): replays a single image file every call.
   Used for dev/testing on machines without the game running (e.g. this repo's
   Linux dev environment) -- proves out the OCR/parse/rate/overlay code without
@@ -51,6 +52,7 @@ from .regions import (
 # panel. Routine and recoverable, so it travels the same path as the
 # minimized/not-found states -- see overlay._do_tick and _localize_error.
 PANEL_OBSCURED = "stat panel is obscured"
+TARGET_WINDOW_CAPTURE_UNAVAILABLE = "target window capture is unavailable"
 
 
 def set_process_dpi_awareness() -> None:
@@ -965,6 +967,17 @@ class GameWindowCapture:
             return f"{PANEL_OBSCURED}; Windows Graphics Capture unavailable: {detail}"
         return PANEL_OBSCURED
 
+    def _target_window_capture_error(self) -> str:
+        """Describe why OBS-style target-window capture is unavailable."""
+        details = []
+        if self.graphics_capture_error:
+            details.append(f"WGC: {self.graphics_capture_error}")
+        if self.print_window_error:
+            details.append(f"PrintWindow: {self.print_window_error}")
+        if not details:
+            details.append("WGC and PrintWindow returned no frame")
+        return f"{TARGET_WINDOW_CAPTURE_UNAVAILABLE}; " + "; ".join(details)
+
     def grab_full(self) -> Image.Image:
         client_rect = self._client_rect_on_screen()
         window_frame = self._try_window_frame(client_rect)
@@ -1242,39 +1255,13 @@ class GameWindowCapture:
                 )
                 for name, box in CONTEXT_BOXES.items()
             }
-
-        left, top, right, bottom = client_rect
-        client_size = (right - left, bottom - top)
-        self.client_size = client_size
-        # Unlike WGC, the desktop fallback sees the visible desktop.  The
-        # analyzer is commonly kept above the game, and its translucent HUD
-        # can cover the mini-map title.  Refuse this frame instead of feeding
-        # the HUD labels into map/job OCR and publishing a false map name.
-        points = [
-            (left + x, top + y)
-            for x, y in context_sample_points(
-                client_size,
-                window_size=self.window_size,
-                client_offset=self.client_offset or (0, 0),
-            )
-        ]
-        if panel_is_obscured(points, self._hwnd, self._root_window_at):
-            raise RuntimeError(self._obscured_live_error())
-        regions: dict[str, Image.Image] = {}
-        for name, raw_box in CONTEXT_BOXES.items():
-            box = self._live_box(
-                raw_box,
-                client_size,
-                top_left=name in {"map", "map_wide"},
-            )
-            shot = self._mss.grab({
-                "left": left + box.left,
-                "top": top + box.top,
-                "width": box.right - box.left,
-                "height": box.bottom - box.top,
-            })
-            regions[name] = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-        return regions
+        # Never OCR the visible desktop for map/job context.  The analyzer's
+        # own translucent HUD normally overlaps the mini-map, and another
+        # foreground window may cover either crop.  Returning those pixels is
+        # how labels such as the HUD's "每60分鐘預估…" became a fake map name.
+        # Preserve the last confirmed context and let the monitor retry the
+        # WGC/PrintWindow target surface instead.
+        raise RuntimeError(self._target_window_capture_error())
 
     def close(self) -> None:
         """Release native capture handles during app/update shutdown.

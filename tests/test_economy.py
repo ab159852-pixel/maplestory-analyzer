@@ -44,9 +44,38 @@ def test_mesos_feed_counts_new_lines_once_while_they_remain_visible():
     assert tracker.update([MesosObservation(144, 100), MesosObservation(300, 120)]) == 300
     assert tracker.total == 300
     assert tracker.events == 1
-    # Empty feed is the boundary that allows a later identical pickup to count.
+    # The boundary requires two empty samples so one scroll/redraw miss cannot
+    # make the same visible row count twice.
+    tracker.update([])
     tracker.update([])
     assert tracker.update([MesosObservation(144, 100)]) == 144
+
+
+def test_mesos_feed_does_not_double_count_after_one_empty_segmentation_frame():
+    tracker = MesosFeedTracker()
+
+    assert tracker.update([MesosObservation(144, 100)]) == 0
+    assert tracker.update([]) == 0
+    assert tracker.update([MesosObservation(144, 100)]) == 0
+    assert tracker.total == 0
+    assert tracker.events == 0
+
+
+def test_mesos_feed_keeps_one_temporarily_missing_row_in_a_partial_stack():
+    tracker = MesosFeedTracker()
+
+    assert tracker.update([
+        MesosObservation(100, 86),
+        MesosObservation(200, 100),
+    ]) == 0
+    # Segmentation briefly loses +100 while +200 remains readable.
+    assert tracker.update([MesosObservation(200, 100)]) == 0
+    # The same +100 row returns; it is not a new income event.
+    assert tracker.update([
+        MesosObservation(100, 86),
+        MesosObservation(200, 100),
+    ]) == 0
+    assert tracker.total == 0
 
 
 def test_mesos_feed_preserves_every_fast_scroll_step_including_duplicate_amounts():

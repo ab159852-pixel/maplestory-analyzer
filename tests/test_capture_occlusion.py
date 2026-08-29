@@ -13,6 +13,8 @@ from __future__ import annotations
 import pytest
 
 from maple_analyzer.capture import (
+    GameWindowCapture,
+    TARGET_WINDOW_CAPTURE_UNAVAILABLE,
     context_sample_points,
     field_sample_points,
     panel_is_obscured,
@@ -107,6 +109,24 @@ def test_context_sample_points_cover_map_and_job_at_2k_geometry():
         assert all(box.left <= x < box.right and box.top <= y < box.bottom for x, y in name_points)
 
 
+def test_context_never_falls_back_to_foreground_desktop_pixels():
+    capture = GameWindowCapture.__new__(GameWindowCapture)
+    capture._client_rect_on_screen = lambda: (0, 0, 2560, 1440)
+    capture._remember_capture_geometry = lambda *_args, **_kwargs: None
+    capture._try_window_frame = lambda _rect: None
+    capture._target_window_capture_error = (
+        lambda: f"{TARGET_WINDOW_CAPTURE_UNAVAILABLE}; WGC test failure"
+    )
+
+    class DesktopMustNotBeRead:
+        def grab(self, _box):
+            raise AssertionError("context OCR must not read foreground desktop pixels")
+
+    capture._mss = DesktopMustNotBeRead()
+    with pytest.raises(RuntimeError, match=TARGET_WINDOW_CAPTURE_UNAVAILABLE):
+        capture._grab_context()
+
+
 def test_obscured_message_is_localised():
     """The three capture states are routine, expected conditions users hit
     constantly, so they get real translations rather than leaking raw English
@@ -128,4 +148,8 @@ def test_obscured_message_is_localised():
     stub._settings = Settings(language="en")
     assert stub._localize_error(PANEL_OBSCURED) == (
         "Stat panel is covered; live capture is unavailable"
+    )
+
+    assert stub._localize_error(TARGET_WINDOW_CAPTURE_UNAVAILABLE) == (
+        "Target-window capture unavailable; retrying WGC"
     )

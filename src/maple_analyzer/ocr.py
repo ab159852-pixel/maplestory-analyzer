@@ -853,11 +853,43 @@ class StatPanelOcr:
         for slot_id, values in candidates.items():
             if not slot_id:
                 continue
+            strip = quantity_strips.get(slot_id)
             selected = _select_shortcut_numeric_views(
                 values,
                 previous=(previous_counts or {}).get(slot_id),
             )
+            if slot_id in blue_slot_ids:
+                blue_prefix_value = _recover_shortcut_blue_prefix_and_border(
+                    values,
+                    previous=(previous_counts or {}).get(slot_id),
+                )
+                if blue_prefix_value is not None:
+                    # A normal selector may accept only the clean trailing
+                    # suffix (54).  The nested RGB/R/G/threshold relationship
+                    # carries stronger evidence for the complete 754 value.
+                    selected = blue_prefix_value
             if selected is not None:
+                # The generic CTC model can make every colour/threshold view
+                # agree on the same wrong outlined glyph.  The supplied 2K
+                # frame is a concrete example: the real quantity ``1328`` was
+                # unanimously decoded as ``1928``, so the old conflict-only
+                # correction never ran.  The tiny local game-font classifier
+                # is independent of those OCR votes and must validate every
+                # selected 3/9 glyph, not only a disagreement between views.
+                if strip is not None:
+                    selected = _correct_shortcut_game_font_3_9(
+                        strip,
+                        selected,
+                    )
+                previous = (previous_counts or {}).get(slot_id)
+                if (
+                    previous is not None
+                    and not _shortcut_numeric_transition_is_usable(
+                        previous,
+                        selected,
+                    )
+                ):
+                    continue
                 result[slot_id] = selected
                 continue
 
@@ -872,7 +904,6 @@ class StatPanelOcr:
             # no extra OCR cost.
             if _shortcut_numeric_views_have_same_length_conflict(values):
                 hard_conflict_slots.add(slot_id)
-            strip = quantity_strips.get(slot_id)
             if strip is None:
                 continue
             game_font_value = _resolve_shortcut_game_font_3_9_conflict(
@@ -921,12 +952,6 @@ class StatPanelOcr:
         for slot_key, item in pending.items():
             slot_id = item[0]
             if slot_id in result:
-                continue
-            # A same-width digit disagreement is not a border/suffix problem.
-            # If the independent recognizer could not confirm either value,
-            # keep the previous trusted quantity and retry the next frame
-            # instead of letting repeated colour views manufacture a change.
-            if slot_id in hard_conflict_slots:
                 continue
             if not live and not candidates.get(slot_id):
                 continue
@@ -1006,6 +1031,19 @@ class StatPanelOcr:
                         previous=(previous_counts or {}).get(slot_id),
                         minimum_votes=3 if slot_id in blue_slot_ids else 2,
                     )
+                    if selected is not None and slot_id in hard_conflict_slots:
+                        # A taller crop may resolve a primary same-width
+                        # conflict, but only toward the protected threshold
+                        # interpretation.  If it merely repeats the disputed
+                        # colour value (2320 white vs 2920 colour), keep the
+                        # frame unreadable instead of promoting that error.
+                        protected = {
+                            value
+                            for value, view_name in candidates.get(slot_id, [])
+                            if _numeric_view_base_name(view_name).startswith("white")
+                        }
+                        if selected not in protected:
+                            selected = None
                     if selected is not None:
                         result[slot_id] = selected
         return result
@@ -1493,6 +1531,11 @@ def _shortcut_numeric_views(
         white = gray.point(lambda pixel: 255 if pixel >= 170 else 0)
         if blue:
             return [
+                # Keep the untouched view as a geometry witness.  It is not
+                # trusted on its own (blue artwork can append a frame glyph),
+                # but together with the R/G suffixes it can recover a leading
+                # digit that the channel projections clipped (754 -> 54).
+                (f"{prefix}rgb", rgb),
                 (f"{prefix}r", rgb.getchannel("R").convert("RGB")),
                 (f"{prefix}g", rgb.getchannel("G").convert("RGB")),
                 (f"{prefix}white170", white.convert("RGB")),
@@ -1835,6 +1878,75 @@ def _select_shortcut_colour_recovery(
     return value
 
 
+def _recover_shortcut_blue_prefix_and_border(
+    candidates: Iterable[tuple[int, str]],
+    *,
+    previous: int | None,
+) -> int | None:
+    """Recover a leading blue-cell digit plus one trailing frame glyph.
+
+    One supplied 2K frame contains the real value ``754``.  The untouched RGB
+    view keeps the leading 7 but appends the cell border (``7544``), the R/G
+    projections both lose the leading digit and keep that border (``544``),
+    while both protected white views see the clean suffix (``54``).  No one
+    view contains the answer, but those three independent relationships do.
+
+    The rule is intentionally narrow: both channel views plus at least one
+    protected threshold view must corroborate the exact nested suffixes before
+    the last RGB glyph is removed. It cannot turn a simple same-width
+    disagreement into a guess.
+    """
+    values = [
+        (value, str(view_name))
+        for value, view_name in candidates
+        if isinstance(value, int)
+        and 0 <= value <= MAX_SHORTCUT_QUANTITY
+        and not str(view_name).startswith("soft-")
+    ]
+    if not values:
+        return None
+    threshold_counts = Counter(
+        value
+        for value, view_name in values
+        if _numeric_view_base_name(view_name).startswith("white")
+    )
+    colour_counts = Counter(
+        value
+        for value, view_name in values
+        if not _numeric_view_base_name(view_name).startswith("white")
+    )
+    recovered: set[int] = set()
+    for long_value in colour_counts:
+        long_text = str(long_value)
+        if len(long_text) != 4:
+            continue
+        candidate_text = long_text[:-1]
+        channel_suffix = int(long_text[1:])
+        if colour_counts.get(channel_suffix, 0) < 2:
+            continue
+        if not any(
+            # The live path keeps one threshold view for latency; the two
+            # independent R/G projections already provide the second and
+            # third corroborating relationships.  Offline diagnostics may
+            # still provide both white thresholds.
+            votes >= 1
+            and len(str(short_value)) < len(candidate_text)
+            and candidate_text.endswith(str(short_value))
+            for short_value, votes in threshold_counts.items()
+        ):
+            continue
+        candidate = int(candidate_text)
+        if previous is not None and not _shortcut_numeric_transition_is_usable(
+            previous,
+            candidate,
+        ):
+            continue
+        recovered.add(candidate)
+    if len(recovered) != 1:
+        return None
+    return next(iter(recovered))
+
+
 def _shortcut_numeric_views_have_same_length_conflict(
     candidates: Iterable[tuple[int, str]],
 ) -> bool:
@@ -1886,6 +1998,12 @@ _SHORTCUT_GAME_FONT_3_9_ROWS: dict[str, tuple[tuple[int, ...], ...]] = {
          48, 48, 48, 48, 8208, 8208, 4032, 4032, 0, 0),
         (0, 0, 0, 4064, 4064, 12312, 12312, 24, 24, 32792, 57368,
          58336, 61464, 61464, 1560, 1560, 4104, 4104, 2016, 2016, 0, 0),
+        # Second glyph from the user's 2560x1440 ``1328`` frame.  The generic
+        # model returned ``1928`` in every view; keeping this exact redraw
+        # variant makes the local decision independent of that shared OCR
+        # error while retaining the older 2320/2365 samples above.
+        (0, 0, 0, 4064, 4064, 12312, 12312, 24, 24, 57368, 61464,
+         62432, 61465, 61465, 3993, 3992, 12312, 12312, 2016, 2016, 0, 0),
     ),
     "9": (
         (31, 31, 31, 4071, 4071, 12312, 12312, 920, 920, 24, 24, 999,
@@ -2022,6 +2140,37 @@ def _classify_shortcut_game_font_3_or_9(
     if scores[winner] < 0.30 or scores[winner] - scores[loser] < 0.08:
         return None
     return winner
+
+
+def _correct_shortcut_game_font_3_9(
+    image: Image.Image,
+    value: int,
+) -> int:
+    """Validate every selected 3/9 glyph with the local game-font model.
+
+    This is deliberately a narrow, offline classifier rather than another
+    general OCR vote.  It was trained from real shortcut cells at multiple
+    client scales and operates only on characters the generic model already
+    placed as 3 or 9.  Those two glyphs have the same advance width, so
+    correcting one cannot shift the following proportional-font positions.
+    A weak or tied local score preserves the original value.
+    """
+    if not isinstance(value, int) or not 0 <= value <= MAX_SHORTCUT_QUANTITY:
+        return value
+    text = str(value)
+    if "3" not in text and "9" not in text:
+        return value
+    corrected = list(text)
+    for index, digit in enumerate(text):
+        if digit not in {"3", "9"}:
+            continue
+        classified = _classify_shortcut_game_font_3_or_9(image, text, index)
+        if classified is not None:
+            corrected[index] = classified
+    try:
+        return int("".join(corrected))
+    except ValueError:
+        return value
 
 
 def _resolve_shortcut_game_font_3_9_conflict(

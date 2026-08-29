@@ -551,14 +551,14 @@ def _context_candidate_is_confirmed(
     """Return whether one scan has enough evidence to publish immediately."""
     if not selected:
         return False
-    if Counter(candidates).get(selected, 0) >= 2:
-        return True
     if kind == "map":
         # A numbered barracks name or explicit Roman floor cannot be produced
         # by merely dropping a glyph from a neighbouring label.  These are the
         # two real tiny-map cases where waiting another 2s made drop lookup feel
         # broken even though the first OCR pass was already complete.
         return _has_strong_map_candidate([selected])
+    if Counter(candidates).get(selected, 0) >= 2:
+        return True
     # The alias table is intentionally narrow and currently canonicalizes only
     # the repeatedly observed thief label.  A recognized canonical alias is
     # stronger than an arbitrary two-CJK-glyph string from a single view.
@@ -1587,6 +1587,7 @@ class BackgroundMonitor:
         if not callable(grab_context):
             return
         while not self._stop.is_set():
+            context_complete = False
             try:
                 regions = grab_context()
                 # Context is useful before Start, but it is not a real-time
@@ -1610,20 +1611,34 @@ class BackgroundMonitor:
                     reading = extract_context(self.ocr, regions)
                 finally:
                     self._ocr_lock.release()
+                context_complete = bool(reading.map_name and reading.job_name)
                 if priority_event is not None:
-                    priority_event.clear()
+                    if context_complete:
+                        priority_event.clear()
+                    else:
+                        # Startup/drop lookup is still missing useful context.
+                        # Keep one bounded-priority retry instead of falling
+                        # into the normal 3s cadence after an empty OCR pass.
+                        priority_event.set()
                 _put_latest(self.context_queue, reading)
             except RuntimeError as exc:
                 priority_event = getattr(self, "_context_priority", None)
                 if priority_event is not None:
-                    priority_event.clear()
+                    # WGC can recover after the game finishes initializing or
+                    # the compositor restarts.  Retain the request and retry
+                    # promptly; the target-only capture path never substitutes
+                    # foreground HUD pixels while waiting.
+                    priority_event.set()
                 _put_latest(self.context_queue, ContextReading(error=str(exc)))
             except Exception as exc:
                 priority_event = getattr(self, "_context_priority", None)
                 if priority_event is not None:
-                    priority_event.clear()
+                    priority_event.set()
                 _put_latest(self.context_queue, ContextReading(error=f"OCR: {exc}"))
-            deadline = time.monotonic() + self._context_scan_ms / 1000
+            retry_seconds = self._context_scan_ms / 1000
+            if not context_complete:
+                retry_seconds = min(retry_seconds, 1.0)
+            deadline = time.monotonic() + retry_seconds
             while not self._stop.is_set():
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:

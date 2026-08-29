@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from io import BytesIO
 import inspect
+import os
+from pathlib import Path
+import subprocess
 import zipfile
 
 from maple_analyzer.updates import (
@@ -96,6 +99,10 @@ def test_updater_handles_renamed_exe_and_records_transaction_progress():
     assert "Get-InstallProcesses" in _POWERSHELL_UPDATER
     assert "[System.IO.Path]::GetFullPath($candidatePath)" in _POWERSHELL_UPDATER
     assert "force-stopping-install-process" in _POWERSHELL_UPDATER
+    assert "parent-process-captured" in _POWERSHELL_UPDATER
+    assert "$parentProcess.WaitForExit(6000)" in _POWERSHELL_UPDATER
+    assert "$parentProcess.Kill()" in _POWERSHELL_UPDATER
+    assert "force-stopping-parent-process" in _POWERSHELL_UPDATER
     assert "old-install-processes-cleared" in _POWERSHELL_UPDATER
 
 
@@ -119,3 +126,33 @@ def test_updater_requires_helper_start_ack_before_app_exit():
     assert '"helper-start" in status' in source
     assert 'update helper did not acknowledge startup' in source
     assert 'helper.terminate()' in source
+
+
+def test_embedded_powershell_updater_has_valid_syntax(tmp_path: Path):
+    script = tmp_path / "updater.ps1"
+    script.write_text(_POWERSHELL_UPDATER, encoding="utf-8")
+    parser = (
+        "$tokens=$null; $errors=$null; "
+        "[System.Management.Automation.Language.Parser]::ParseFile("
+        "$env:MAPLE_UPDATER_PARSE_PATH, [ref]$tokens, [ref]$errors) | Out-Null; "
+        "if ($errors.Count -gt 0) { "
+        "$errors | ForEach-Object { Write-Error $_.Message }; exit 1 }"
+    )
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            parser,
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "MAPLE_UPDATER_PARSE_PATH": str(script)},
+        timeout=15,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout

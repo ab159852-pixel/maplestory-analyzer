@@ -42,6 +42,14 @@ _STRINGS: dict[str, dict[Lang, str]] = {
         "en": "Stat panel is covered; live capture is unavailable",
         "zh": "狀態列被其他視窗遮擋，且即時擷取不可用",
     },
+    "status_error_target_capture": {
+        "en": "Target-window capture unavailable; retrying WGC",
+        "zh": "遊戲視窗背景擷取暫時無法使用，正在重試 WGC",
+    },
+    "context_capture_retrying": {
+        "en": "Retrying window capture…",
+        "zh": "正在重試背景視窗擷取…",
+    },
     # Fallback for anything NOT recognized above -- an actual bug, not a
     # known game-window state, so {detail} (the raw exception text) stays in
     # English rather than pretending to translate arbitrary Python errors.

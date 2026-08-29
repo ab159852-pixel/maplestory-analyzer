@@ -343,6 +343,37 @@ def test_real_game_font_shape_keeps_983_when_threshold_erases_9_loop():
     ) == 983
 
 
+def test_local_game_font_model_corrects_unanimous_1928_to_real_1328():
+    """Regression for the supplied 2560x1440 frame from v1.0.39."""
+    from PIL import Image
+
+    rows = (
+        0, 0, 0, 4064, 4064, 12312, 12312, 24, 24, 57368, 61464,
+        62432, 61465, 61465, 3993, 3992, 12312, 12312, 2016, 2016, 0, 0,
+    )
+    strip = _real_game_font_conflict_strip(rows, left=12)
+    assert ocr_module._correct_shortcut_game_font_3_9(strip, 1928) == 1328
+
+    class Numeric:
+        def read_digit_fields(self, images, *, max_digits=4):
+            return {name: "1928" for name in images}
+
+    # Rebuild a complete cell so the production quantity-strip crop sees the
+    # exact 34px-high sample in its normal 45%-95% vertical envelope.
+    cell = Image.new("RGB", (66, 68), "black")
+    cell.paste(strip, (0, 31))
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._numeric_engine = Numeric()
+    ocr._read_once = lambda _image: ("", [])
+
+    assert ocr._read_shortcut_numeric_batch(
+        {"6:False": ("6", cell)},
+        blue_slot_ids=set(),
+        previous_counts={},
+        live=True,
+    ) == {"6": 1328}
+
+
 def test_shortcut_numeric_views_reject_1359_to_1959_substitution_but_keep_correction():
     # 3 -> 9 in the hundreds place is the reported same-length upward OCR
     # substitution.  A correction such as 40 -> 80 must remain possible so a
@@ -477,6 +508,86 @@ def test_shortcut_numeric_batch_uses_colour_recovery_for_a_three_digit_cell():
     ) == {"8": 920}
 
 
+def test_same_width_primary_conflict_can_use_unanimous_taller_recovery():
+    """Regression for the supplied real 2855 shortcut frame."""
+    from PIL import Image
+
+    class Numeric:
+        def read_digit_fields(self, images, *, max_digits=4):
+            result = {}
+            for name in images:
+                view = name.rsplit(":", 1)[-1]
+                if name.startswith("shortcut-recovery:"):
+                    result[name] = "2855"
+                else:
+                    result[name] = "2859" if view == "raw-rgb" else "2855"
+            return result
+
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._numeric_engine = Numeric()
+    ocr._read_once = lambda _image: ("", [])
+    image = Image.new("RGB", (65, 66))
+
+    assert ocr._read_shortcut_numeric_batch(
+        {"6": ("6", image)},
+        blue_slot_ids=set(),
+        previous_counts={},
+        live=True,
+    ) == {"6": 2855}
+
+
+def test_blue_nested_views_recover_real_754_without_guessing():
+    values = [
+        (7544, "raw-rgb"),
+        (54, "raw-gray"),
+        (54, "raw-white170"),
+        (54, "raw-white180"),
+        (544, "raw-r"),
+        (544, "raw-g"),
+    ]
+
+    assert ocr_module._recover_shortcut_blue_prefix_and_border(
+        values,
+        previous=None,
+    ) == 754
+    # One channel vote is insufficient; preserve the prior value instead of
+    # fabricating a leading digit from a single noisy colour projection.
+    assert ocr_module._recover_shortcut_blue_prefix_and_border(
+        [item for item in values if item[1] != "raw-g"],
+        previous=None,
+    ) is None
+
+
+def test_blue_nested_views_override_truncated_threshold_selection_in_batch():
+    from PIL import Image
+
+    class Numeric:
+        def read_digit_fields(self, images, *, max_digits=4):
+            result = {}
+            for name in images:
+                view = name.rsplit(":", 1)[-1]
+                result[name] = {
+                    "raw-rgb": "7544",
+                    "raw-gray": "54",
+                    "raw-white170": "54",
+                    "raw-white180": "54",
+                    "raw-r": "544",
+                    "raw-g": "544",
+                }.get(view, "")
+            return result
+
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._numeric_engine = Numeric()
+    ocr._read_once = lambda _image: ("", [])
+
+    assert ocr._read_shortcut_numeric_batch(
+        {"7": ("7", Image.new("RGB", (65, 66)))},
+        blue_slot_ids={"7"},
+        previous_counts={},
+        live=True,
+    ) == {"7": 754}
+
+
 def test_live_shortcut_numeric_batch_uses_blue_channels_for_mp_cells():
     from PIL import Image
 
@@ -501,10 +612,11 @@ def test_live_shortcut_numeric_batch_uses_blue_channels_for_mp_cells():
     # Live tracking keeps the independent colour/threshold guard.  The MP
     # cell uses red/green projections instead of the blue-artwork-heavy RGB
     # projection, while HP remains the two-view fast path.
-    assert len(numeric.calls[0]) == 5
+    assert len(numeric.calls[0]) == 6
     assert {
         "shortcut:7:raw-r",
         "shortcut:7:raw-g",
+        "shortcut:7:raw-rgb",
         "shortcut:7:raw-white170",
     }.issubset(numeric.calls[0])
     assert len(numeric.calls) == 1
@@ -542,6 +654,7 @@ def test_live_blue_shortcut_reads_when_rgb_view_is_blank():
         live=True,
     ) == {"7": 1875}
     assert set(numeric.keys) == {
+        "shortcut:7:raw-rgb",
         "shortcut:7:raw-r",
         "shortcut:7:raw-g",
         "shortcut:7:raw-white170",

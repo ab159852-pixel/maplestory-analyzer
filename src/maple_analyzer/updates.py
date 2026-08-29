@@ -199,6 +199,7 @@ $success = $false
 $stage = Join-Path ([System.IO.Path]::GetTempPath()) ("MapleStoryAnalyzer-update-" + [guid]::NewGuid().ToString("N"))
 $backup = "$InstallDir.previous-" + [guid]::NewGuid().ToString("N")
 $newProcess = $null
+$parentProcess = $null
 function Write-UpdateStatus([string] $Message) {
     try {
         (Get-Date -Format o) + " " + $Message | Add-Content -LiteralPath $StatusPath -Encoding UTF8
@@ -294,6 +295,16 @@ try {
     [System.IO.Directory]::SetCurrentDirectory($helperWorkingDir)
     Set-Location -LiteralPath $helperWorkingDir
     Write-UpdateStatus ("helper-start install=" + $InstallDir + " exe=" + $ExeName + " expected=" + $ExpectedVersion)
+    # Capture the exact Process object while the launcher is still alive.
+    # Looking it up later only by executable path is insufficient: Windows can
+    # temporarily deny Get-Process.Path while WinRT/ONNX is tearing down, which
+    # previously left the old frozen process holding the install directory.
+    # Keeping this handle also avoids confusing a very unlikely reused PID with
+    # the application that actually started this helper.
+    $parentProcess = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if ($null -ne $parentProcess) {
+        Write-UpdateStatus ("parent-process-captured pid=" + $parentProcess.Id)
+    }
     if (-not (Test-Path -LiteralPath $ZipPath)) {
         throw "update archive does not exist: $ZipPath"
     }
@@ -329,20 +340,27 @@ try {
     }
     Write-UpdateStatus ("package-ready path=" + $targetExe)
 
-    for ($attempt = 0; $attempt -lt 12; $attempt++) {
-        if ($null -eq (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) { break }
-        Start-Sleep -Milliseconds 500
-    }
-    if ($null -ne (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
-        Write-UpdateStatus ("old-process-did-not-exit pid=" + $ProcessId)
+    if ($null -ne $parentProcess) {
+        try { $null = $parentProcess.WaitForExit(6000) } catch { }
+        try { $parentStillRunning = -not $parentProcess.HasExited } catch { $parentStillRunning = $false }
+        if ($parentStillRunning) {
+            Write-UpdateStatus ("force-stopping-parent-process pid=" + $parentProcess.Id)
+            try {
+                $parentProcess.Kill()
+                $null = $parentProcess.WaitForExit(5000)
+            } catch {
+                throw "the old application process could not be stopped: $($_.Exception.Message)"
+            }
+        }
+        try { $parentStillRunning = -not $parentProcess.HasExited } catch { $parentStillRunning = $false }
+        if ($parentStillRunning) {
+            throw "the old application process is still running after forced shutdown"
+        }
     }
     # Closing Tk can leave a frozen process alive while WinRT/ONNX tears down.
     # Clear every process whose executable is this exact install path before
     # attempting a directory rename or in-place replacement.
     Stop-InstallProcesses
-    if ($null -ne (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
-        throw "the old application did not exit and could not be stopped safely"
-    }
     Write-UpdateStatus "old-process-exited"
     Write-UpdateStatus "old-install-processes-cleared"
 

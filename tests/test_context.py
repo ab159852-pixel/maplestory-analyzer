@@ -144,6 +144,27 @@ def test_unconfirmed_generic_context_still_requires_two_scans():
     assert app._detected_map_name == "神秘森林"
 
 
+def test_repeated_generic_map_views_in_one_scan_are_not_immediate_confirmation():
+    """A foreground HUD label must not become a map from one OCR frame."""
+    class GenericMapOcr:
+        def read_field(self, _image):
+            return "每60分鐘預估經驗"
+
+        def read_lines(self, _image):
+            return []
+
+    reading = extract_context(
+        GenericMapOcr(),
+        {
+            "map": Image.new("RGB", (75, 20)),
+            "map_wide": Image.new("RGB", (110, 27)),
+        },
+    )
+
+    assert reading.map_name == "每60分鐘預估經驗"
+    assert reading.map_confirmed is False
+
+
 class _WeakMapOnlyOcr:
     def read_field(self, _image):
         return "軍/營"

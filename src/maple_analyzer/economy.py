@@ -82,6 +82,11 @@ MAX_SLOT_RECONCILE_DROP = MAX_SHORTCUT_QUANTITY
 HP_RECOVERY_MESOS_PER_POINT = 1.2
 MP_RECOVERY_MESOS_PER_POINT = 2.1
 MESOS_Y_MATCH_PX = 52.0
+# Dynamic row segmentation can miss one rendered toast during a fast scroll
+# even though the feed itself is still visible.  Retain an unmatched row for
+# one complete pickup sample before forgetting it; otherwise the same line is
+# counted again when it reappears 100-200ms later.
+MESOS_MISSING_GRACE_SCANS = 1
 
 
 def _is_probable_leading_digit_recovery(previous: int, current: int) -> bool:
@@ -242,6 +247,7 @@ class EconomySnapshot:
 class _VisibleMesos:
     amount: int
     y: float | None
+    misses: int = 0
 
 
 @dataclass
@@ -259,29 +265,47 @@ class MesosFeedTracker:
         self.events = 0
         self._visible: list[_VisibleMesos] = []
         self._initialized = False
+        self._empty_scans = 0
 
     def reset(self) -> None:
         self.total = 0
         self.events = 0
         self._visible.clear()
         self._initialized = False
+        self._empty_scans = 0
 
     def update(self, observations: Iterable[MesosObservation], now: float | None = None) -> int:
         del now  # kept in the signature for a future fade-time model
         current = list(observations)
         if not current:
-            # A genuinely empty feed is a strong boundary: an identical line
-            # appearing after this point is a new pickup, even if the amount
-            # happens to match the previous one.
-            self._visible.clear()
+            # A single empty segmentation is not a trustworthy boundary. A
+            # fast scroll/redraw can erase the thin white glyphs for exactly
+            # one 100-200ms sample, after which the same toast returns. The
+            # old immediate clear made that return look like a new pickup and
+            # charged it twice. Two consecutive empty scans still form the
+            # real boundary needed for a later identical amount to count.
+            if self._initialized:
+                self._empty_scans += 1
+                if self._empty_scans > MESOS_MISSING_GRACE_SCANS:
+                    self._visible.clear()
+                else:
+                    self._visible = [
+                        _VisibleMesos(item.amount, item.y, item.misses + 1)
+                        for item in self._visible
+                        if item.misses < MESOS_MISSING_GRACE_SCANS
+                    ]
+            else:
+                self._empty_scans = 0
             self._initialized = True
             return 0
 
         if not self._initialized:
             self._visible = [_VisibleMesos(item.amount, item.y) for item in current]
             self._initialized = True
+            self._empty_scans = 0
             return 0
 
+        self._empty_scans = 0
         unmatched = list(self._visible)
         new_total = 0
         new_events = 0
@@ -294,6 +318,14 @@ class MesosFeedTracker:
             else:
                 unmatched.pop(match_index)
             next_visible.append(_VisibleMesos(observation.amount, observation.y))
+        # Preserve a row that disappeared from only this segmentation result.
+        # It can then match the same amount/y trajectory on the next frame,
+        # while a genuinely missing row expires after the configured grace.
+        next_visible.extend(
+            _VisibleMesos(item.amount, item.y, item.misses + 1)
+            for item in unmatched
+            if item.misses < MESOS_MISSING_GRACE_SCANS
+        )
         self._visible = next_visible
         self.total += new_total
         self.events += new_events

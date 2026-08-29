@@ -52,8 +52,17 @@ from typing import Protocol
 
 import customtkinter as ctk
 
-from .capture import PANEL_OBSCURED, set_process_dpi_awareness
-from .diagnostics import install_exception_logging, install_tk_exception_logging, log_exception
+from .capture import (
+    PANEL_OBSCURED,
+    TARGET_WINDOW_CAPTURE_UNAVAILABLE,
+    set_process_dpi_awareness,
+)
+from .diagnostics import (
+    install_exception_logging,
+    install_tk_exception_logging,
+    log_exception,
+    log_message,
+)
 from .drop_lookup import (
     DropLookupError,
     MapDropSummary,
@@ -625,6 +634,11 @@ class OverlayApp:
             return self._t("status_error_not_found")
         if message == PANEL_OBSCURED or message.startswith(f"{PANEL_OBSCURED};"):
             return self._t("status_error_obscured")
+        if (
+            message == TARGET_WINDOW_CAPTURE_UNAVAILABLE
+            or message.startswith(f"{TARGET_WINDOW_CAPTURE_UNAVAILABLE};")
+        ):
+            return self._t("status_error_target_capture")
         return message
 
     def _render_update_status(self) -> None:
@@ -2522,12 +2536,18 @@ class OverlayApp:
         values = getattr(self, "_context_value_labels", {})
         if not values:
             return
+        context_error = str(getattr(self, "_context_error", "") or "")
+        placeholder_key = (
+            "context_capture_retrying"
+            if context_error.startswith(TARGET_WINDOW_CAPTURE_UNAVAILABLE)
+            else "context_unknown"
+        )
         job_label = values.get("job")
         map_label = values.get("map")
         if job_label is not None:
-            job_label.configure(text=self._current_job_name() or self._t("context_unknown"))
+            job_label.configure(text=self._current_job_name() or self._t(placeholder_key))
         if map_label is not None:
-            map_label.configure(text=self._current_map_name() or self._t("context_unknown"))
+            map_label.configure(text=self._current_map_name() or self._t(placeholder_key))
         floating_context = getattr(self, "_floating_context_label", None)
         if floating_context is not None:
             job = self._current_job_name() or self._t("context_unknown")
@@ -3113,7 +3133,15 @@ class OverlayApp:
             except queue.Empty:
                 break
             self._context_refresh_pending = False
+            previous_context_error = self._context_error
             self._context_error = reading.error
+            if reading.error and reading.error != previous_context_error:
+                # The frozen GUI has no console. Persist the exact WGC /
+                # PrintWindow reason once per transition so a failed target
+                # capture can be diagnosed instead of looking like slow OCR.
+                log_message("context capture unavailable", reading.error)
+            elif previous_context_error and not reading.error:
+                log_message("context capture recovered", "target window frame available")
             if reading.map_name:
                 self._accept_context_candidate(
                     "map",
