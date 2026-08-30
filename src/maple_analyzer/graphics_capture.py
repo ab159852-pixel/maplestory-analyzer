@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -45,6 +46,14 @@ class WindowsGraphicsCapture:
         self._lock = threading.Lock()
         self._frame_ready = threading.Event()
         self._pending_frame: Any | None = None
+        # The live status/economy paths must never reuse this image: a stalled
+        # capture would otherwise look like healthy, frozen telemetry.  The
+        # low-frequency map/job caller can opt in to a bounded reuse window,
+        # because it is better to keep a confirmed map label than turn it into
+        # "not detected" simply because the static game scene did not present
+        # another compositor frame.
+        self._last_image: Image.Image | None = None
+        self._last_image_at = 0.0
         self._closed = False
 
         try:
@@ -134,15 +143,20 @@ class WindowsGraphicsCapture:
                 self._frame_ready.clear()
             return frame
 
-    def grab(self, timeout: float = 0.8) -> Image.Image:
+    def grab(
+        self,
+        timeout: float = 0.8,
+        *,
+        allow_stale: bool = False,
+        max_stale_seconds: float = 0.0,
+    ) -> Image.Image:
         """Return a newly arrived frame.
 
-        A previous implementation returned ``_last_image`` when the frame
-        pool did not produce a frame before the timeout.  That made a stalled
-        capture look healthy to OCR: EXP, HP/MP and the economy counters all
-        stayed at the first successfully captured values forever.  A live
-        monitor must fail loudly on a stale compositor stream so the caller
-        can retry another backend or show the real capture error.
+        The default always requires a new frame.  This protects EXP, HP/MP,
+        and economy tracking from treating a stalled capture as live data.
+        The map/job context caller may explicitly opt in to a recent cached
+        target-window frame; it is low-frequency metadata, not accounting,
+        and receives a new frame first whenever one arrives.
         """
         frame = self._take_pending_frame()
         if frame is None:
@@ -150,6 +164,17 @@ class WindowsGraphicsCapture:
             frame = self._take_pending_frame()
 
         if frame is None:
+            if allow_stale:
+                with self._lock:
+                    last_image = getattr(self, "_last_image", None)
+                    last_at = float(getattr(self, "_last_image_at", 0.0))
+                    age = time.monotonic() - last_at
+                    if (
+                        last_image is not None
+                        and max_stale_seconds > 0
+                        and 0 <= age <= max_stale_seconds
+                    ):
+                        return last_image.copy()
             raise GraphicsCaptureError(
                 "Windows Graphics Capture did not return a new frame"
             )
@@ -162,6 +187,9 @@ class WindowsGraphicsCapture:
             with contextlib.suppress(Exception):
                 frame.close()
 
+        with self._lock:
+            self._last_image = image.copy()
+            self._last_image_at = time.monotonic()
         return image
 
     @staticmethod
@@ -199,6 +227,8 @@ class WindowsGraphicsCapture:
         with self._lock:
             pending = self._pending_frame
             self._pending_frame = None
+            self._last_image = None
+            self._last_image_at = 0.0
             self._frame_ready.set()
         if pending is not None:
             with contextlib.suppress(Exception):

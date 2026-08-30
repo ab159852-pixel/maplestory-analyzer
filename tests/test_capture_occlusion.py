@@ -113,7 +113,7 @@ def test_context_never_falls_back_to_foreground_desktop_pixels():
     capture = GameWindowCapture.__new__(GameWindowCapture)
     capture._client_rect_on_screen = lambda: (0, 0, 2560, 1440)
     capture._remember_capture_geometry = lambda *_args, **_kwargs: None
-    capture._try_window_frame = lambda _rect: None
+    capture._try_window_frame = lambda _rect, **_kwargs: None
     capture._target_window_capture_error = (
         lambda: f"{TARGET_WINDOW_CAPTURE_UNAVAILABLE}; WGC test failure"
     )

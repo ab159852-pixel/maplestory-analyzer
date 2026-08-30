@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import threading
+import time
 
 import pytest
 
@@ -199,3 +200,21 @@ def test_graphics_grab_never_returns_a_stale_last_frame():
 
     with pytest.raises(GraphicsCaptureError, match="new frame"):
         capture.grab(timeout=0.05)
+
+
+def test_graphics_grab_returns_a_recent_frame_only_when_context_opts_in():
+    capture = WindowsGraphicsCapture.__new__(WindowsGraphicsCapture)
+    capture._lock = threading.Lock()
+    capture._frame_ready = threading.Event()
+    capture._take_pending_frame = lambda: None
+    capture._last_image = Image.new("RGB", (3, 2), "#123456")
+    capture._last_image_at = time.monotonic()
+
+    result = capture.grab(
+        timeout=0.05,
+        allow_stale=True,
+        max_stale_seconds=1.0,
+    )
+
+    assert result.size == (3, 2)
+    assert result.getpixel((0, 0)) == (18, 52, 86)

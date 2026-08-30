@@ -829,7 +829,11 @@ class GameWindowCapture:
         return rect
 
     def _try_graphics_frame(
-        self, client_rect: tuple[int, int, int, int]
+        self,
+        client_rect: tuple[int, int, int, int],
+        *,
+        allow_stale: bool = False,
+        max_stale_seconds: float = 0.0,
     ) -> Image.Image | None:
         """Return a compositor-independent frame, or select desktop fallback."""
         if self._graphics_capture_disabled:
@@ -871,7 +875,14 @@ class GameWindowCapture:
                 # the first compositor frame.
                 self._graphics_capture = WindowsGraphicsCapture(hwnd, capture_size)
                 self._graphics_capture_size = capture_size
-            image = self._graphics_capture.grab(timeout=1.2)
+            if allow_stale:
+                image = self._graphics_capture.grab(
+                    timeout=1.2,
+                    allow_stale=True,
+                    max_stale_seconds=max_stale_seconds,
+                )
+            else:
+                image = self._graphics_capture.grab(timeout=1.2)
             item_size = getattr(self._graphics_capture, "item_size", None)
             frame = _crop_frame_to_client(
                 image,
@@ -983,11 +994,21 @@ class GameWindowCapture:
                     self._win32gui.ReleaseDC(hwnd, window_dc)
 
     def _try_window_frame(
-        self, client_rect: tuple[int, int, int, int]
+        self,
+        client_rect: tuple[int, int, int, int],
+        *,
+        allow_stale_graphics: bool = False,
     ) -> Image.Image | None:
         """Try compositor capture backends in priority order."""
         self._remember_capture_geometry(client_rect)
-        graphics = self._try_graphics_frame(client_rect)
+        graphics = self._try_graphics_frame(
+            client_rect,
+            allow_stale=allow_stale_graphics,
+            # Context is refreshed whenever the game redraws. A bounded cached
+            # target frame only covers clients that stop presenting while the
+            # player is idle; the status and economy paths never opt in.
+            max_stale_seconds=30.0 if allow_stale_graphics else 0.0,
+        )
         if graphics is not None:
             return graphics
         return self._try_print_window_frame(client_rect)
@@ -1279,7 +1300,10 @@ class GameWindowCapture:
     def _grab_context(self) -> dict[str, Image.Image]:
         client_rect = self._client_rect_on_screen()
         self._remember_capture_geometry(client_rect)
-        window_frame = self._try_window_frame(client_rect)
+        window_frame = self._try_window_frame(
+            client_rect,
+            allow_stale_graphics=True,
+        )
         if window_frame is not None:
             self.client_size = window_frame.size
             return {
