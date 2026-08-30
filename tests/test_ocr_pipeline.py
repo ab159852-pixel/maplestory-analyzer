@@ -877,7 +877,10 @@ def test_live_initial_baseline_uses_complete_views_for_real_1107_and_1134(
     ocr = StatPanelOcr.__new__(StatPanelOcr)
     ocr._numeric_engine = numeric
     ocr._read_once = lambda _image: ("", [])
-    ocr._shortcut_last_fast_counts = {}
+    # Reproduce the value left by the old lean live path. A freshly loaded
+    # configuration has no cell-image cache, so this pass must repair the
+    # stale suffix rather than treat 107 -> 1107 as a neighbouring-cell jump.
+    ocr._shortcut_last_fast_counts = {"6": 107, "7": 1134}
     ocr._shortcut_last_full_counts = {}
     ocr._shortcut_last_validation_at = 0.0
     ocr._shortcut_validation_signature = None

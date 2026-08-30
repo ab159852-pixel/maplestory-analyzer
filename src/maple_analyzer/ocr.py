@@ -520,6 +520,10 @@ class StatPanelOcr:
         # are the primary real-time signal; waiting for a full-bar detector
         # pass here can miss a 0.3-0.7s potion change. The general detector
         # remains available to callers that explicitly request validation.
+        # The numeric batch may establish one narrowly verified repair such as
+        # ``107 -> 1107``.  Reset this per sample so its evidence cannot be
+        # reused for a later, unrelated quantity transition.
+        self._shortcut_verified_leading_one_repair_slots: set[str] = set()
         if required:
             try:
                 fast_counts = self._read_shortcut_slot_counts(
@@ -540,7 +544,16 @@ class StatPanelOcr:
             # A temporary numeric miss must not trigger the expensive detector
             # on every 0.1–0.2s sample. Keep the last trusted quantity for the
             # missing cell and allow the next fast frame to recover it.
-            counts = _merge_fast_shortcut_counts(previous_counts, fast_counts, required)
+            counts = _merge_fast_shortcut_counts(
+                previous_counts,
+                fast_counts,
+                required,
+                verified_leading_one_repair_slots=getattr(
+                    self,
+                    "_shortcut_verified_leading_one_repair_slots",
+                    set(),
+                ),
+            )
             result = {slot: counts[slot] for slot in required if slot in counts}
             # Cache the merged/trusted result, not the raw candidate map.  If
             # a frame is rejected (for example 1359 -> 1959), caching the
@@ -799,6 +812,7 @@ class StatPanelOcr:
         with an independent colour view; a disagreement is unreadable rather
         than a reason to guess a new inventory quantity.
         """
+        self._shortcut_verified_leading_one_repair_slots = set()
         numeric_engine = getattr(self, "_numeric_engine", None)
         if numeric_engine is None or not pending:
             return {}
@@ -865,6 +879,7 @@ class StatPanelOcr:
             candidates.setdefault(owners.get(key, ""), []).append((value, view_name))
 
         result: dict[str, int] = {}
+        verified_leading_one_repairs: set[str] = set()
         hard_conflict_slots: set[str] = set()
         for slot_id, values in candidates.items():
             if not slot_id:
@@ -889,6 +904,16 @@ class StatPanelOcr:
                     # a value only when colour and white-threshold views agree
                     # after the missing leading ones are put back.
                     selected = leading_one_value
+                    previous = (previous_counts or {}).get(slot_id)
+                    if (
+                        previous is not None
+                        and _shortcut_leading_one_recovery_transition_is_usable(
+                            previous,
+                            leading_one_value,
+                            _shortcut_leading_one_count(strip),
+                        )
+                    ):
+                        verified_leading_one_repairs.add(slot_id)
             if slot_id in blue_slot_ids:
                 blue_prefix_value = _recover_shortcut_blue_prefix_and_border(
                     values,
@@ -918,6 +943,14 @@ class StatPanelOcr:
                     and not _shortcut_numeric_transition_is_usable(
                         previous,
                         selected,
+                    )
+                    and not (
+                        leading_one_value == selected
+                        and _shortcut_leading_one_recovery_transition_is_usable(
+                            previous,
+                            selected,
+                            _shortcut_leading_one_count(strip),
+                        )
                     )
                 ):
                     continue
@@ -1111,6 +1144,17 @@ class StatPanelOcr:
                 continue
             selected = _correct_shortcut_game_font_3_9(strip, selected)
             result[slot_id] = selected
+            previous = (previous_counts or {}).get(slot_id)
+            if (
+                previous is not None
+                and _shortcut_leading_one_recovery_transition_is_usable(
+                    previous,
+                    selected,
+                    _shortcut_leading_one_count(strip),
+                )
+            ):
+                verified_leading_one_repairs.add(slot_id)
+        self._shortcut_verified_leading_one_repair_slots = verified_leading_one_repairs
         return result
 
     def _read_shortcut_quantity_strip(
@@ -2329,9 +2373,10 @@ def _recover_shortcut_leading_ones(
         if len(reconstructed_text) - len(reconstructed_text.lstrip("1")) != leading_count:
             continue
         reconstructed = int(reconstructed_text)
-        if previous is not None and not _shortcut_numeric_transition_is_usable(
+        if previous is not None and not _shortcut_leading_one_recovery_transition_is_usable(
             previous,
             reconstructed,
+            leading_count,
         ):
             continue
         name = str(view_name)
@@ -2341,7 +2386,28 @@ def _recover_shortcut_leading_ones(
         elif not name.startswith("soft-"):
             colour_votes.setdefault(reconstructed, set()).add(name)
 
-    recovered = {
+    # Ordinarily a white-glyph result still needs independent colour support:
+    # that prevents a thresholding artefact from becoming a new quantity.  A
+    # remembered suffix is a special, locally provable case.  For example, if
+    # the previous trusted reading was 107, the strip contains exactly two
+    # leading one glyphs, and both white thresholds read 1107, the two
+    # thresholds plus the measured glyph count are stronger evidence than a
+    # colour view that lost the narrow leading stroke.  Keep this exception
+    # structural so it cannot admit an unrelated upward value.
+    threshold_suffix_repairs = {
+        value
+        for value, witnesses in threshold_votes.items()
+        if (
+            previous is not None
+            and len(witnesses) >= 2
+            and _shortcut_leading_one_recovery_transition_is_usable(
+                previous,
+                value,
+                leading_count,
+            )
+        )
+    }
+    recovered = threshold_suffix_repairs | {
         value
         for value in threshold_votes.keys() | colour_votes.keys()
         if (
@@ -2353,6 +2419,36 @@ def _recover_shortcut_leading_ones(
     if len(recovered) != 1:
         return None
     return next(iter(recovered))
+
+
+def _shortcut_leading_one_recovery_transition_is_usable(
+    previous: int,
+    recovered: int,
+    leading_count: int,
+) -> bool:
+    """Allow a locally verified leading-one repair past the generic jump guard.
+
+    The ordinary transition guard correctly rejects ``107 -> 1107`` as a
+    possible neighbouring-cell merge.  When the quantity strip itself proves
+    the additional leading ``1`` glyph, however, that exact expansion is the
+    repair we need.  Keep the exception structural: the recovered text must
+    be the old text with only the locally counted missing leading ones added.
+    No other upward OCR change is admitted through this path.
+    """
+    if _shortcut_numeric_transition_is_usable(previous, recovered):
+        return True
+    if not isinstance(leading_count, int) or not 1 <= leading_count <= 4:
+        return False
+    previous_text = str(previous)
+    recovered_text = str(recovered)
+    previous_leading = len(previous_text) - len(previous_text.lstrip("1"))
+    recovered_leading = len(recovered_text) - len(recovered_text.lstrip("1"))
+    missing = recovered_leading - previous_leading
+    return (
+        recovered_leading == leading_count
+        and missing >= 1
+        and recovered_text == "1" * missing + previous_text
+    )
 
 
 def _classify_shortcut_game_font_3_or_9(
@@ -2773,9 +2869,20 @@ def _shortcut_numeric_transition_is_usable(previous: int, current: int) -> bool:
 
 
 def _merge_fast_shortcut_counts(
-    cached: dict[str, int], fast: dict[str, int], required: set[str]
+    cached: dict[str, int],
+    fast: dict[str, int],
+    required: set[str],
+    *,
+    verified_leading_one_repair_slots: Iterable[str] = (),
 ) -> dict[str, int]:
-    """Merge low-latency cell reads without publishing OCR jumps."""
+    """Merge low-latency cell reads without publishing OCR jumps.
+
+    ``verified_leading_one_repair_slots`` is generated only by the numeric
+    batch after it has measured the local glyph count and corroborated the
+    repaired text.  It permits that one proof-carrying suffix expansion past
+    the generic jump guard; callers cannot enable it from a raw integer.
+    """
+    verified_repairs = {str(slot) for slot in verified_leading_one_repair_slots}
     result: dict[str, int] = {}
     for slot in required:
         current = fast.get(slot)
@@ -2783,7 +2890,11 @@ def _merge_fast_shortcut_counts(
         if current is None:
             if previous is not None:
                 result[slot] = previous
-        elif previous is None or _is_probable_shortcut_ocr_change(previous, current):
+        elif (
+            previous is None
+            or slot in verified_repairs
+            or _is_probable_shortcut_ocr_change(previous, current)
+        ):
             result[slot] = current
         elif previous is not None:
             result[slot] = previous
