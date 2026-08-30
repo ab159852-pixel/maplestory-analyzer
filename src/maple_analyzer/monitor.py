@@ -573,29 +573,45 @@ def extract_context(ocr: Any, regions: dict[str, Any]) -> ContextReading:
         regions.get("map_wide"),
     ]
     map_images = [image for image in map_images if image is not None]
-    # First read only the enlarged focused/wide views.  In real captures these
-    # two views already recover the numbered prefix or Roman floor suffix.  The
-    # previous implementation also read both tiny originals before checking
-    # the result, doubling startup latency even when the answer was complete.
-    for image in map_images:
+    # The supplied 2K game frame preserves ``寺院通道Ⅱ`` in the focused native
+    # crop, while enlarging it turns the floor marker into ``川`` or removes it.
+    # Read that one cheap native crop first and stop immediately when it already
+    # carries a numbered map/floor suffix.  Enlarged/wide retries remain for
+    # clients whose native text is too small (for example 第3軍營).
+    native_map_images_read = 0
+    if map_images:
         try:
-            from PIL import Image
-            resampling = getattr(getattr(Image, "Resampling", Image), "BICUBIC", 3)
-            enlarged = image.resize((image.width * 8, image.height * 8), resampling)
-            map_lines.append(ocr.read_field(enlarged))
+            map_lines.append(ocr.read_field(map_images[0]))
+            native_map_images_read = 1
         except Exception:
             pass
 
     map_candidates = _context_candidates(map_lines, kind="map")
     if not _has_strong_map_candidate(map_candidates):
-        # Tiny originals are a cheap secondary vote for generic map names.  Do
-        # not pay for them after a complete numbered/floor result is available.
         for image in map_images:
+            try:
+                from PIL import Image
+                resampling = getattr(getattr(Image, "Resampling", Image), "BICUBIC", 3)
+                enlarged = image.resize((image.width * 8, image.height * 8), resampling)
+                map_lines.append(ocr.read_field(enlarged))
+            except Exception:
+                pass
+            map_candidates = _context_candidates(map_lines, kind="map")
+            if _has_strong_map_candidate(map_candidates):
+                break
+
+    map_candidates = _context_candidates(map_lines, kind="map")
+    if not _has_strong_map_candidate(map_candidates):
+        # The wider native crop is a cheap secondary vote for generic map
+        # names.  Do not repeat the focused native crop already read above.
+        for image in map_images[native_map_images_read:]:
             try:
                 map_lines.append(ocr.read_field(image))
             except Exception:
                 pass
-        map_candidates = _context_candidates(map_lines, kind="map")
+            map_candidates = _context_candidates(map_lines, kind="map")
+            if _has_strong_map_candidate(map_candidates):
+                break
     if not _has_strong_map_candidate(map_candidates) and map_images:
         # A single contrast retry is cheaper than running detection on every
         # context tick and helps when the game window is dimmed or partially
@@ -643,20 +659,24 @@ def extract_context(ocr: Any, regions: dict[str, Any]) -> ContextReading:
             image.width,
             image.height,
         ))
-        try:
-            from PIL import Image
-            resampling = getattr(getattr(Image, "Resampling", Image), "BICUBIC", 3)
-            enlarged = job_focus.resize(
-                (job_focus.width * 8, job_focus.height * 8),
-                resampling,
-            )
-            job_lines.append(job_reader(enlarged))
-        except Exception:
-            pass
+        # Native-first is both faster and more accurate on the supplied 2K
+        # frame (俠盜); the enlarged view also captures the character name and
+        # costs another ~650ms.  Keep it only as a fallback for tiny clients.
         try:
             job_lines.append(job_reader(job_focus))
         except Exception:
             pass
+        if not _context_candidates(job_lines, kind="job"):
+            try:
+                from PIL import Image
+                resampling = getattr(getattr(Image, "Resampling", Image), "BICUBIC", 3)
+                enlarged = job_focus.resize(
+                    (job_focus.width * 8, job_focus.height * 8),
+                    resampling,
+                )
+                job_lines.append(job_reader(enlarged))
+            except Exception:
+                pass
         # Do not pay for detection when the focused recognition crop already
         # produced a usable class.  This keeps background context available
         # quickly after startup; detection remains the fallback for clients

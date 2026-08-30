@@ -53,6 +53,10 @@ from .regions import (
 # minimized/not-found states -- see overlay._do_tick and _localize_error.
 PANEL_OBSCURED = "stat panel is obscured"
 TARGET_WINDOW_CAPTURE_UNAVAILABLE = "target window capture is unavailable"
+_NON_GAME_WINDOW_PROCESSES = {
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
+    "explorer.exe", "codex.exe", "discord.exe",
+}
 
 
 def set_process_dpi_awareness() -> None:
@@ -558,6 +562,13 @@ class GameWindowCapture:
         self._win32con = win32con
         self._mss = mss.mss()
         self._title_substring = title_substring
+        # The Traditional Chinese client normally uses ``新楓之谷：經典版``;
+        # some launchers/devices expose the same game window as ``MapleStory``.
+        # Keep both discoverable, while the process/geometry checks below stop
+        # browser tabs and Explorer folders with similar text from matching.
+        self._title_tokens = tuple(
+            dict.fromkeys(token for token in (title_substring, "MapleStory") if token)
+        )
         self._process_name = process_name.lower()
         self._hwnd: int | None = None
         # Last client size seen by grab_fields, for the overlay to log. Every
@@ -717,13 +728,34 @@ class GameWindowCapture:
 
     def _is_match(self, hwnd: int) -> bool:
         title = self._win32gui.GetWindowText(hwnd)
-        if self._title_substring not in title:
+        title_tokens = getattr(self, "_title_tokens", (self._title_substring,))
+        if not any(token.casefold() in title.casefold() for token in title_tokens):
             return False
         owner = self._owning_process_name(hwnd).lower()
         # Anti-tamper protected clients can deny GetModuleFileNameEx even
         # though the title is an exact game-window match.  Do not make that
         # harmless query failure look like "game window not found".
-        return not owner or self._process_name in owner
+        if not owner or self._process_name in owner:
+            return True
+
+        # Portable/private clients may rename the executable while retaining
+        # the native game title.  Requiring the old process name made context
+        # OCR wait forever even though the correct 2K window was visible.  A
+        # title-only fallback is safe only for a large native-looking client
+        # and never for known browser/shell processes.
+        owner_name = owner.rsplit("\\", 1)[-1]
+        if owner_name in _NON_GAME_WINDOW_PROCESSES:
+            return False
+        stripped_title = title.strip()
+        if not any(stripped_title.casefold().startswith(token.casefold()) for token in title_tokens):
+            return False
+        try:
+            left, top, right, bottom = self._win32gui.GetClientRect(hwnd)
+            width = right - left
+            height = bottom - top
+        except Exception:
+            return False
+        return width >= 640 and height >= 480
 
     def _find_window(self) -> int:
         # IsWindow() alone isn't enough: if the game process exits, Windows can
@@ -742,7 +774,12 @@ class GameWindowCapture:
 
         self._win32gui.EnumWindows(_cb, None)
         if not found:
-            raise RuntimeError(f"No window found with title containing {self._title_substring!r}")
+            expected = " or ".join(repr(token) for token in getattr(
+                self,
+                "_title_tokens",
+                (self._title_substring,),
+            ))
+            raise RuntimeError(f"No usable game window found with title containing {expected}")
         self._hwnd = found[0]
         return self._hwnd
 

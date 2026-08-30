@@ -858,6 +858,21 @@ class StatPanelOcr:
                 values,
                 previous=(previous_counts or {}).get(slot_id),
             )
+            if strip is not None:
+                leading_one_value = _recover_shortcut_leading_ones(
+                    strip,
+                    values,
+                    previous=(previous_counts or {}).get(slot_id),
+                )
+                if leading_one_value is not None:
+                    # MapleStory's proportional font makes every leading ``1``
+                    # narrower than the other digits.  Generic CTC OCR can
+                    # therefore drop one of several consecutive ones (1117 ->
+                    # 117) or shift the following glyphs.  The local font
+                    # geometry is independent of those OCR votes and restores
+                    # a value only when colour and white-threshold views agree
+                    # after the missing leading ones are put back.
+                    selected = leading_one_value
             if slot_id in blue_slot_ids:
                 blue_prefix_value = _recover_shortcut_blue_prefix_and_border(
                     values,
@@ -967,6 +982,7 @@ class StatPanelOcr:
             recovery_pending[slot_key] = item
         self._shortcut_live_recovery_at = recovery_at
 
+        recovery_candidates: dict[str, list[tuple[int, str]]] = {}
         if recovery_pending:
             recovery_batch: dict[str, Image.Image] = {}
             recovery_owners: dict[str, str] = {}
@@ -979,17 +995,28 @@ class StatPanelOcr:
                     blue=slot_id in blue_slot_ids,
                 )
                 if live:
-                    # The recovery selector intentionally ignores white
-                    # threshold views and requires independent colour views
-                    # to agree.  Do not spend an ONNX pass constructing those
-                    # threshold images in the high-frequency worker: the
-                    # live blue-cell recovery needs RGB/gray/R/G (and HP
-                    # needs RGB/gray) only.
-                    recovery_views = [
-                        (view_name, view)
-                        for view_name, view in recovery_views
-                        if not _numeric_view_base_name(view_name).startswith("white")
-                    ]
+                    if slot_id in blue_slot_ids:
+                        # Blue artwork needs the independent RGB/gray/R/G
+                        # projections.  Threshold views are already present in
+                        # its primary live batch.
+                        recovery_views = [
+                            (view_name, view)
+                            for view_name, view in recovery_views
+                            if not _numeric_view_base_name(view_name).startswith("white")
+                        ]
+                    else:
+                        # Keep one white-threshold witness for an unresolved HP
+                        # cell.  On the supplied 2K frame, the taller RGB and
+                        # white170 views both read the visible suffix ``117``
+                        # while gray reads ``1172``.  RGB + white170 is enough
+                        # for the local leading-one geometry to restore 1117;
+                        # dropping every threshold view made slot 6 stay blank.
+                        recovery_views = [
+                            (view_name, view)
+                            for view_name, view in recovery_views
+                            if _numeric_view_base_name(view_name)
+                            in {"rgb", "gray", "white170"}
+                        ]
                 for view_name, view in recovery_views:
                     key_view_name = view_name
                     if not callable(getattr(numeric_engine, "read_digit_fields", None)):
@@ -1009,7 +1036,6 @@ class StatPanelOcr:
                         recovery_texts = numeric_engine.read_fields(recovery_batch)
                 except Exception:
                     recovery_texts = {}
-                recovery_candidates: dict[str, list[tuple[int, str]]] = {}
                 for key, text in recovery_texts.items():
                     if not _numeric_shortcut_text_is_usable(text):
                         continue
@@ -1046,6 +1072,29 @@ class StatPanelOcr:
                             selected = None
                     if selected is not None:
                         result[slot_id] = selected
+
+        # The primary strip is the reliable source of proportional glyph
+        # positions, while the taller retry can be the only OCR view that keeps
+        # the suffix after several narrow leading ones.  Combine both evidence
+        # sets only for cells still unresolved by the normal selectors.  This
+        # runs after the 300ms recovery throttle and never touches unconfigured
+        # shortcut cells.
+        for slot_id, strip in quantity_strips.items():
+            if slot_id in result:
+                continue
+            combined = [
+                *candidates.get(slot_id, []),
+                *recovery_candidates.get(slot_id, []),
+            ]
+            selected = _recover_shortcut_leading_ones(
+                strip,
+                combined,
+                previous=(previous_counts or {}).get(slot_id),
+            )
+            if selected is None:
+                continue
+            selected = _correct_shortcut_game_font_3_9(strip, selected)
+            result[slot_id] = selected
         return result
 
     def _read_shortcut_quantity_strip(
@@ -2016,6 +2065,22 @@ _SHORTCUT_GLYPH_NORMALIZED_HEIGHT = 34
 _SHORTCUT_GLYPH_TARGET_HEIGHT = 22
 _SHORTCUT_GLYPH_TARGET_WIDTH = 16
 
+# First-position ``1`` glyphs from four real 2560x1440 shortcut quantities:
+# 1328, 1265, 1117 and 1135.  Only first-position samples are kept here.  They
+# include both dark and blue item backgrounds but do not bake a guessed value
+# into the classifier; the following OCR suffix still has to be corroborated
+# by independent colour and threshold views before a quantity is returned.
+_SHORTCUT_GAME_FONT_1_ROWS: tuple[tuple[int, ...], ...] = (
+    (0, 0, 0, 1543, 1543, 15896, 15896, 1536, 1536, 1648, 1656, 1657,
+     1656, 1656, 1543, 1543, 1560, 1560, 515, 515, 0, 0),
+    (4095, 240, 240, 3279, 3279, 31792, 31792, 3087, 3087, 3327, 3327,
+     3324, 3315, 3315, 3276, 3276, 3120, 3120, 1055, 1055, 0, 0),
+    (0, 0, 0, 1537, 1537, 15903, 15903, 1537, 1537, 1649, 1657, 1657,
+     1657, 1657, 1657, 1657, 1537, 1537, 512, 512, 0, 0),
+    (4095, 252, 252, 3267, 3267, 31807, 31807, 3075, 3075, 3315, 3315,
+     3315, 3315, 3315, 3315, 3315, 3075, 3075, 1025, 1025, 0, 0),
+)
+
 
 @lru_cache(maxsize=1)
 def _shortcut_game_font_3_9_templates() -> dict[str, tuple[Any, ...]]:
@@ -2035,6 +2100,78 @@ def _shortcut_game_font_3_9_templates() -> dict[str, tuple[Any, ...]]:
             for rows in templates
         )
     return decoded
+
+
+@lru_cache(maxsize=1)
+def _shortcut_game_font_1_templates() -> tuple[Any, ...]:
+    """Decode real narrow-one templates once, outside the 0.2s worker."""
+    import numpy as np
+
+    return tuple(
+        np.asarray(
+            [
+                [bool(row & (1 << (15 - column))) for column in range(16)]
+                for row in rows
+            ],
+            dtype=bool,
+        )
+        for rows in _SHORTCUT_GAME_FONT_1_ROWS
+    )
+
+
+def _shortcut_leading_one_target(
+    image: Image.Image,
+    digit_index: int,
+) -> Any | None:
+    """Normalize one expected leading-one position before thresholding.
+
+    Resizing the antialiased grayscale strip *before* thresholding is important:
+    threshold-first nearest-neighbour scaling loses the second/third narrow one
+    at 1080p and 4K-like scales.  This path is separate from the 3/9 classifier
+    so its DPI normalization cannot change already-verified 3/9 behavior.
+    """
+    try:
+        import numpy as np
+
+        gray = ImageOps.autocontrast(ImageOps.grayscale(image))
+        width, height = gray.size
+        if width <= 1 or height <= 1 or not 0 <= digit_index <= 3:
+            return None
+        if height != _SHORTCUT_GLYPH_NORMALIZED_HEIGHT:
+            normalized_width = max(
+                2,
+                round(width * _SHORTCUT_GLYPH_NORMALIZED_HEIGHT / height),
+            )
+            gray = gray.resize(
+                (normalized_width, _SHORTCUT_GLYPH_NORMALIZED_HEIGHT),
+                getattr(Image, "Resampling", Image).LANCZOS,
+            )
+        mask = gray.point(lambda pixel: 255 if pixel >= 170 else 0)
+        pixels = np.asarray(mask, dtype=np.uint8) > 0
+        anchor = 4 + 9 * digit_index
+        left = anchor - 1
+        target = np.zeros(
+            (_SHORTCUT_GLYPH_TARGET_HEIGHT, _SHORTCUT_GLYPH_TARGET_WIDTH),
+            dtype=bool,
+        )
+        source_left = max(0, left)
+        source_right = min(pixels.shape[1], left + _SHORTCUT_GLYPH_TARGET_WIDTH)
+        if source_right <= source_left:
+            return None
+        destination_left = max(0, -left)
+        source = pixels[
+            :_SHORTCUT_GLYPH_TARGET_HEIGHT,
+            source_left:source_right,
+        ]
+        target[
+            :source.shape[0],
+            destination_left:destination_left + source.shape[1],
+        ] = source
+        if int(target.sum()) < 16:
+            return None
+        return target
+    except Exception:
+        return None
 
 
 def _shortcut_game_font_target(
@@ -2114,6 +2251,92 @@ def _shortcut_shifted_dice(left: Any, right: Any) -> float:
         return best
     except Exception:
         return 0.0
+
+
+def _shortcut_leading_one_count(image: Image.Image) -> int:
+    """Return the verified contiguous leading-one run in a quantity strip."""
+    templates = _shortcut_game_font_1_templates()
+    # 1080p-like strips contain fewer antialiased pixels after normalization;
+    # 0.56 keeps all twelve supplied real cells separated at that scale.  At
+    # native 2K and larger, 0.58 gives more protection against a non-one first
+    # glyph (the closest real negative sample scores 0.556).
+    minimum_score = 0.56 if image.height < 30 else 0.58
+    count = 0
+    for index in range(4):
+        target = _shortcut_leading_one_target(image, index)
+        if target is None:
+            break
+        score = max(
+            (_shortcut_shifted_dice(target, template) for template in templates),
+            default=0.0,
+        )
+        if score < minimum_score:
+            break
+        count += 1
+    return count
+
+
+def _recover_shortcut_leading_ones(
+    image: Image.Image,
+    candidates: Iterable[tuple[int, str]],
+    *,
+    previous: int | None,
+) -> int | None:
+    """Restore leading ones dropped by proportional-font OCR without guessing.
+
+    The local pixel classifier decides only how many *contiguous leading* ones
+    are present.  It never supplies the remaining digits.  Those still come
+    from OCR and must reconstruct the same bounded value in at least one colour
+    and one white-threshold view (or three colour views).  For example, the
+    supplied slot-6 frame has three verified leading ones while RGB and
+    white170 independently read ``117``; prepending one missing one yields
+    1117.  Competing 1172/1722 reads exceed four digits after reconstruction
+    and are rejected.
+    """
+    leading_count = _shortcut_leading_one_count(image)
+    if leading_count <= 0:
+        return None
+
+    threshold_votes: dict[int, set[str]] = {}
+    colour_votes: dict[int, set[str]] = {}
+    for value, view_name in candidates:
+        if not isinstance(value, int) or not 0 <= value <= MAX_SHORTCUT_QUANTITY:
+            continue
+        text = str(value)
+        candidate_leading = len(text) - len(text.lstrip("1"))
+        missing = leading_count - candidate_leading
+        if missing < 0:
+            continue
+        reconstructed_text = "1" * missing + text
+        if len(reconstructed_text) > 4:
+            continue
+        if len(reconstructed_text) - len(reconstructed_text.lstrip("1")) != leading_count:
+            continue
+        reconstructed = int(reconstructed_text)
+        if previous is not None and not _shortcut_numeric_transition_is_usable(
+            previous,
+            reconstructed,
+        ):
+            continue
+        name = str(view_name)
+        base_name = _numeric_view_base_name(name)
+        if base_name.startswith("white"):
+            threshold_votes.setdefault(reconstructed, set()).add(name)
+        elif not name.startswith("soft-"):
+            colour_votes.setdefault(reconstructed, set()).add(name)
+
+    recovered = {
+        value
+        for value in threshold_votes.keys() | colour_votes.keys()
+        if (
+            len(threshold_votes.get(value, set())) >= 1
+            and len(colour_votes.get(value, set())) >= 1
+        )
+        or len(colour_votes.get(value, set())) >= 3
+    }
+    if len(recovered) != 1:
+        return None
+    return next(iter(recovered))
 
 
 def _classify_shortcut_game_font_3_or_9(

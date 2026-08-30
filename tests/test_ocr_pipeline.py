@@ -19,6 +19,45 @@ from maple_analyzer.parser import parse_fields
 from conftest import SAMPLE_IMAGE
 
 
+# Threshold masks extracted from the user's pure 2560x1440 game capture.  The
+# complete measured cells show slot 6 = 1117 and slot 7 = 1135.  Keeping the
+# compact rows in source makes this regression portable without depending on a
+# OneDrive path or checking a multi-megabyte desktop BMP into the repository.
+_REAL_1117_MASK_ROWS = (
+    0x1E007C0, 0x7C0, 0x1FC0, 0x300C061FFC01FC0,
+    0x300C061FFC1FFC0, 0x1F0FC3E000C1FFC0, 0x1F0FC3E000CFFFC0,
+    0x300C060031FFFC0, 0x300C060033FFFC0, 0x338C060033FFFC0,
+    0x33CC063FB3FFFC0, 0x33CC063ECFFFFC0, 0x33CCF67ECFFFFC0,
+    0x33CCF67ECFFFFC0, 0x33CCF6391FFFF00, 0x33CC06010000000,
+    0x300C06010000000, 0x300C06010000000, 0x100402020000000,
+    0x100402020000000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x3FFFFFFFFFFFFFFFF, 0x3FFFFFFFFFFFFFFFF,
+)
+_REAL_1135_MASK_ROWS = (
+    0x3FFFF0000000000, 0x3F0F0000000000, 0x3F0F0000000000,
+    0x330CCFE07FF0000, 0x330CCFE07FF0000, 0x1F0FC30186000000,
+    0x1F0FC30186000000, 0x300C00186000000, 0x300C00186000120,
+    0x33CCF0187FC0120, 0x33CCF0187FC0020, 0x33CCF3E00030020,
+    0x33CCF01800300E0, 0x33CCF01800300E0, 0x33CC0F980030080,
+    0x33CC0F980030080, 0x300C30082010000, 0x300C30082010000,
+    0x100407E00FC0000, 0x100407E00FC0000, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0x1FFFFFFFFFFFFFFFF, 0x1FFFFFFFFFFFFFFFF,
+)
+
+
+def _shortcut_mask_image(width, rows):
+    from PIL import Image
+
+    pixels = [
+        255 if row & (1 << (width - 1 - column)) else 0
+        for row in rows
+        for column in range(width)
+    ]
+    image = Image.new("L", (width, len(rows)))
+    image.putdata(pixels)
+    return image.convert("RGB")
+
+
 @pytest.fixture(scope="module")
 def ocr_engine():
     return StatPanelOcr()  # loads the ONNX model once, reused across tests in this file
@@ -246,6 +285,114 @@ def test_shortcut_numeric_views_prefer_clean_threshold_consensus_and_reject_conf
         previous=None,
         minimum_votes=3,
     ) is None
+
+
+@pytest.mark.parametrize(
+    ("width", "rows", "expected"),
+    [
+        (66, _REAL_1117_MASK_ROWS, 3),
+        (65, _REAL_1135_MASK_ROWS, 2),
+    ],
+)
+def test_real_proportional_shortcut_font_counts_leading_ones_across_scales(
+    width,
+    rows,
+    expected,
+):
+    from PIL import Image
+
+    image = _shortcut_mask_image(width, rows)
+    assert ocr_module._shortcut_leading_one_count(image) == expected
+    # 0.75x approximates a 1080p client relative to the supplied 2K crop;
+    # 1.25x exercises the inverse normalization used by a larger client.
+    for factor in (0.75, 1.25):
+        resized = image.resize(
+            (
+                max(2, round(image.width * factor)),
+                max(2, round(image.height * factor)),
+            ),
+            Image.Resampling.BILINEAR,
+        )
+        assert ocr_module._shortcut_leading_one_count(resized) == expected
+
+
+def test_live_shortcut_recovery_restores_real_1117_and_keeps_white_witness(monkeypatch):
+    from PIL import Image
+
+    class Numeric:
+        def __init__(self):
+            self.calls = []
+
+        def read_digit_fields(self, images, *, max_digits=4):
+            del max_digits
+            self.calls.append(tuple(images))
+            result = {}
+            for key in images:
+                view = key.rsplit(":", 1)[-1]
+                if key.startswith("shortcut-recovery:"):
+                    result[key] = {
+                        "raw-rgb": "117",
+                        "raw-gray": "1172",
+                        "raw-white170": "117",
+                    }.get(view, "")
+                else:
+                    result[key] = {
+                        "raw-rgb": "1722",
+                        "raw-white170": "147",
+                    }.get(view, "")
+            return result
+
+    numeric = Numeric()
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._numeric_engine = numeric
+    ocr._read_once = lambda _image: ("", [])
+    ocr._shortcut_live_recovery_at = {}
+    strip = _shortcut_mask_image(66, _REAL_1117_MASK_ROWS)
+    monkeypatch.setattr(ocr_module, "_shortcut_quantity_strip", lambda image: image)
+    monkeypatch.setattr(
+        ocr_module,
+        "_shortcut_quantity_recovery_strip",
+        lambda image: image,
+    )
+
+    assert ocr._read_shortcut_numeric_batch(
+        {"6:False": ("6", strip)},
+        blue_slot_ids=set(),
+        previous_counts={},
+        live=True,
+    ) == {"6": 1117}
+    assert len(numeric.calls) == 2
+    assert "shortcut-recovery:6:raw-white170" in numeric.calls[1]
+
+
+def test_live_blue_shortcut_uses_real_1135_leading_one_geometry(monkeypatch):
+    class Numeric:
+        def read_digit_fields(self, images, *, max_digits=4):
+            del max_digits
+            values = {
+                "raw-rgb": "1135",
+                "raw-r": "1135",
+                "raw-g": "1352",
+                "raw-white170": "1135",
+            }
+            return {
+                key: values.get(key.rsplit(":", 1)[-1], "")
+                for key in images
+            }
+
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._numeric_engine = Numeric()
+    ocr._read_once = lambda _image: ("", [])
+    ocr._shortcut_live_recovery_at = {}
+    strip = _shortcut_mask_image(65, _REAL_1135_MASK_ROWS)
+    monkeypatch.setattr(ocr_module, "_shortcut_quantity_strip", lambda image: image)
+
+    assert ocr._read_shortcut_numeric_batch(
+        {"7:True": ("7", strip)},
+        blue_slot_ids={"7"},
+        previous_counts={},
+        live=True,
+    ) == {"7": 1135}
 
 
 def test_independent_text_model_resolves_real_3_vs_9_quantity_conflict():

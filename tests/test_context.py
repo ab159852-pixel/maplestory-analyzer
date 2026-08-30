@@ -103,7 +103,7 @@ def test_context_prefers_map_candidate_with_roman_floor_suffix():
     assert reading.map_confirmed is True
 
 
-def test_complete_floor_map_stops_after_the_two_enlarged_views():
+def test_complete_floor_map_stops_after_native_probe_and_two_enlarged_views():
     class CountingOcr(_RomanFloorOcr):
         def __init__(self):
             self.field_calls = 0
@@ -122,7 +122,36 @@ def test_complete_floor_map_stops_after_the_two_enlarged_views():
     )
 
     assert reading.map_name == "寺院通道II"
-    assert ocr.field_calls == 2
+    assert ocr.field_calls == 3
+
+
+def test_complete_floor_map_in_native_crop_skips_all_expensive_retries():
+    class NativeFloorOcr:
+        def __init__(self):
+            self.field_calls = 0
+            self.line_calls = 0
+
+        def read_field(self, _image):
+            self.field_calls += 1
+            return "寺院通道Ⅱ"
+
+        def read_lines(self, _image):
+            self.line_calls += 1
+            return []
+
+    ocr = NativeFloorOcr()
+    reading = extract_context(
+        ocr,
+        {
+            "map": Image.new("RGB", (273, 49)),
+            "map_wide": Image.new("RGB", (376, 68)),
+        },
+    )
+
+    assert reading.map_name == "寺院通道II"
+    assert reading.map_confirmed is True
+    assert ocr.field_calls == 1
+    assert ocr.line_calls == 0
 
 
 def test_internally_confirmed_context_is_published_on_first_scan():

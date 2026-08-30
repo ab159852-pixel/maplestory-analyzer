@@ -180,17 +180,17 @@ identically whether started via the .exe or this command.
 
 ## Publish a release (maintainers)
 
-This source currently contains `APP_VERSION = 1.0.40`. For each release, bump
+This source currently contains `APP_VERSION = 1.0.41`. For each release, bump
 `APP_VERSION` in `src/maple_analyzer/version.py`, commit the change, and push a
 matching tag, for example:
 
 ```powershell
-git tag v1.0.40
-git push origin v1.0.40
+git tag v1.0.41
+git push origin v1.0.41
 ```
 
 GitHub Actions installs dependencies, builds
-`MapleStoryAnalyzer-v1.0.40-win64.zip`, writes a SHA-256 checksum, and publishes
+`MapleStoryAnalyzer-v1.0.41-win64.zip`, writes a SHA-256 checksum, and publishes
 the Release automatically. Packaged users will be offered the update next time
 the app starts.
 
