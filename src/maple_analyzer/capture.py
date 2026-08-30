@@ -57,6 +57,15 @@ TARGET_WINDOW_CAPTURE_UNAVAILABLE = "target window capture is unavailable"
 # cadence for a new WGC frame serializes status, potion and pickup capture
 # behind a static scene, then used to trigger a needless WGC reconnect.
 LIVE_GRAPHICS_FRAME_TIMEOUT_SECONDS = 0.25
+# ``BackgroundMonitor`` has independent potion, pickup, status and context
+# workers.  They can all wake on the same compositor presentation, while one
+# WGC session exposes that presentation to only one ``grab()`` caller.  Share
+# a just-converted client frame for less than one worker tick so the other
+# workers crop the *same current game frame* instead of reporting a false
+# "no new frame" failure.  This is deliberately much shorter than the
+# 100-150ms live worker cadences: it reduces consumer contention without
+# treating an idle/stalled surface as live telemetry.
+LIVE_GRAPHICS_SHARED_FRAME_SECONDS = 0.08
 _NON_GAME_WINDOW_PROCESSES = {
     "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
     "explorer.exe", "codex.exe", "discord.exe",
@@ -606,6 +615,14 @@ class GameWindowCapture:
         self.capture_backend = "windows-graphics"
         self.graphics_capture_error: str | None = None
         self.graphics_capture_is_stale = False
+        # A fresh WGC frame is a single-consumer resource.  Keep a tiny
+        # client-frame hand-off window for the monitor's concurrent workers;
+        # unlike the context cache below, this is safe for live accounting
+        # because it is only a few milliseconds old and comes from the game
+        # window itself rather than the visible desktop.
+        self._last_live_graphics_frame: Image.Image | None = None
+        self._last_live_graphics_frame_at = 0.0
+        self._last_live_graphics_frame_client_size: tuple[int, int] | None = None
         # A WGC session can need a fresh frame pool after a compositor reset.
         # Keep one *context-only* client frame across that reconnect so map/job
         # labels remain available. Live status and economy methods never read
@@ -620,6 +637,48 @@ class GameWindowCapture:
         self._print_window_disabled = False
         self._print_window_retry_at = 0.0
         self.print_window_error: str | None = None
+
+    def _recent_live_graphics_frame(
+        self, client_rect: tuple[int, int, int, int]
+    ) -> Image.Image | None:
+        """Return a just-captured target frame for a concurrent live worker.
+
+        WGC correctly withholds duplicate frames.  That normally protects the
+        economy/status paths, but with several monitor workers it made the
+        first worker consume every presentation and made the other workers
+        report the game as obscured.  A same-presentation hand-off is neither
+        a desktop fallback nor an idle cache; once its tiny window has passed,
+        callers must obtain a genuinely new WGC frame again.
+        """
+        frame = getattr(self, "_last_live_graphics_frame", None)
+        recorded_at = float(getattr(self, "_last_live_graphics_frame_at", 0.0))
+        client_size = getattr(self, "_last_live_graphics_frame_client_size", None)
+        expected_size = (
+            client_rect[2] - client_rect[0],
+            client_rect[3] - client_rect[1],
+        )
+        age = time.monotonic() - recorded_at
+        if (
+            frame is None
+            or client_size != expected_size
+            or age < 0
+            or age > LIVE_GRAPHICS_SHARED_FRAME_SECONDS
+        ):
+            return None
+        return frame.copy()
+
+    def _remember_live_graphics_frame(
+        self,
+        frame: Image.Image,
+        client_rect: tuple[int, int, int, int],
+    ) -> None:
+        """Publish one fresh target frame to sibling monitor workers."""
+        self._last_live_graphics_frame = frame.copy()
+        self._last_live_graphics_frame_at = time.monotonic()
+        self._last_live_graphics_frame_client_size = (
+            client_rect[2] - client_rect[0],
+            client_rect[3] - client_rect[1],
+        )
 
     def _remember_capture_geometry(
         self,
@@ -845,9 +904,21 @@ class GameWindowCapture:
         *,
         allow_stale: bool = False,
         max_stale_seconds: float = 0.0,
+        prefer_stale: bool = False,
         timeout: float = LIVE_GRAPHICS_FRAME_TIMEOUT_SECONDS,
     ) -> Image.Image | None:
         """Return a compositor-independent frame, or select desktop fallback."""
+        # Let sibling live workers (and display-only idle readers) use the
+        # exact WGC presentation converted moments ago. Context deliberately
+        # bypasses this check: it has its own longer target-only cache and
+        # should still prefer a newly arrived presentation whenever available.
+        if not allow_stale or prefer_stale:
+            shared = self._recent_live_graphics_frame(client_rect)
+            if shared is not None:
+                self.graphics_capture_is_stale = False
+                self.graphics_capture_error = None
+                self.capture_backend = "windows-graphics-shared"
+                return shared
         if self._graphics_capture_disabled:
             # A transient Graphics Capture service/driver failure should not
             # permanently downgrade the app to desktop pixels.  Retry after
@@ -893,6 +964,7 @@ class GameWindowCapture:
                     timeout=timeout,
                     allow_stale=True,
                     max_stale_seconds=max_stale_seconds,
+                    prefer_stale=prefer_stale,
                 )
             else:
                 image = self._graphics_capture.grab(timeout=timeout)
@@ -914,6 +986,8 @@ class GameWindowCapture:
                 )
                 self.graphics_capture_error = None
                 self.capture_backend = "windows-graphics"
+                if not self.graphics_capture_is_stale:
+                    self._remember_live_graphics_frame(frame, client_rect)
                 return frame
             raise RuntimeError(
                 f"graphics capture size {image.size} does not match client "
@@ -1118,18 +1192,40 @@ class GameWindowCapture:
         # so the game's own children don't read as something covering it.
         return self._win32gui.GetAncestor(self._win32gui.WindowFromPoint((x, y)), 2)
 
-    def grab_fields(self, *, include_bar_signals: bool = False) -> dict[str, Image.Image]:
+    def grab_fields(
+        self,
+        *,
+        include_bar_signals: bool = False,
+        allow_stale: bool = False,
+    ) -> dict[str, Image.Image]:
         with self._capture_lock:
-            return self._grab_fields(include_bar_signals=include_bar_signals)
+            return self._grab_fields(
+                include_bar_signals=include_bar_signals,
+                allow_stale=allow_stale,
+            )
 
-    def _grab_fields(self, *, include_bar_signals: bool = False) -> dict[str, Image.Image]:
+    def _grab_fields(
+        self,
+        *,
+        include_bar_signals: bool = False,
+        allow_stale: bool = False,
+    ) -> dict[str, Image.Image]:
         client_rect = self._client_rect_on_screen()
         self._remember_capture_geometry(client_rect)
         # WGC is the live, compositor-independent path.  When it is
         # unavailable, try the visible desktop before PrintWindow: classic
         # DirectX clients can return a perfectly valid-looking but stale
         # PrintWindow bitmap, which would freeze EXP/HP/MP at the first frame.
-        graphics = self._try_graphics_frame(client_rect)
+        graphics = self._try_graphics_frame(
+            client_rect,
+            allow_stale=allow_stale,
+            # A stopped/paused HUD is display-only.  If the game is idle, do
+            # not hold the capture lock for 250ms merely to redisplay the
+            # exact same target-window pixels; take a pending new frame when
+            # one is already available, otherwise use the bounded WGC image.
+            max_stale_seconds=30.0 if allow_stale else 0.0,
+            prefer_stale=allow_stale,
+        )
         if graphics is not None:
             self.client_size = graphics.size
             fields = {
@@ -1197,14 +1293,23 @@ class GameWindowCapture:
                 ))
         return fields
 
-    def grab_auxiliary(self) -> dict[str, Image.Image]:
+    def grab_auxiliary(
+        self, *, allow_stale: bool = False
+    ) -> dict[str, Image.Image]:
         with self._capture_lock:
-            return self._grab_auxiliary()
+            return self._grab_auxiliary(allow_stale=allow_stale)
 
-    def _grab_auxiliary(self) -> dict[str, Image.Image]:
+    def _grab_auxiliary(
+        self, *, allow_stale: bool = False
+    ) -> dict[str, Image.Image]:
         client_rect = self._client_rect_on_screen()
         self._remember_capture_geometry(client_rect)
-        graphics = self._try_graphics_frame(client_rect)
+        graphics = self._try_graphics_frame(
+            client_rect,
+            allow_stale=allow_stale,
+            max_stale_seconds=30.0 if allow_stale else 0.0,
+            prefer_stale=allow_stale,
+        )
         if graphics is not None:
             client_size = graphics.size
             self.client_size = client_size
@@ -1385,6 +1490,9 @@ class GameWindowCapture:
         if graphics_capture is not None:
             with contextlib.suppress(Exception):
                 graphics_capture.close()
+        self._last_live_graphics_frame = None
+        self._last_live_graphics_frame_at = 0.0
+        self._last_live_graphics_frame_client_size = None
         mss_capture = getattr(self, "_mss", None)
         self._mss = None
         if mss_capture is not None:

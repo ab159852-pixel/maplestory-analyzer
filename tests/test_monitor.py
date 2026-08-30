@@ -33,6 +33,7 @@ def test_monitor_stop_releases_native_capture_source_with_one_total_budget():
     monitor._stop = threading.Event()
     monitor._status_enabled = threading.Event()
     monitor._aux_enabled = threading.Event()
+    monitor._pickup_enabled = threading.Event()
     monitor._potion_request = threading.Event()
     monitor._pickup_request = threading.Event()
     monitor._context_request = threading.Event()
@@ -116,6 +117,28 @@ def test_background_ocr_receives_all_enabled_shortcut_cells_in_settings_order():
         "7": 1875,
     }
     assert ocr.calls == [({"6", "7"}, {"7"}, {"6", "7"}, True)]
+
+
+def test_auxiliary_cache_never_carries_idle_display_frame_into_live_scan():
+    class _Source:
+        def __init__(self):
+            self.calls = []
+
+        def grab_auxiliary(self, *, allow_stale=False):
+            self.calls.append(allow_stale)
+            return {"shortcut": Image.new("RGB", (1, 1), "white")}
+
+    monitor = BackgroundMonitor.__new__(BackgroundMonitor)
+    monitor.source = _Source()
+    monitor._aux_capture_lock = threading.Lock()
+    monitor._aux_capture_cache = None
+
+    idle = monitor._grab_auxiliary_cached(allow_stale=True)
+    assert monitor._grab_auxiliary_cached(allow_stale=True) is idle
+    live = monitor._grab_auxiliary_cached(allow_stale=False)
+
+    assert live is not idle
+    assert monitor.source.calls == [True, False]
 
 
 def test_pickup_row_retries_after_an_empty_cached_ocr_result():

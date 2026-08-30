@@ -758,7 +758,17 @@ class BackgroundMonitor:
         )
         self._stop = threading.Event()
         self._status_enabled = threading.Event()
+        # Stopped/paused readouts are display-only: they can show a bounded
+        # target-window frame while the game is idle, but a running session
+        # must continue to receive only new WGC presentations for accounting.
+        self._status_allow_stale = False
         self._aux_enabled = threading.Event()
+        # The stopped/paused shortcut inventory is a display baseline, not a
+        # billable signal. It may use a recent target frame so the user sees
+        # the actual quantities before Start; active potion/pickup accounting
+        # always clears this flag and waits for a new presentation.
+        self._auxiliary_allow_stale = False
+        self._pickup_enabled = threading.Event()
         # Potion and pickup scans have separate cadences. Sharing one event
         # lets either worker clear the other's wake-up request, which makes a
         # Start/Resume refresh nondeterministic.
@@ -772,7 +782,7 @@ class BackgroundMonitor:
         self._context_priority.set()
         self._potion_scan_active = threading.Event()
         self._aux_capture_lock = threading.Lock()
-        self._aux_capture_cache: tuple[float, dict[str, Any]] | None = None
+        self._aux_capture_cache: tuple[float, bool, dict[str, Any]] | None = None
         self._lock = threading.Lock()
         # RapidOCR/ONNX objects are shared by status, pickup and context
         # workers. Their public wrapper is not safe for concurrent inference;
@@ -879,6 +889,7 @@ class BackgroundMonitor:
         self._stop.set()
         self._status_enabled.set()
         self._aux_enabled.set()
+        self._pickup_enabled.set()
         self._potion_request.set()
         self._pickup_request.set()
         self._context_request.set()
@@ -913,14 +924,10 @@ class BackgroundMonitor:
         with self._lock:
             self._sample_interval_ms = max(200, min(1000, int(value_ms)))
 
-    def set_status_enabled(self, enabled: bool) -> None:
-        """Run high-frequency status OCR only while a session is active.
-
-        Context OCR remains independent so map/job detection is available
-        before Start. Keeping LV/HP/MP/EXP idle until then removes a large
-        source of startup and idle CPU contention without changing the last
-        displayed snapshot.
-        """
+    def set_status_enabled(self, enabled: bool, *, allow_stale: bool = False) -> None:
+        """Enable live status OCR, optionally in display-only stale mode."""
+        with self._lock:
+            self._status_allow_stale = bool(enabled and allow_stale)
         if enabled:
             self._status_enabled.set()
         else:
@@ -930,13 +937,32 @@ class BackgroundMonitor:
         with self._lock:
             self._pickup_interval_ms = max(PICKUP_SCAN_MIN_MS, min(1000, int(value_ms)))
 
-    def set_aux_enabled(self, enabled: bool) -> None:
+    def set_aux_enabled(
+        self,
+        enabled: bool,
+        *,
+        allow_stale: bool = False,
+        pickup_enabled: bool = True,
+    ) -> None:
+        with self._aux_capture_lock:
+            # A cached stopped-state image must never cross the Start/Resume
+            # boundary into a billable potion/pickup scan.
+            self._aux_capture_cache = None
+        with self._lock:
+            self._auxiliary_allow_stale = bool(enabled and allow_stale)
         if enabled:
             self._aux_enabled.set()
             self._potion_request.set()
-            self._pickup_request.set()
+            if pickup_enabled:
+                self._pickup_enabled.set()
+                self._pickup_request.set()
+            else:
+                self._pickup_enabled.clear()
+                self._pickup_request.clear()
+                self._clear_pickup_frames()
         else:
             self._aux_enabled.clear()
+            self._pickup_enabled.clear()
             self._potion_request.clear()
             self._pickup_request.clear()
             self._clear_pickup_frames()
@@ -972,15 +998,25 @@ class BackgroundMonitor:
             # to fall back to all eight cells.
             self._potion_slots = configured
 
-    def _grab_auxiliary_cached(self) -> dict[str, Any]:
+    def _grab_auxiliary_cached(self, *, allow_stale: bool = False) -> dict[str, Any]:
         """Capture one short-lived auxiliary frame for both workers."""
         now = time.monotonic()
         with self._aux_capture_lock:
             cached = self._aux_capture_cache
-            if cached is not None and now - cached[0] <= AUX_CAPTURE_CACHE_SECONDS:
-                return cached[1]
-            regions = self.source.grab_auxiliary()
-            self._aux_capture_cache = (time.monotonic(), regions)
+            if (
+                cached is not None
+                and cached[1] == allow_stale
+                and now - cached[0] <= AUX_CAPTURE_CACHE_SECONDS
+            ):
+                return cached[2]
+            try:
+                regions = self.source.grab_auxiliary(allow_stale=allow_stale)
+            except TypeError:
+                # Keep minimal/custom sources created before display-only
+                # inventory support working; their original method remains a
+                # fresh-frame implementation.
+                regions = self.source.grab_auxiliary()
+            self._aux_capture_cache = (time.monotonic(), allow_stale, regions)
             return regions
 
     def _status_loop(self) -> None:
@@ -996,6 +1032,7 @@ class BackgroundMonitor:
                 potion_priority = (
                     self._track_potions and bool(self._configured_potion_slots)
                 )
+                allow_stale = bool(getattr(self, "_status_allow_stale", False))
             if potion_priority and (
                 self._potion_request.is_set() or self._potion_scan_active.is_set()
             ):
@@ -1009,11 +1046,19 @@ class BackgroundMonitor:
             bar_flash: tuple[str, ...] = ()
             try:
                 try:
-                    field_images = self.source.grab_fields(include_bar_signals=True)
+                    field_images = self.source.grab_fields(
+                        include_bar_signals=True,
+                        allow_stale=allow_stale,
+                    )
                 except TypeError:
                     # Keep lightweight/custom capture sources compatible with
-                    # the original four-field method signature.
-                    field_images = self.source.grab_fields()
+                    # the original method signatures.
+                    try:
+                        field_images = self.source.grab_fields(
+                            include_bar_signals=True
+                        )
+                    except TypeError:
+                        field_images = self.source.grab_fields()
                 ocr_images = {
                     name: image
                     for name, image in field_images.items()
@@ -1062,6 +1107,13 @@ class BackgroundMonitor:
             )
             with self._lock:
                 interval = self._sample_interval_ms / 1000
+                display_only = bool(getattr(self, "_status_allow_stale", False))
+            # Re-OCRing an unchanged status bar five times per second wastes
+            # CPU before a session has even started. The value is still
+            # visible promptly, and a running session always restores the
+            # user's configured live cadence above.
+            if display_only:
+                interval = max(interval, 0.75)
             remaining = max(0.01, interval - (time.perf_counter() - started))
             self._stop.wait(remaining)
 
@@ -1076,6 +1128,7 @@ class BackgroundMonitor:
                 track_potions = self._track_potions
                 potion_interval = self._aux_scan_ms / 1000
                 configured_slots = self._configured_potion_slots
+                allow_stale = bool(getattr(self, "_auxiliary_allow_stale", False))
             if not track_potions or not configured_slots:
                 self._potion_request.clear()
                 self._stop.wait(0.1)
@@ -1094,7 +1147,7 @@ class BackgroundMonitor:
             try:
                 with self._lock:
                     slots = self._potion_slots
-                regions = self._grab_auxiliary_cached()
+                regions = self._grab_auxiliary_cached(allow_stale=allow_stale)
                 # Quantity changes are the hard real-time signal: a potion
                 with self._ocr_lock:
                     counts = self._read_potion_counts(regions, configured_slots, slots)
@@ -1252,13 +1305,14 @@ class BackgroundMonitor:
         """Capture pickup pixels at the configured cadence, independent of OCR."""
         next_pickup_scan = 0.0
         while not self._stop.is_set():
-            if not self._aux_enabled.wait(0.1):
+            if not self._pickup_enabled.wait(0.1):
                 continue
             now = time.monotonic()
             requested = self._pickup_request.is_set()
             with self._lock:
                 track_pickup = self._track_pickup
                 pickup_interval = self._pickup_interval_ms / 1000
+                allow_stale = bool(getattr(self, "_auxiliary_allow_stale", False))
             if not track_pickup:
                 self._pickup_request.clear()
                 self._clear_pickup_frames()
@@ -1270,7 +1324,7 @@ class BackgroundMonitor:
             self._pickup_request.clear()
             next_pickup_scan = now + pickup_interval
             try:
-                regions = self._grab_auxiliary_cached()
+                regions = self._grab_auxiliary_cached(allow_stale=allow_stale)
             except RuntimeError as exc:
                 _put_latest(
                     self.auxiliary_queue,
@@ -1312,7 +1366,7 @@ class BackgroundMonitor:
         """OCR the captured pickup sequence without controlling its cadence."""
         pending: tuple[float, dict[str, Any]] | None = None
         while not self._stop.is_set():
-            if not self._aux_enabled.wait(0.1):
+            if not self._pickup_enabled.wait(0.1):
                 pending = None
                 continue
             with self._lock:

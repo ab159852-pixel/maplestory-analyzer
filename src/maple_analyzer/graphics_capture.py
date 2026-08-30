@@ -150,6 +150,7 @@ class WindowsGraphicsCapture:
         *,
         allow_stale: bool = False,
         max_stale_seconds: float = 0.0,
+        prefer_stale: bool = False,
     ) -> Image.Image:
         """Return a newly arrived frame.
 
@@ -160,6 +161,22 @@ class WindowsGraphicsCapture:
         and receives a new frame first whenever one arrives.
         """
         frame = self._take_pending_frame()
+        if frame is None and allow_stale and prefer_stale:
+            # A stopped/paused HUD normally has a recent target frame already.
+            # Return it without monopolizing the shared source lock; however,
+            # a brand-new capture session still needs one bounded wait to
+            # acquire its initial frame.
+            with self._lock:
+                last_image = getattr(self, "_last_image", None)
+                last_at = float(getattr(self, "_last_image_at", 0.0))
+                age = time.monotonic() - last_at
+                if (
+                    last_image is not None
+                    and max_stale_seconds > 0
+                    and 0 <= age <= max_stale_seconds
+                ):
+                    self._last_grab_was_stale = True
+                    return last_image.copy()
         if frame is None:
             self._frame_ready.wait(max(0.05, timeout))
             frame = self._take_pending_frame()

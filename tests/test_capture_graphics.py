@@ -9,7 +9,11 @@ import pytest
 
 from PIL import Image
 
-from maple_analyzer.capture import GameWindowCapture, _crop_frame_to_client
+from maple_analyzer.capture import (
+    LIVE_GRAPHICS_SHARED_FRAME_SECONDS,
+    GameWindowCapture,
+    _crop_frame_to_client,
+)
 from maple_analyzer.graphics_capture import GraphicsCaptureError, WindowsGraphicsCapture
 
 
@@ -228,6 +232,52 @@ def test_graphics_frame_keeps_wgc_session_after_a_normal_no_frame_wait(monkeypat
     assert active.closed is False
 
 
+def test_live_workers_share_only_the_same_fresh_graphics_presentation(monkeypatch):
+    """One WGC presentation must initialize all workers that wake together."""
+    image = Image.new("RGB", (100, 60), "#123456")
+    capture, _fake = _capture_stub(frame=image)
+
+    class OneFrameGraphicsCapture:
+        def __init__(self, *_args):
+            self.item_size = None
+            self.calls = 0
+
+        def grab(self, timeout=1.2):
+            assert timeout == 0.25
+            self.calls += 1
+            if self.calls == 1:
+                return image.copy()
+            raise GraphicsCaptureError(
+                "Windows Graphics Capture did not return a new frame"
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "maple_analyzer.graphics_capture.WindowsGraphicsCapture",
+        OneFrameGraphicsCapture,
+    )
+
+    first = GameWindowCapture._try_graphics_frame(capture, (20, 30, 120, 90))
+    sibling = GameWindowCapture._try_graphics_frame(capture, (20, 30, 120, 90))
+
+    assert first is not None
+    assert sibling is not None
+    assert sibling.getpixel((0, 0)) == (18, 52, 86)
+    assert capture.capture_backend == "windows-graphics-shared"
+    assert capture._graphics_capture.calls == 1
+
+    # This is a concurrent-consumer hand-off, not a stale live cache.  The
+    # next scheduled live scan must go back to WGC and visibly wait for a
+    # presentation when the short hand-off window has passed.
+    capture._last_live_graphics_frame_at = (
+        time.monotonic() - LIVE_GRAPHICS_SHARED_FRAME_SECONDS - 0.01
+    )
+    assert GameWindowCapture._try_graphics_frame(capture, (20, 30, 120, 90)) is None
+    assert capture._graphics_capture.calls == 2
+
+
 def test_graphics_grab_never_returns_a_stale_last_frame():
     """A stalled frame stream must be visible to the capture fallback.
 
@@ -259,6 +309,27 @@ def test_graphics_grab_returns_a_recent_frame_only_when_context_opts_in():
     assert result.size == (3, 2)
     assert result.getpixel((0, 0)) == (18, 52, 86)
     assert capture._last_grab_was_stale is True
+
+
+def test_graphics_display_grab_can_use_a_recent_target_frame_without_waiting():
+    """Idle HUD display must not hold the capture lock for a missing redraw."""
+    capture = WindowsGraphicsCapture.__new__(WindowsGraphicsCapture)
+    capture._lock = threading.Lock()
+    capture._frame_ready = threading.Event()
+    capture._take_pending_frame = lambda: None
+    capture._last_image = Image.new("RGB", (3, 2), "#123456")
+    capture._last_image_at = time.monotonic()
+
+    started = time.monotonic()
+    result = capture.grab(
+        timeout=1.0,
+        allow_stale=True,
+        max_stale_seconds=1.0,
+        prefer_stale=True,
+    )
+
+    assert result.size == (3, 2)
+    assert time.monotonic() - started < 0.1
 
 
 def test_context_keeps_its_last_fresh_target_frame_during_wgc_reconnect():

@@ -2605,6 +2605,12 @@ class OverlayApp:
                 baseline_samples.clear()
             self._last_logged_shortcut_counts = None
         if monitor is not None:
+            if not enabled:
+                # Keep the HUD's values/context and shortcut inventory visible
+                # after Pause/Stop, but leave all accounting disabled. This is
+                # also the state used immediately after the app opens.
+                self._set_monitor_idle_aux_enabled()
+                return
             set_status = getattr(monitor, "set_status_enabled", None)
             if callable(set_status):
                 set_status(enabled)
@@ -2621,12 +2627,29 @@ class OverlayApp:
             return
         set_status = getattr(monitor, "set_status_enabled", None)
         if callable(set_status):
-            set_status(False)
+            try:
+                # A stopped HUD still needs an actual HP/MP/EXP readout. Its
+                # worker may display a bounded target-only WGC image, but the
+                # overlay never feeds these readings to a session/economy.
+                set_status(True, allow_stale=True)
+            except TypeError:
+                # Compatibility with minimal in-memory monitor adapters.
+                set_status(True)
         configured = bool(
             getattr(self._settings, "track_potions", False)
             and any(slot.enabled for slot in getattr(self._settings, "potion_slots", ()))
         )
-        monitor.set_aux_enabled(configured)
+        try:
+            # Pickup notifications are only useful once a session is running.
+            # Keeping that high-frequency worker asleep here leaves the first
+            # game frame available for the displayed shortcut baseline.
+            monitor.set_aux_enabled(
+                configured,
+                allow_stale=True,
+                pickup_enabled=False,
+            )
+        except TypeError:
+            monitor.set_aux_enabled(configured)
         if configured:
             request_scan = getattr(monitor, "request_auxiliary_scan", None)
             if callable(request_scan):
