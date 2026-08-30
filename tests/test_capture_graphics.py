@@ -44,7 +44,7 @@ def _capture_stub(
             self.item_size = item_size
 
         def grab(self, timeout=1.2):
-            assert timeout == 1.2
+            assert timeout == 0.25
             return frame.copy()
 
         def close(self):
@@ -188,6 +188,46 @@ def test_graphics_frame_disables_broken_backend_for_desktop_fallback(monkeypatch
     assert "WGC unavailable" in capture.graphics_capture_error
 
 
+def test_graphics_frame_keeps_wgc_session_after_a_normal_no_frame_wait(monkeypatch):
+    """A quiet game surface is not a backend failure or a five-second outage."""
+    image = Image.new("RGB", (100, 60), "#123456")
+    capture, _fake = _capture_stub(frame=image)
+
+    class IntermittentGraphicsCapture:
+        def __init__(self, *_args):
+            self.item_size = None
+            self.calls = 0
+            self.closed = False
+
+        def grab(self, timeout=1.2):
+            assert timeout == 0.25
+            self.calls += 1
+            if self.calls == 1:
+                raise GraphicsCaptureError(
+                    "Windows Graphics Capture did not return a new frame"
+                )
+            return image.copy()
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        "maple_analyzer.graphics_capture.WindowsGraphicsCapture",
+        IntermittentGraphicsCapture,
+    )
+
+    assert GameWindowCapture._try_graphics_frame(capture, (20, 30, 120, 90)) is None
+    active = capture._graphics_capture
+    assert active is not None
+    assert capture._graphics_capture_disabled is False
+    assert capture.capture_backend == "windows-graphics-waiting"
+
+    result = GameWindowCapture._try_graphics_frame(capture, (20, 30, 120, 90))
+    assert result is not None
+    assert capture._graphics_capture is active
+    assert active.closed is False
+
+
 def test_graphics_grab_never_returns_a_stale_last_frame():
     """A stalled frame stream must be visible to the capture fallback.
 
@@ -218,3 +258,33 @@ def test_graphics_grab_returns_a_recent_frame_only_when_context_opts_in():
 
     assert result.size == (3, 2)
     assert result.getpixel((0, 0)) == (18, 52, 86)
+    assert capture._last_grab_was_stale is True
+
+
+def test_context_keeps_its_last_fresh_target_frame_during_wgc_reconnect():
+    capture = GameWindowCapture.__new__(GameWindowCapture)
+    capture._remember_capture_geometry = lambda _rect: None
+    capture._try_graphics_frame = lambda _rect, **_kwargs: None
+    capture._try_print_window_frame = lambda _rect: None
+    capture._last_context_frame = Image.new("RGB", (100, 60), "#123456")
+    capture._last_context_frame_client_size = (100, 60)
+
+    result = capture._try_window_frame(
+        (0, 0, 100, 60),
+        allow_stale_graphics=True,
+    )
+
+    assert result is not None
+    assert result.getpixel((0, 0)) == (18, 52, 86)
+    assert capture.capture_backend == "windows-graphics-context-cache"
+
+
+def test_live_window_frame_never_uses_the_context_cache():
+    capture = GameWindowCapture.__new__(GameWindowCapture)
+    capture._remember_capture_geometry = lambda _rect: None
+    capture._try_graphics_frame = lambda _rect, **_kwargs: None
+    capture._try_print_window_frame = lambda _rect: None
+    capture._last_context_frame = Image.new("RGB", (100, 60), "#123456")
+    capture._last_context_frame_client_size = (100, 60)
+
+    assert capture._try_window_frame((0, 0, 100, 60)) is None

@@ -521,6 +521,50 @@ def test_local_game_font_model_corrects_unanimous_1928_to_real_1328():
     ) == {"6": 1328}
 
 
+def test_local_game_font_model_corrects_live_850_to_verified_950():
+    """Regression for the user's live slot-6 cell: actual 950, OCR 850."""
+    from PIL import Image
+
+    # First digit from the live ``950`` shortcut cell. Rebuild the 34px strip
+    # at its normal first-glyph anchor so this exercises production geometry.
+    rows = (
+        0, 0, 0, 4064, 4064, 12312, 12312, 13080, 13208, 13208, 13208,
+        12312, 4089, 4089, 24, 24, 24, 24, 4064, 4064, 0, 0,
+    )
+    strip = _real_game_font_conflict_strip(rows, left=3)
+    assert ocr_module._correct_shortcut_game_font_8_9(strip, 850) == 950
+
+    class Numeric:
+        def read_digit_fields(self, images, *, max_digits=4):
+            return {name: "850" for name in images}
+
+    cell = Image.new("RGB", (66, 68), "black")
+    cell.paste(strip, (0, 31))
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._numeric_engine = Numeric()
+    ocr._read_once = lambda _image: ("", [])
+
+    assert ocr._read_shortcut_numeric_batch(
+        {"6:False": ("6", cell)},
+        blue_slot_ids=set(),
+        previous_counts={},
+        live=True,
+    ) == {"6": 950}
+
+
+def test_local_game_font_model_preserves_verified_1081_eight():
+    """The 8/9 repair must not turn the known MP quantity 1081 into 1091."""
+    rows = (
+        0, 0, 0, 8128, 8128, 24624, 24624, 24624, 24624, 24624, 24624,
+        40896, 24624, 24624, 24624, 24624, 24624, 24624, 8128, 8128,
+        0, 0,
+    )
+    # 1081 has a narrow leading 1 (9px), then 0 (15px), so the third glyph
+    # begins at x=27. The target helper crops one pixel before that anchor.
+    strip = _real_game_font_conflict_strip(rows, left=26)
+    assert ocr_module._correct_shortcut_game_font_8_9(strip, 1091) == 1081
+
+
 def test_shortcut_numeric_views_reject_1359_to_1959_substitution_but_keep_correction():
     # 3 -> 9 in the hundreds place is the reported same-length upward OCR
     # substitution.  A correction such as 40 -> 80 must remain possible so a

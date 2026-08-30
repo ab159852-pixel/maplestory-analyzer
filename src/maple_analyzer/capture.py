@@ -53,6 +53,10 @@ from .regions import (
 # minimized/not-found states -- see overlay._do_tick and _localize_error.
 PANEL_OBSCURED = "stat panel is obscured"
 TARGET_WINDOW_CAPTURE_UNAVAILABLE = "target window capture is unavailable"
+# Live monitor workers sample every 150-300ms. Waiting longer than one such
+# cadence for a new WGC frame serializes status, potion and pickup capture
+# behind a static scene, then used to trigger a needless WGC reconnect.
+LIVE_GRAPHICS_FRAME_TIMEOUT_SECONDS = 0.25
 _NON_GAME_WINDOW_PROCESSES = {
     "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
     "explorer.exe", "codex.exe", "discord.exe",
@@ -601,6 +605,13 @@ class GameWindowCapture:
         self._graphics_capture_retry_at = 0.0
         self.capture_backend = "windows-graphics"
         self.graphics_capture_error: str | None = None
+        self.graphics_capture_is_stale = False
+        # A WGC session can need a fresh frame pool after a compositor reset.
+        # Keep one *context-only* client frame across that reconnect so map/job
+        # labels remain available. Live status and economy methods never read
+        # this cache.
+        self._last_context_frame: Image.Image | None = None
+        self._last_context_frame_client_size: tuple[int, int] | None = None
         # PrintWindow is a second compositor-independent fallback for Windows
         # builds where the Graphics Capture service is disabled.  It remains
         # available for full/context previews, but live status/economy OCR
@@ -834,6 +845,7 @@ class GameWindowCapture:
         *,
         allow_stale: bool = False,
         max_stale_seconds: float = 0.0,
+        timeout: float = LIVE_GRAPHICS_FRAME_TIMEOUT_SECONDS,
     ) -> Image.Image | None:
         """Return a compositor-independent frame, or select desktop fallback."""
         if self._graphics_capture_disabled:
@@ -842,6 +854,7 @@ class GameWindowCapture:
             # a short cooldown so an OBS-like HWND capture can recover after
             # the game finishes initializing or the compositor restarts.
             if time.monotonic() < getattr(self, "_graphics_capture_retry_at", 0.0):
+                self.graphics_capture_is_stale = False
                 return None
             self._graphics_capture_disabled = False
         try:
@@ -877,13 +890,16 @@ class GameWindowCapture:
                 self._graphics_capture_size = capture_size
             if allow_stale:
                 image = self._graphics_capture.grab(
-                    timeout=1.2,
+                    timeout=timeout,
                     allow_stale=True,
                     max_stale_seconds=max_stale_seconds,
                 )
             else:
-                image = self._graphics_capture.grab(timeout=1.2)
+                image = self._graphics_capture.grab(timeout=timeout)
             item_size = getattr(self._graphics_capture, "item_size", None)
+            self.graphics_capture_is_stale = bool(
+                getattr(self._graphics_capture, "_last_grab_was_stale", False)
+            )
             frame = _crop_frame_to_client(
                 image,
                 client_rect,
@@ -905,6 +921,20 @@ class GameWindowCapture:
             )
         except Exception as exc:
             self.graphics_capture_error = str(exc.__cause__ or exc)
+            self.graphics_capture_is_stale = False
+            # WGC delivers frames only when the game presents. A quiet scene
+            # can legitimately exceed one worker tick without a new frame;
+            # closing the healthy session here used to impose a five-second
+            # blind period and lose subsequent HP/MP/EXP/pickup changes.
+            # Preserve the session and let the next scheduled scan consume
+            # its next real frame. We deliberately return no image rather
+            # than reusing an old one for live accounting.
+            if (
+                "did not return a new frame" in str(exc)
+                and self._graphics_capture is not None
+            ):
+                self.capture_backend = "windows-graphics-waiting"
+                return None
             self._graphics_capture_disabled = True
             self._graphics_capture_retry_at = time.monotonic() + 5.0
             graphics = self._graphics_capture
@@ -1010,7 +1040,23 @@ class GameWindowCapture:
             max_stale_seconds=30.0 if allow_stale_graphics else 0.0,
         )
         if graphics is not None:
+            if allow_stale_graphics and not self.graphics_capture_is_stale:
+                self._last_context_frame = graphics.copy()
+                self._last_context_frame_client_size = (
+                    client_rect[2] - client_rect[0],
+                    client_rect[3] - client_rect[1],
+                )
             return graphics
+        if allow_stale_graphics:
+            client_size = (
+                client_rect[2] - client_rect[0],
+                client_rect[3] - client_rect[1],
+            )
+            cached = getattr(self, "_last_context_frame", None)
+            cached_size = getattr(self, "_last_context_frame_client_size", None)
+            if cached is not None and cached_size == client_size:
+                self.capture_backend = "windows-graphics-context-cache"
+                return cached.copy()
         return self._try_print_window_frame(client_rect)
 
     def _obscured_live_error(self) -> str:

@@ -937,6 +937,10 @@ class StatPanelOcr:
                         strip,
                         selected,
                     )
+                    selected = _correct_shortcut_game_font_8_9(
+                        strip,
+                        selected,
+                    )
                 previous = (previous_counts or {}).get(slot_id)
                 if (
                     previous is not None
@@ -1143,6 +1147,7 @@ class StatPanelOcr:
             if selected is None:
                 continue
             selected = _correct_shortcut_game_font_3_9(strip, selected)
+            selected = _correct_shortcut_game_font_8_9(strip, selected)
             result[slot_id] = selected
             previous = (previous_counts or {}).get(slot_id)
             if (
@@ -2121,6 +2126,26 @@ _SHORTCUT_GAME_FONT_3_9_ROWS: dict[str, tuple[tuple[int, ...], ...]] = {
          1999, 48, 48, 48, 48, 24624, 24624, 4032, 4032, 0, 0),
     ),
 }
+
+# The same OCR model also confuses the outlined ``8`` and ``9`` at the first
+# shortcut position. These are thresholded targets from the user's verified
+# live cells: the first is the observed ``9`` of ``950`` (the model returned
+# ``850``), and the second is the verified ``8`` of ``1081``. Keep the
+# classifier pair-specific: it must only decide between the two glyphs the
+# recognizer already supplied, never invent an arbitrary leading digit.
+_SHORTCUT_GAME_FONT_8_9_ROWS: dict[str, tuple[tuple[int, ...], ...]] = {
+    "8": (
+        (0, 0, 0, 8128, 8128, 24624, 24624, 24624, 24624, 24624, 24624,
+         40896, 24624, 24624, 24624, 24624, 24624, 24624, 8128, 8128,
+         0, 0),
+    ),
+    "9": (
+        (0, 0, 0, 4064, 4064, 12312, 12312, 13080, 13208, 13208, 13208,
+         12312, 4089, 4089, 24, 24, 24, 24, 4064, 4064, 0, 0),
+        (0, 0, 0, 4064, 4064, 12312, 12312, 13080, 13208, 13208, 13208,
+         12312, 4089, 4089, 25, 25, 24, 24, 4064, 4064, 0, 0),
+    ),
+}
 _SHORTCUT_GLYPH_NORMALIZED_HEIGHT = 34
 _SHORTCUT_GLYPH_TARGET_HEIGHT = 22
 _SHORTCUT_GLYPH_TARGET_WIDTH = 16
@@ -2149,6 +2174,26 @@ def _shortcut_game_font_3_9_templates() -> dict[str, tuple[Any, ...]]:
 
     decoded: dict[str, tuple[Any, ...]] = {}
     for digit, templates in _SHORTCUT_GAME_FONT_3_9_ROWS.items():
+        decoded[digit] = tuple(
+            np.asarray(
+                [
+                    [bool(row & (1 << (15 - column))) for column in range(16)]
+                    for row in rows
+                ],
+                dtype=bool,
+            )
+            for rows in templates
+        )
+    return decoded
+
+
+@lru_cache(maxsize=1)
+def _shortcut_game_font_8_9_templates() -> dict[str, tuple[Any, ...]]:
+    """Decode the verified 8/9 glyph targets once for live shortcut OCR."""
+    import numpy as np
+
+    decoded: dict[str, tuple[Any, ...]] = {}
+    for digit, templates in _SHORTCUT_GAME_FONT_8_9_ROWS.items():
         decoded[digit] = tuple(
             np.asarray(
                 [
@@ -2477,6 +2522,33 @@ def _classify_shortcut_game_font_3_or_9(
     return winner
 
 
+def _classify_shortcut_game_font_8_or_9(
+    image: Image.Image,
+    candidate_text: str,
+    digit_index: int,
+) -> str | None:
+    """Return a confident local 8/9 decision for one game-font glyph."""
+    target = _shortcut_game_font_target(image, candidate_text, digit_index)
+    if target is None:
+        return None
+    templates = _shortcut_game_font_8_9_templates()
+    scores = {
+        digit: max(
+            (_shortcut_shifted_dice(target, template) for template in digit_templates),
+            default=0.0,
+        )
+        for digit, digit_templates in templates.items()
+    }
+    winner = max(scores, key=scores.get)
+    loser = "9" if winner == "8" else "8"
+    # The supplied cells remain separated by at least 0.14 after 70% DPI
+    # scaling. A much smaller client can tie these glyphs; leave those as the
+    # numeric recognizer's original value instead of changing a real count.
+    if scores[winner] < 0.30 or scores[winner] - scores[loser] < 0.08:
+        return None
+    return winner
+
+
 def _correct_shortcut_game_font_3_9(
     image: Image.Image,
     value: int,
@@ -2500,6 +2572,35 @@ def _correct_shortcut_game_font_3_9(
         if digit not in {"3", "9"}:
             continue
         classified = _classify_shortcut_game_font_3_or_9(image, text, index)
+        if classified is not None:
+            corrected[index] = classified
+    try:
+        return int("".join(corrected))
+    except ValueError:
+        return value
+
+
+def _correct_shortcut_game_font_8_9(
+    image: Image.Image,
+    value: int,
+) -> int:
+    """Validate each selected 8/9 glyph against the shortcut's own pixels.
+
+    This corrects only a same-width substitution already made by OCR. It is
+    deliberately independent of the previous count, so a normal potion drop
+    such as ``958 -> 950`` remains valid while a weak/ambiguous glyph remains
+    untouched.
+    """
+    if not isinstance(value, int) or not 0 <= value <= MAX_SHORTCUT_QUANTITY:
+        return value
+    text = str(value)
+    if "8" not in text and "9" not in text:
+        return value
+    corrected = list(text)
+    for index, digit in enumerate(text):
+        if digit not in {"8", "9"}:
+            continue
+        classified = _classify_shortcut_game_font_8_or_9(image, text, index)
         if classified is not None:
             corrected[index] = classified
     try:

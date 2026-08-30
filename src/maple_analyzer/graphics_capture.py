@@ -54,6 +54,7 @@ class WindowsGraphicsCapture:
         # another compositor frame.
         self._last_image: Image.Image | None = None
         self._last_image_at = 0.0
+        self._last_grab_was_stale = False
         self._closed = False
 
         try:
@@ -174,6 +175,7 @@ class WindowsGraphicsCapture:
                         and max_stale_seconds > 0
                         and 0 <= age <= max_stale_seconds
                     ):
+                        self._last_grab_was_stale = True
                         return last_image.copy()
             raise GraphicsCaptureError(
                 "Windows Graphics Capture did not return a new frame"
@@ -190,6 +192,7 @@ class WindowsGraphicsCapture:
         with self._lock:
             self._last_image = image.copy()
             self._last_image_at = time.monotonic()
+            self._last_grab_was_stale = False
         return image
 
     @staticmethod
@@ -229,6 +232,7 @@ class WindowsGraphicsCapture:
             self._pending_frame = None
             self._last_image = None
             self._last_image_at = 0.0
+            self._last_grab_was_stale = False
             self._frame_ready.set()
         if pending is not None:
             with contextlib.suppress(Exception):
