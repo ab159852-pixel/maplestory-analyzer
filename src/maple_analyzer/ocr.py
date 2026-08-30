@@ -717,6 +717,17 @@ class StatPanelOcr:
             blue_slot_ids=blue_slot_ids,
             previous_counts=previous_counts,
             live=live,
+            # A configured cell without a cached, validated reading is
+            # establishing its baseline, not reporting a time-critical potion
+            # change.  Give that one isolated cell the complete independent
+            # view family once.  The lean live family can miss a narrow ``1``
+            # (1107 -> 107) or the sole clean channel of an MP cell, leaving
+            # no trustworthy initial value to protect later live samples.
+            baseline_slot_ids={
+                slot_id
+                for slot_key, (slot_id, _crop) in pending.items()
+                if slot_key not in last_values
+            },
         )
         numeric_engine_available = getattr(self, "_numeric_engine", None) is not None
 
@@ -776,6 +787,7 @@ class StatPanelOcr:
         blue_slot_ids: set[str],
         previous_counts: Mapping[str, int] | None = None,
         live: bool = False,
+        baseline_slot_ids: set[str] | None = None,
     ) -> dict[str, int]:
         """Read pending shortcut quantity strips in one numeric-model batch.
 
@@ -791,6 +803,7 @@ class StatPanelOcr:
         if numeric_engine is None or not pending:
             return {}
 
+        baseline_slot_ids = set(baseline_slot_ids or ())
         batch: dict[str, Image.Image] = {}
         owners: dict[str, str] = {}
         quantity_strips: dict[str, Image.Image] = {}
@@ -803,7 +816,10 @@ class StatPanelOcr:
                 strip,
                 blue=slot_id in blue_slot_ids,
                 layout_hint=(previous_counts or {}).get(slot_id),
-                live=live,
+                # Initial values are read once with all independent views.
+                # This remains limited to explicitly configured cells, and
+                # subsequent changed samples use the existing fast path.
+                live=live and slot_id not in baseline_slot_ids,
             )
             for view_name, view in views:
                 key_view_name = view_name

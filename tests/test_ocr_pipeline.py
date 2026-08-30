@@ -808,6 +808,114 @@ def test_live_blue_shortcut_reads_when_rgb_view_is_blank():
     }
 
 
+def test_live_initial_baseline_uses_complete_views_for_real_1107_and_1134(
+    monkeypatch,
+):
+    """Keep the exact source-capture evidence in a compact regression.
+
+    The supplied 2560px capture's configured cells visibly contain slot 6 =
+    1107 and blue slot 7 = 1134.  Its lean live views produce the deliberately
+    awkward readings below: no complete source BMP is checked into Git, but
+    these measured numeric-model outputs exercise the same selection and
+    leading-one recovery path.  An unobserved cell must use the complete view
+    family exactly once to create a trustworthy baseline for both slots.
+    """
+    from PIL import Image
+
+    class Numeric:
+        def __init__(self):
+            self.calls = []
+
+        def read_digit_fields(self, images, *, max_digits=4):
+            del max_digits
+            self.calls.append(tuple(images))
+            result = {}
+            for key in images:
+                prefix, slot_id, view = key.rsplit(":", 2)
+                is_recovery = prefix == "shortcut-recovery"
+                values = (
+                    {
+                        "6": {
+                            "raw-rgb": "187",
+                            "raw-gray": "1107",
+                            "raw-white170": "1107",
+                            "raw-white180": "107",
+                        },
+                        "7": {
+                            "raw-rgb": "1134",
+                            "raw-gray": "1342",
+                            "raw-r": "1343",
+                            "raw-g": "1344",
+                            "raw-white170": "134",
+                            "raw-white180": "134",
+                        },
+                    }
+                    if is_recovery
+                    else {
+                        "6": {
+                            "raw-rgb": "187",
+                            "raw-gray": "1872",
+                            "raw-white170": "1107",
+                            "raw-white180": "1107",
+                        },
+                        "7": {
+                            "raw-rgb": "134",
+                            "raw-gray": "1134",
+                            "raw-r": "1944",
+                            "raw-g": "1134",
+                            "raw-white170": "194 ",
+                            "raw-white180": "134",
+                        },
+                    }
+                )
+                text = values.get(slot_id, {}).get(view)
+                if text:
+                    result[key] = text
+            return result
+
+    numeric = Numeric()
+    ocr = StatPanelOcr.__new__(StatPanelOcr)
+    ocr._numeric_engine = numeric
+    ocr._read_once = lambda _image: ("", [])
+    ocr._shortcut_last_fast_counts = {}
+    ocr._shortcut_last_full_counts = {}
+    ocr._shortcut_last_validation_at = 0.0
+    ocr._shortcut_validation_signature = None
+    ocr._shortcut_last_cell_signatures = {}
+    ocr._shortcut_last_cell_values = {}
+    ocr._shortcut_live_recovery_at = {}
+    # The actual source strips both have two leading narrow ones. The raw
+    # model observations above are measured from that capture; keeping this
+    # small geometry fixture avoids committing its multi-megabyte screenshot.
+    monkeypatch.setattr(ocr_module, "_shortcut_leading_one_count", lambda _image: 2)
+    monkeypatch.setattr(ocr_module, "_shortcut_quantity_strip", lambda image: image)
+    monkeypatch.setattr(
+        ocr_module,
+        "_shortcut_quantity_recovery_strip",
+        lambda image: image,
+    )
+
+    cell = Image.new("RGB", (66, 34))
+    counts = ocr.read_shortcut_counts(
+        Image.new("RGB", (147, 77)),
+        {"6", "7"},
+        {"7"},
+        allow_full_validation=False,
+        slot_images={"6": cell, "7": cell},
+        live=True,
+    )
+
+    assert counts == {"6": 1107, "7": 1134}
+    # The first live batch is a baseline, so it contains the extra gray and
+    # white180 witnesses that the lean ongoing live worker deliberately omits.
+    assert {
+        "shortcut:6:raw-gray",
+        "shortcut:6:raw-white180",
+        "shortcut:7:raw-gray",
+        "shortcut:7:raw-white180",
+    }.issubset(numeric.calls[0])
+
+
 def test_live_shortcut_batch_recovers_a_missing_configured_second_cell():
     """A blank slot 7 must not disappear just because slot 6 decoded first."""
     from PIL import Image
